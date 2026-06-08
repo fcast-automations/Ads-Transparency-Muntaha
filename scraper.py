@@ -2,7 +2,6 @@ from playwright.sync_api import sync_playwright
 from urllib.parse import urlparse, parse_qs, unquote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-import difflib
 import re
 import time
 import threading
@@ -65,38 +64,6 @@ def clean_text(value):
     if not value:
         return "N/A"
     return re.sub(r"\s+", " ", str(value)).strip() or "N/A"
-
-
-def extract_package_name(app_link):
-    """
-    Extracts package name from app store link.
-    For Google Play: extracts the 'id' parameter
-    For App Store: extracts app ID from URL
-    """
-    if not app_link or app_link == "N/A":
-        return "N/A"
-    
-    try:
-        # Google Play Store format: ...?id=com.example.app
-        if "play.google.com" in app_link.lower():
-            parsed = urlparse(app_link)
-            query = parse_qs(parsed.query)
-            package_name = query.get("id", [None])[0]
-            if package_name:
-                return package_name
-        
-        # Apple App Store format: ...app/app-name/id123456789
-        if "apps.apple.com" in app_link.lower():
-            # Extract the ID from the URL path
-            match = re.search(r"/id(\d+)", app_link)
-            if match:
-                return f"id{match.group(1)}"
-        
-        # If we can't extract, return N/A
-        return "N/A"
-    
-    except Exception:
-        return "N/A"
 
 
 # =========================
@@ -863,153 +830,6 @@ def extract_advertiser_from_page(page):
 
 
 # =========================
-# TEXT AD EXTRACTION (FALLBACK FOR NON-VIDEO ADS)
-# =========================
-
-def decode_all(text):
-    """Decode every encoding variant for package extraction."""
-    text = re.sub(r'\\x3[Dd]', '=', text)
-    text = re.sub(r'\\x26',    '&', text)
-    text = re.sub(r'\\x3[Ff]', '?', text)
-    text = re.sub(r'\\x2[Ff]', '/', text)
-    text = re.sub(r'\\u003[Dd]', '=', text)
-    text = re.sub(r'\\u0026',    '&', text)
-    text = re.sub(r'\\u003[Ff]', '?', text)
-    text = re.sub(r'%3[Dd]', '=', text, flags=re.I)
-    text = re.sub(r'%26',    '&', text, flags=re.I)
-    text = re.sub(r'%3[Ff]', '?', text, flags=re.I)
-    text = re.sub(r'%2[Ff]', '/', text, flags=re.I)
-    text = re.sub(r'%3[Aa]', ':', text, flags=re.I)
-    text = (text.replace('&amp;', '&').replace('&quot;', '"')
-                .replace('&#38;', '&').replace('&#61;', '=')
-                .replace('&#x3D;', '=').replace('&#x26;', '&'))
-    return text
-
-
-_SKIP_EXT = re.compile(
-    r'\.(jpg|jpeg|png|gif|webp|svg|ico|css|js|json|xml|html|htm|'
-    r'woff|woff2|ttf|otf|eot|pdf|zip|apk|mp4|mp3|ogg|m3u8)$', re.I)
-_SKIP_PFX = re.compile(
-    r'^(com\.google\.android\.(gms|vending|inputmethod|tts|webview)|'
-    r'com\.android\.|android\.|androidx\.|kotlin\.|kotlinx\.|'
-    r'com\.squareup\.|io\.reactivex\.|okhttp3\.|javax\.|java\.|'
-    r'org\.json\.|org\.apache\.)', re.I)
-
-
-def _is_valid_pkg(pkg):
-    """Validate package name format."""
-    parts = pkg.split('.')
-    if len(parts) < 3 or len(pkg) < 8:  return False
-    if _SKIP_EXT.search(pkg):            return False
-    if _SKIP_PFX.match(pkg):             return False
-    for p in parts:
-        if not p or not re.match(r'^[A-Za-z][A-Za-z0-9_]*$', p):
-            return False
-    return True
-
-
-def extract_packages_from_text(raw_text):
-    """Extract all valid package names from text."""
-    text = decode_all(raw_text)
-    candidates = set()   
-
-    patterns = [
-        r"""['"]appId['"]\s*:\s*['"]([A-Za-z][\w.]+)['"]""",
-        r"""play\.google\.com/store/apps/details[^\s'"<>]*[?&]id=([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*){2,})""",
-        r"""market://[^\s'"]*[?&]id=([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*){2,})""",
-        r"""(?:destination_url|final_url|click_url|destUrl|clickUrl|landingUrl)['"\s]*:['"\s]*['"][^'"]*[?&]id=([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*){2,})""",
-        r"""[?&]id=([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*){2,})""",
-        r"""[?&]package=([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*){2,})"""
-    ]
-
-    for pat in patterns:
-        for m in re.finditer(pat, text, re.IGNORECASE):
-            pkg = m.group(1).rstrip('.,;\'"\\ ')
-            if _is_valid_pkg(pkg):
-                candidates.add(pkg)
-
-    return candidates
-
-
-def extract_package_from_page(page):
-    """Scan page DOM for packages."""
-    collected_texts = []
-
-    for frame in page.frames:
-        try:
-            frame_html = frame.evaluate("() => document.documentElement.outerHTML")
-            if frame_html and len(frame_html) > 200:
-                collected_texts.append(frame_html)
-
-            hrefs = frame.evaluate("""
-                () => Array.from(document.querySelectorAll('a[href]'))
-                           .map(a => a.href).filter(Boolean)
-            """)
-            if hrefs:
-                collected_texts.append('\n'.join(hrefs))
-
-            visible = frame.evaluate("() => document.body ? document.body.innerText : ''")
-            if visible:
-                collected_texts.append(visible)
-
-        except Exception:
-            continue
-
-    try:
-        visible = page.evaluate("() => document.body ? document.body.innerText : ''")
-        if visible:
-            collected_texts.append(visible)
-        
-        hrefs = page.evaluate("""
-            () => Array.from(document.querySelectorAll('a[href]'))
-                       .map(a => a.href).filter(Boolean)
-        """)
-        if hrefs:
-            collected_texts.append('\n'.join(hrefs))
-            
-        main_html = page.evaluate("() => document.documentElement.outerHTML")
-        if main_html:
-            collected_texts.append(main_html)
-    except Exception:
-        pass
-
-    combined = '\n'.join(collected_texts)
-    return extract_packages_from_text(combined)
-
-
-def clean_text_for_comparison(text):
-    """Clean text for package matching."""
-    if not text or text == "N/A": return ""
-    return re.sub(r'[^a-z0-9]', '', str(text).lower())
-
-
-def get_best_matching_package(headline, advertiser, package_list):
-    """Match packages to headline with 90% threshold."""
-    if not package_list: 
-        return None
-    
-    if len(package_list) == 1: 
-        return list(package_list)[0]
-
-    best_pkg = None
-    highest_ratio = 0.0
-    THRESHOLD = 0.90
-
-    visible_target = clean_text_for_comparison(f"{headline}{advertiser}")
-
-    for pkg in package_list:
-        clean_pkg = re.sub(r'^(com\.|net\.|org\.|android\.)', '', pkg.lower())
-        clean_pkg = re.sub(r'[^a-z0-9]', '', clean_pkg)
-        ratio = difflib.SequenceMatcher(None, visible_target, clean_pkg).ratio()
-        
-        if ratio > highest_ratio:
-            highest_ratio = ratio
-            best_pkg = pkg if ratio >= THRESHOLD else None
-
-    return best_pkg if highest_ratio >= THRESHOLD else None
-
-
-# =========================
 # MAIN SCRAPER
 # =========================
 
@@ -1081,63 +901,29 @@ def scrape_single_url(url_row):
             video_time = get_exact_time()
 
             if video_id == "N/A":
-                # ════════════════════════════════════════════════════════════
-                # TEXT AD FALLBACK (No video detected)
-                # Keep using the SAME ORIGINAL HEADLINE/DESCRIPTION extraction!
-                # ════════════════════════════════════════════════════════════
-                
-                print(f"📄 Row {row_num}: No video. Processing as TEXT AD.")
-                text_time = get_exact_time()
-
-                # Use the ORIGINAL headline/description extraction (same as video ads!)
-                headline, description = wait_and_extract_headline_description(page, max_wait_seconds=15)
-
-                if headline == "N/A" or len(headline) < 3:
-                    # No valid headline - skip this ad
-                    package_name = "N/A"
-                    app_link = "N/A"
-                    status = "NO_VALID_TEXT"
-                    message = "Text ad but no valid headline found"
-                else:
-                    # Extract packages and match to headline
-                    all_packages = extract_package_from_page(page)
-                    package_name = get_best_matching_package(headline, advertiser, all_packages)
-
-                    if package_name:
-                        app_link = f"https://play.google.com/store/apps/details?id={package_name}"
-                        status = "SUCCESS"
-                        message = f"TEXT_AD | Package: {package_name}"
-                    else:
-                        app_link = "N/A"
-                        package_name = "NOT FOUND"
-                        status = "TEXT_AD_NO_MATCH"
-                        message = f"TEXT_AD | No package match at 90% threshold"
-
-                # Save TEXT AD data (same column structure as VIDEO)
                 data = [
                     advertiser,
-                    package_name,
+                    "",
                     url,
-                    app_link,
-                    text_time,
-                    "TEXT_AD",  # ← Shows "TEXT_AD" instead of video ID
-                    text_time
+                    "",
+                    "",
+                    "NON_VIDEO",
+                    video_time
                 ]
 
                 safe_update_combined_row(row_num, data)
-                safe_update_headline_desc(row_num, headline, description)
+                safe_update_headline_desc(row_num, "N/A", "N/A")
 
                 safe_add_log(
                     row_number=row_num,
-                    status=status,
+                    status="NON_VIDEO",
                     log_type="COMBINED",
                     url=url,
-                    video_id="TEXT_AD",
-                    app_link=app_link,
-                    message=message
+                    video_id="NON_VIDEO",
+                    message="No video detected. App link not checked."
                 )
 
-                print(f"✅ Row {row_num}: TEXT_AD saved")
+                print(f"⏭ Row {row_num}: NON_VIDEO at {video_time}")
                 return
 
             print(f"🎬 Row {row_num}: video ID found first: {video_id}")
@@ -1156,12 +942,9 @@ def scrape_single_url(url_row):
                 status = "SUCCESS"
                 message = "Video ID and app link saved"
 
-            # Extract package name from app_link
-            package_name = extract_package_name(app_link)
-
             data = [
                 advertiser,
-                package_name,
+                "",
                 url,
                 app_link,
                 app_link_time,
@@ -1192,7 +975,7 @@ def scrape_single_url(url_row):
             try:
                 data = [
                     "",
-                    "N/A",
+                    "",
                     url,
                     "ERROR",
                     error_time,
