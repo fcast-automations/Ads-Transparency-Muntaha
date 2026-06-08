@@ -66,6 +66,38 @@ def clean_text(value):
     return re.sub(r"\s+", " ", str(value)).strip() or "N/A"
 
 
+def extract_package_name(app_link):
+    """
+    Extracts package name from app store link.
+    For Google Play: extracts the 'id' parameter
+    For App Store: extracts app ID from URL
+    """
+    if not app_link or app_link == "N/A":
+        return "N/A"
+    
+    try:
+        # Google Play Store format: ...?id=com.example.app
+        if "play.google.com" in app_link.lower():
+            parsed = urlparse(app_link)
+            query = parse_qs(parsed.query)
+            package_name = query.get("id", [None])[0]
+            if package_name:
+                return package_name
+        
+        # Apple App Store format: ...app/app-name/id123456789
+        if "apps.apple.com" in app_link.lower():
+            # Extract the ID from the URL path
+            match = re.search(r"/id(\d+)", app_link)
+            if match:
+                return f"id{match.group(1)}"
+        
+        # If we can't extract, return N/A
+        return "N/A"
+    
+    except Exception:
+        return "N/A"
+
+
 # =========================
 # VIDEO ID LOGIC (REVERTED TO YOUR ORIGINAL WORKING LOGIC)
 # =========================
@@ -901,9 +933,10 @@ def scrape_single_url(url_row):
             video_time = get_exact_time()
 
             if video_id == "N/A":
+                package_name = "N/A"  # No app link extracted yet for non-videos
                 data = [
                     advertiser,
-                    "",
+                    package_name,
                     url,
                     "",
                     "",
@@ -942,9 +975,12 @@ def scrape_single_url(url_row):
                 status = "SUCCESS"
                 message = "Video ID and app link saved"
 
+            # Extract package name from app_link
+            package_name = extract_package_name(app_link)
+
             data = [
                 advertiser,
-                "",
+                package_name,
                 url,
                 app_link,
                 app_link_time,
@@ -975,7 +1011,7 @@ def scrape_single_url(url_row):
             try:
                 data = [
                     "",
-                    "",
+                    "N/A",
                     url,
                     "ERROR",
                     error_time,
