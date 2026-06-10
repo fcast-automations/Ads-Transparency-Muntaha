@@ -616,7 +616,48 @@ def wait_and_extract_headline_description(page, max_wait_seconds=15):
     to avoid grabbing hidden/template text.
     """
     import time
+def debug_visible_text(page):
+    """
+    Prints visible text from:
+    1) Main page DOM
+    2) All iframes
 
+    Use this to check whether Playwright can actually see
+    headline/description text.
+    """
+
+    print("\n==============================")
+    print("===== MAIN PAGE TEXT =========")
+    print("==============================")
+
+    try:
+        text = page.inner_text("body", timeout=5000)
+        if text and text.strip():
+            print(text[:5000])
+        else:
+            print("No visible text found in main page body.")
+    except Exception as e:
+        print("Main page error:", e)
+
+    print("\n==============================")
+    print("===== IFRAMES TEXT ===========")
+    print("==============================")
+
+    for i, frame in enumerate(page.frames):
+        try:
+            text = frame.inner_text("body", timeout=5000)
+            if text and text.strip():
+                print(f"\n--- FRAME {i} ---")
+                print("URL:", frame.url)
+                print(text[:3000])
+            else:
+                print(f"\n--- FRAME {i} ---")
+                print("URL:", frame.url)
+                print("No visible text found.")
+        except Exception as e:
+            print(f"\n--- FRAME {i} ---")
+            print("URL:", frame.url)
+            print("Frame error:", e)
     js = r"""
     () => {
         let headText = "N/A";
