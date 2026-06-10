@@ -5,10 +5,19 @@ on:
   schedule:
     - cron: '0 */6 * * *'
 
+concurrency:
+  group: run-two-scraper-agents
+  cancel-in-progress: false
+
 jobs:
   top-agent:
     runs-on: ubuntu-latest
     timeout-minutes: 350
+
+    env:
+      TZ: Asia/Karachi
+      PYTHONUNBUFFERED: "1"
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -16,7 +25,7 @@ jobs:
       - name: Create creds.json safely from secret
         shell: bash
         run: |
-          cat <<'EOF' > creds.json
+          cat > creds.json <<'EOF'
           ${{ secrets.CREDS_JSON }}
           EOF
 
@@ -27,8 +36,10 @@ jobs:
 
       - name: Install dependencies
         run: |
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
-          playwright install chromium
+          python -m playwright install --with-deps chromium
+          python -m playwright --version
 
       - name: Run top agent
         run: |
@@ -37,6 +48,11 @@ jobs:
   bottom-agent:
     runs-on: ubuntu-latest
     timeout-minutes: 350
+
+    env:
+      TZ: Asia/Karachi
+      PYTHONUNBUFFERED: "1"
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -44,7 +60,7 @@ jobs:
       - name: Create creds.json safely from secret
         shell: bash
         run: |
-          cat <<'EOF' > creds.json
+          cat > creds.json <<'EOF'
           ${{ secrets.CREDS_JSON }}
           EOF
 
@@ -55,8 +71,10 @@ jobs:
 
       - name: Install dependencies
         run: |
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
-          playwright install chromium
+          python -m playwright install --with-deps chromium
+          python -m playwright --version
 
       - name: Run bottom agent
         run: |
@@ -67,15 +85,18 @@ jobs:
     needs: [top-agent, bottom-agent]
     if: always()
 
+    env:
+      TZ: Asia/Karachi
+      PYTHONUNBUFFERED: "1"
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # Create creds.json from secret
       - name: Create creds.json safely from secret
         shell: bash
         run: |
-          cat <<'EOF' > creds.json
+          cat > creds.json <<'EOF'
           ${{ secrets.CREDS_JSON }}
           EOF
 
@@ -85,7 +106,10 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Check remaining rows
-        run: python check_remaining.py
+        run: |
+          python check_remaining.py
