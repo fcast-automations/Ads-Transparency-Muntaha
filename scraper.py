@@ -695,6 +695,8 @@ def wait_and_extract_headline_description(page, max_wait_seconds=15):
         page.wait_for_timeout(1000)
 
     return "N/A", "N/A"
+
+
 # =========================
 # ADVERTISER LOGIC
 # =========================
