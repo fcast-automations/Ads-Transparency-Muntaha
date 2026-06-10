@@ -3,6 +3,9 @@ from urllib.parse import urlparse, parse_qs, unquote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import re
+import json
+import base64
+import difflib
 import time
 import threading
 import sheets
@@ -683,60 +686,182 @@ def wait_and_extract_headline_description(page, max_wait_seconds=15):
 # ADVERTISER LOGIC
 # =========================
 
-# =========================
-# ADVERTISER LOGIC
-# =========================
-
 def extract_advertiser_from_page(page):
     """
-    Extract advertiser name from the top of the page.
-    Primary: Uses the explicit 'advertiser-title' class for perfect accuracy.
-    Fallback: Scans leaf nodes for the largest text near the top (for headless Linux).
+    Extract advertiser name from the Ads Transparency page header.
+    Primary target is the exact element shown in DOM:
+    <a class="advertiser-title" aria-label="Link to advertiser page for ...">
+    Only advertiser extraction is changed; video/text/package logic stays untouched.
     """
-    
-    # STRATEGY 1: Exact Class Match (Highly Reliable!)
+
+    def clean_advertiser_candidate(value):
+        if not value:
+            return "N/A"
+
+        text = clean_text(value)
+        if not text or text == "N/A":
+            return "N/A"
+
+        # Your shown DOM has:
+        # aria-label="Link to advertiser page for 9D TECHNOLOGIES ..."
+        prefixes = [
+            "link to advertiser page for",
+            "advertiser page for",
+        ]
+
+        lower = text.lower()
+        for prefix in prefixes:
+            if lower.startswith(prefix):
+                text = text[len(prefix):].strip(" :-\t\n\r")
+                lower = text.lower()
+                break
+
+        bad_exact = {
+            "ad details", "last shown", "format:", "shown in", "report this ad",
+            "see more ads", "ads transparency centre", "ads transparency center",
+            "faqs", "privacy", "terms", "policies", "home", "sign in", "sign up",
+            "log in", "close", "menu", "keyboard_arrow_right", "arrow_back",
+            "arrow_forward", "chevron_left", "chevron_right", "n/a"
+        }
+
+        if lower in bad_exact:
+            return "N/A"
+        if "information about this ad" in lower or "cookie" in lower:
+            return "N/A"
+        if len(text) < 2 or len(text) > 120:
+            return "N/A"
+
+        return text
+
+    # Wait briefly for the header anchor to appear. This does not touch any ad logic.
     try:
-        loc = page.locator('.advertiser-title')
-        if loc.count() > 0:
-            text = loc.nth(0).inner_text(timeout=1500).strip()
-            if text and len(text) > 1:
-                return text
+        page.wait_for_selector(
+            'a.advertiser-title, .advertiser-title, [aria-label*="advertiser page for"]',
+            timeout=5000
+        )
     except Exception:
         pass
 
-    # STRATEGY 2: Visual Fallback (If Google temporarily changes their HTML classes)
+    # STRATEGY 1: Exact advertiser-title / aria-label extraction.
+    selectors = [
+        'a.advertiser-title',
+        '.advertiser-title',
+        'a[aria-label^="Link to advertiser page for"]',
+        '[aria-label^="Link to advertiser page for"]',
+        'a[aria-label*="advertiser page for"]',
+        '[class*="advertiser-title"]',
+    ]
+
+    for selector in selectors:
+        try:
+            loc = page.locator(selector)
+            count = loc.count()
+
+            for i in range(min(count, 5)):
+                el = loc.nth(i)
+
+                # First read aria-label because that contains the exact advertiser in your DOM.
+                for attr in ["aria-label", "title", "data-tooltip"]:
+                    try:
+                        value = el.get_attribute(attr, timeout=1500)
+                        cleaned = clean_advertiser_candidate(value)
+                        if cleaned != "N/A":
+                            return cleaned
+                    except Exception:
+                        pass
+
+                # Then try visible/text content.
+                try:
+                    text = el.inner_text(timeout=1500)
+                    cleaned = clean_advertiser_candidate(text)
+                    if cleaned != "N/A":
+                        return cleaned
+                except Exception:
+                    pass
+
+                try:
+                    text = el.evaluate("el => el.textContent || ''")
+                    cleaned = clean_advertiser_candidate(text)
+                    if cleaned != "N/A":
+                        return cleaned
+                except Exception:
+                    pass
+
+        except Exception:
+            continue
+
+    # STRATEGY 2: JS fallback for Angular/scoped classes like advertiser-title _ngcontent-...
     js = r"""
+    () => {
+        const selectors = [
+            'a.advertiser-title',
+            '.advertiser-title',
+            '[class*="advertiser-title"]',
+            '[aria-label^="Link to advertiser page for"]',
+            '[aria-label*="advertiser page for"]'
+        ];
+
+        for (const selector of selectors) {
+            const elements = Array.from(document.querySelectorAll(selector));
+            for (const el of elements) {
+                const values = [
+                    el.getAttribute('aria-label') || '',
+                    el.getAttribute('title') || '',
+                    el.textContent || '',
+                    el.innerText || ''
+                ];
+
+                for (let value of values) {
+                    value = String(value || '').replace(/\s+/g, ' ').trim();
+                    if (value.length > 1) return value;
+                }
+            }
+        }
+
+        return null;
+    }
+    """
+
+    try:
+        value = page.evaluate(js)
+        cleaned = clean_advertiser_candidate(value)
+        if cleaned != "N/A":
+            return cleaned
+    except Exception:
+        pass
+
+    # STRATEGY 3: Original visual fallback, kept only as a backup.
+    fallback_js = r"""
     () => {
         const badExact = [
             'ad details', 'last shown', 'format:', 'shown in', 'report this ad',
             'see more ads', 'ads transparency centre', 'ads transparency center',
-            'faqs', 'privacy', 'terms', 'policies', 'home', 'sign in', 'sign up', 
-            'log in', 'close', 'menu', 'keyboard_arrow_right', 'arrow_back', 
+            'faqs', 'privacy', 'terms', 'policies', 'home', 'sign in', 'sign up',
+            'log in', 'close', 'menu', 'keyboard_arrow_right', 'arrow_back',
             'arrow_forward', 'chevron_left', 'chevron_right'
         ];
-        
+
         const elements = Array.from(document.querySelectorAll('body *'));
         let candidates = [];
-        
+
         for (let i = 0; i < elements.length; i++) {
             let el = elements[i];
-            
             if (el.childElementCount > 0) continue;
-            
-            const text = (el.innerText || el.textContent || "").trim();
+
+            const text = (el.innerText || el.textContent || '').trim();
             if (text.length < 2 || text.length > 80 || text.includes('\n')) continue;
-            
+
             const lower = text.toLowerCase();
             if (badExact.includes(lower)) continue;
             if (lower.includes('information about this ad')) continue;
             if (lower.includes('cookie')) continue;
-            
+
             const rect = el.getBoundingClientRect();
             if (rect.y < 0 || rect.y > 450 || rect.width < 10 || rect.height < 10) continue;
-            
+
             const style = window.getComputedStyle(el);
             if (style.visibility === 'hidden' || style.display === 'none' || style.opacity === '0') continue;
-            
+
             candidates.push({
                 text: text,
                 y: rect.y,
@@ -745,7 +870,7 @@ def extract_advertiser_from_page(page):
                 domIndex: i
             });
         }
-        
+
         let unique = [];
         let seen = new Set();
         for (let c of candidates) {
@@ -754,111 +879,504 @@ def extract_advertiser_from_page(page):
                 unique.push(c);
             }
         }
-        
+
         if (unique.length === 0) return null;
-        
+
         unique.sort((a, b) => {
-            if (b.font !== a.font) return b.font - a.font; 
+            if (b.font !== a.font) return b.font - a.font;
             if (a.y !== b.y) return a.y - b.y;
             return a.domIndex - b.domIndex;
         });
-        
+
         return unique[0].text;
     }
     """
-    
+
     try:
-        advertiser = page.evaluate(js)
-        if advertiser:
-            return advertiser
+        advertiser = page.evaluate(fallback_js)
+        cleaned = clean_advertiser_candidate(advertiser)
+        if cleaned != "N/A":
+            return cleaned
     except Exception:
         pass
-        
+
     return "N/A"
+
+# =========================
+# TEXT / IMAGE AD PACKAGE EXTRACTION + MATCHING
+# =========================
+
+# Lowered from 0.92 so text ads can pass when the package and visible text share
+# strong continuous character overlap. Video logic above is untouched.
+MIN_PACKAGE_MATCH_SCORE = 0.76
+
+_GENERIC_PACKAGE_TOKENS = {
+    "com", "net", "org", "co", "io", "app", "apps", "android", "mobile",
+    "google", "play", "store", "free", "pro", "lite", "online", "official",
+    "inc", "ltd", "llc", "studio", "studios", "company", "group", "digital",
+    "ai", "all", "new", "best", "easy", "fast"
+}
+
+_SKIP_EXT = re.compile(
+    r'\.(jpg|jpeg|png|gif|webp|svg|ico|css|js|json|xml|html|htm|'
+    r'woff|woff2|ttf|otf|eot|pdf|zip|apk|mp4|mp3|ogg|m3u8)$',
+    re.I
+)
+
+_SKIP_PFX = re.compile(
+    r'^(com\.google\.android\.(gms|vending|inputmethod|tts|webview)|'
+    r'com\.android\.|android\.|androidx\.|kotlin\.|kotlinx\.|'
+    r'com\.squareup\.|io\.reactivex\.|okhttp3\.|javax\.|java\.|'
+    r'org\.json\.|org\.apache\.)',
+    re.I
+)
+
+
+def is_valid_text_ad(headline, description):
+    if headline and headline != "N/A" and len(clean_text(headline)) >= 3:
+        return True
+    if description and description != "N/A" and len(clean_text(description)) >= 15:
+        return True
+    return False
+
+
+def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
     """
-    Extract advertiser name from the top of the page.
-    Strictly scans 'leaf nodes' to prevent reading giant UI wrappers,
-    and ignores common Google Ads Transparency UI text.
+    Text/image ad headline + description logic copied from your text-ad file.
+    It checks visible iframe leaf text only and ignores buttons/UI text.
     """
     js = r"""
     () => {
-        const badExact = [
-            'ad details', 'last shown', 'format:', 'shown in', 'report this ad',
-            'see more ads', 'ads transparency centre', 'ads transparency center',
-            'faqs', 'privacy', 'terms', 'policies', 'home', 'sign in', 'sign up', 
-            'log in', 'close', 'menu', 'keyboard_arrow_right', 'arrow_back', 
-            'arrow_forward', 'chevron_left', 'chevron_right'
-        ];
+        let result = { headline: "N/A", description: "N/A" };
+        const isBadText = (txt) => {
+            const lower = txt.toLowerCase();
+            const exactBlock = ['install', 'download', 'get', 'open', 'visit site', 'learn more', 'sign in', 'google', 'search', 'ad details', 'ads transparency'];
+            if (exactBlock.includes(lower)) return true;
+            if (lower.length < 15 && (lower.startsWith('install') || lower.startsWith('download') || lower.startsWith('get '))) return true;
+            return false;
+        };
         
-        // Get absolutely every element on the page
-        const elements = Array.from(document.querySelectorAll('body *'));
-        let candidates = [];
-        
-        for (let el of elements) {
-            // CRITICAL FIX: Must be a leaf node (no child elements inside it).
-            // This prevents grabbing the giant navigation menu wrapper.
+        // 1. EXTRACT HEADLINE (Visual only)
+        let maxFont = 0;
+        let bestEl = null;
+        for (let el of document.querySelectorAll('*')) {
             if (el.childElementCount > 0) continue;
+            let txt = (el.innerText || "").trim();
+            if (txt.length < 4 || isBadText(txt)) continue;
             
-            const text = (el.innerText || el.textContent || "").trim();
+            let rect = el.getBoundingClientRect();
+            if (rect.width === 0 || rect.height === 0) continue;
+
+            let style = window.getComputedStyle(el);
+            if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') continue;
             
-            // Ignore blank text, giant paragraphs, or text with line breaks
-            if (text.length < 2 || text.length > 80 || text.includes('\n')) continue;
-            
-            const lower = text.toLowerCase();
-            
-            // Ignore precise UI keywords
-            if (badExact.includes(lower)) continue;
-            if (lower.includes('information about this ad')) continue;
-            
-            const rect = el.getBoundingClientRect();
-            
-            // The advertiser name is always in the top header area (Y < 250)
-            if (rect.y < 0 || rect.y > 250 || rect.width < 10 || rect.height < 10) continue;
-            
-            // Ignore hidden elements
-            const style = window.getComputedStyle(el);
-            if (style.visibility === 'hidden' || style.display === 'none' || style.opacity === '0') continue;
-            
-            candidates.push({
-                text: text,
-                y: rect.y,
-                x: rect.x,
-                font: parseFloat(style.fontSize || '0')
-            });
-        }
-        
-        // Remove duplicates
-        let unique = [];
-        let seen = new Set();
-        for (let c of candidates) {
-            if (!seen.has(c.text)) {
-                seen.add(c.text);
-                unique.push(c);
+            let fontSize = parseFloat(style.fontSize || '0');
+            if (fontSize > maxFont) {
+                maxFont = fontSize;
+                bestEl = el;
             }
         }
-        
-        if (unique.length === 0) return null;
-        
-        // The advertiser name is consistently the largest text near the top of the page.
-        // Sort by largest font size first, then by closest to the top.
-        unique.sort((a, b) => {
-            if (b.font !== a.font) return b.font - a.font; 
-            return a.y - b.y; 
-        });
-        
-        return unique[0].text;
+
+        if (bestEl) {
+            result.headline = bestEl.innerText.replace(/\n/g, ' ').trim();
+            
+            // 2. EXTRACT DESCRIPTION (Visual only)
+            let maxLen = 0;
+            for (let el of document.querySelectorAll('*')) {
+                if (el.childElementCount > 0) continue;
+                let txt = (el.innerText || "").replace(/\n/g, ' ').trim();
+                if (txt === result.headline || txt.length < 15 || isBadText(txt)) continue;
+                
+                let rect = el.getBoundingClientRect();
+                if (rect.width === 0 || rect.height === 0) continue;
+
+                let style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden') continue;
+                
+                if (txt.length > maxLen) {
+                    maxLen = txt.length;
+                    result.description = txt;
+                }
+            }
+        }
+        return result;
     }
     """
-    
+
+    start_time = time.time()
+
+    while time.time() - start_time < max_wait_seconds:
+        for frame in page.frames:
+            if frame == page.main_frame:
+                continue
+            try:
+                data = frame.evaluate(js)
+                if data["headline"] != "N/A":
+                    return data
+            except Exception:
+                continue
+        page.wait_for_timeout(1000)
+
+    return {"headline": "N/A", "description": "N/A"}
+
+
+def decode_all(text):
+    """Decode common JS/URL/HTML escaped variants before package extraction."""
+    if not text:
+        return ""
+    text = str(text)
+    text = re.sub(r'\\x3[Dd]', '=', text)
+    text = re.sub(r'\\x26', '&', text)
+    text = re.sub(r'\\x3[Ff]', '?', text)
+    text = re.sub(r'\\x2[Ff]', '/', text)
+    text = re.sub(r'\\u003[Dd]', '=', text)
+    text = re.sub(r'\\u0026', '&', text)
+    text = re.sub(r'\\u003[Ff]', '?', text)
+    text = re.sub(r'%3[Dd]', '=', text, flags=re.I)
+    text = re.sub(r'%26', '&', text, flags=re.I)
+    text = re.sub(r'%3[Ff]', '?', text, flags=re.I)
+    text = re.sub(r'%2[Ff]', '/', text, flags=re.I)
+    text = re.sub(r'%3[Aa]', ':', text, flags=re.I)
+    text = (text.replace('&amp;', '&').replace('&quot;', '"')
+                .replace('&#38;', '&').replace('&#61;', '=')
+                .replace('&#x3D;', '=').replace('&#x26;', '&'))
+    return text
+
+
+def _is_valid_pkg(pkg):
+    if not pkg:
+        return False
+    pkg = pkg.strip()
+    parts = pkg.split('.')
+    if len(parts) < 3 or len(pkg) < 8:
+        return False
+    if _SKIP_EXT.search(pkg):
+        return False
+    if _SKIP_PFX.match(pkg):
+        return False
+    for part in parts:
+        if not part or not re.match(r'^[A-Za-z][A-Za-z0-9_]*$', part):
+            return False
+    return True
+
+
+def extract_packages_from_text(raw_text):
+    """
+    Package extraction merged from your HTML extraction file:
+    appId, Play Store id, market:// id, package=, final_url and destination_url.
+    """
+    text = decode_all(raw_text)
+    candidates = set()
+
+    patterns = [
+        r"""['\"]appId['\"]\s*:\s*['\"]([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*){2,})['\"]""",
+        r"""play\.google\.com/store/apps/details[^\s'\"<>]*[?&]id=([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*){2,})""",
+        r"""market://[^\s'\"]*[?&]id=([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*){2,})""",
+        r"""(?:destination_url|final_url|click_url|destUrl|clickUrl|landingUrl)['\"\s]*[:=]['\"\s]*['\"]?[^'\"\s<>]*[?&]id=([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*){2,})""",
+        r"""[?&]id=([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*){2,})""",
+        r"""[?&]package=([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*){2,})""",
+    ]
+
+    for pat in patterns:
+        for match in re.finditer(pat, text, re.IGNORECASE):
+            pkg = match.group(1).rstrip('.,;\'"\\ ')
+            if _is_valid_pkg(pkg):
+                candidates.add(pkg)
+
+    return candidates
+
+
+def is_package_source_url(url):
+    if not url:
+        return False
+    lower = url.lower()
+    return (
+        "displayads" in lower
+        or "addata" in lower
+        or "content.js" in lower
+        or "preview" in lower
+        or "pagead" in lower
+        or "googleusercontent" in lower
+        or "play.google.com/store/apps/details" in lower
+        or "market://" in lower
+    )
+
+
+def start_package_cdp_capture(context, page):
+    """
+    Playwright CDP version of your HTML extraction file's network interceptor.
+    It is enabled before page.goto so iframe/script bodies can be scanned later.
+    """
+    capture = {
+        "session": None,
+        "request_ids": [],
+        "request_urls": {},
+    }
+
     try:
-        # Run the JS exclusively on the main page (Advertiser name is never inside the iframe)
-        advertiser = page.evaluate(js)
-        if advertiser:
-            return advertiser
+        session = context.new_cdp_session(page)
+        session.send("Network.enable")
+        session.send("Page.enable")
+        capture["session"] = session
+
+        def on_response_received(params):
+            try:
+                req_id = params.get("requestId")
+                resp_url = params.get("response", {}).get("url", "")
+                if req_id and is_package_source_url(resp_url):
+                    capture["request_ids"].append(req_id)
+                    capture["request_urls"][req_id] = resp_url
+            except Exception:
+                pass
+
+        session.on("Network.responseReceived", on_response_received)
+    except Exception as e:
+        print(f"WARNING: CDP package capture disabled: {e}")
+
+    return capture
+
+
+def get_cdp_package_bodies(capture):
+    bodies = []
+    session = capture.get("session") if capture else None
+    if not session:
+        return bodies
+
+    seen = set()
+    for req_id in capture.get("request_ids", []):
+        if req_id in seen:
+            continue
+        seen.add(req_id)
+        try:
+            result = session.send("Network.getResponseBody", {"requestId": req_id})
+            body = result.get("body", "")
+            if result.get("base64Encoded"):
+                body = base64.b64decode(body).decode("utf-8", errors="replace")
+            if body and body.strip():
+                bodies.append(body)
+        except Exception:
+            continue
+
+    return bodies
+
+
+def collect_page_text_for_packages(page, package_capture=None):
+    """Collect main DOM, iframe DOM, visible text, links, inline scripts and CDP bodies."""
+    collected = []
+
+    for frame in page.frames:
+        try:
+            frame_html = frame.evaluate("() => document.documentElement ? document.documentElement.outerHTML : ''")
+            if frame_html and len(frame_html) > 200:
+                collected.append(frame_html)
+        except Exception:
+            pass
+
+        try:
+            hrefs = frame.evaluate("""
+                () => Array.from(document.querySelectorAll('a[href]'))
+                           .map(a => a.href).filter(Boolean)
+            """)
+            if hrefs:
+                collected.append("\n".join(hrefs))
+        except Exception:
+            pass
+
+        try:
+            visible = frame.evaluate("() => document.body ? document.body.innerText : ''")
+            if visible:
+                collected.append(visible)
+        except Exception:
+            pass
+
+    try:
+        inline_scripts = page.evaluate("""
+            () => Array.from(document.querySelectorAll('script:not([src])'))
+                       .map(s => s.textContent || '')
+                       .filter(Boolean)
+                       .join('\n\n/* ---- */\n\n')
+        """)
+        if inline_scripts:
+            collected.append(inline_scripts)
     except Exception:
         pass
-        
-    return "N/A"
+
+    for body in get_cdp_package_bodies(package_capture):
+        collected.append(body)
+
+    return "\n".join(collected)
+
+
+def extract_package_candidates_from_page(page, package_capture=None):
+    combined = collect_page_text_for_packages(page, package_capture)
+    return extract_packages_from_text(combined)
+
+
+def clean_text_for_comparison(text):
+    if not text or text == "N/A":
+        return ""
+    return re.sub(r"[^a-z0-9]", "", str(text).lower())
+
+
+def split_words_for_comparison(text):
+    if not text or text == "N/A":
+        return []
+    return re.findall(r"[a-z0-9]+", str(text).lower())
+
+
+def package_tokens_for_matching(pkg):
+    if not pkg:
+        return []
+
+    raw_tokens = re.split(r"[._-]+", pkg.lower())
+    tokens = []
+
+    for token in raw_tokens:
+        token = re.sub(r"[^a-z0-9]", "", token)
+        if not token or token in _GENERIC_PACKAGE_TOKENS:
+            continue
+        if len(token) < 3 or token.isdigit():
+            continue
+        tokens.append(token)
+
+    return tokens
+
+
+def longest_common_substring_len(a, b):
+    if not a or not b:
+        return 0
+
+    previous = [0] * (len(b) + 1)
+    best = 0
+
+    for ca in a:
+        current = [0] * (len(b) + 1)
+        for j, cb in enumerate(b, start=1):
+            if ca == cb:
+                current[j] = previous[j - 1] + 1
+                if current[j] > best:
+                    best = current[j]
+        previous = current
+
+    return best
+
+
+def best_window_fuzzy_ratio(needle, haystack):
+    if not needle or not haystack:
+        return 0.0
+
+    n = len(needle)
+    if n < 4:
+        return 0.0
+
+    if needle in haystack:
+        return 1.0
+
+    best = 0.0
+    min_len = max(4, n - 2)
+    max_len = min(len(haystack), n + 2)
+
+    for size in range(min_len, max_len + 1):
+        if size > len(haystack):
+            continue
+        step = 1 if len(haystack) <= 200 else 2
+        for start in range(0, len(haystack) - size + 1, step):
+            window = haystack[start:start + size]
+            ratio = difflib.SequenceMatcher(None, needle, window).ratio()
+            if ratio > best:
+                best = ratio
+                if best >= 0.98:
+                    return best
+
+    return best
+
+
+def score_package_against_text(pkg, headline, description):
+    """
+    Compares continuous package characters against visible headline + description.
+    This avoids choosing the first hidden package from HTML.
+    """
+    visible_raw = f"{headline or ''} {description or ''}"
+    visible_clean = clean_text_for_comparison(visible_raw)
+    visible_words = split_words_for_comparison(visible_raw)
+    visible_word_set = set(visible_words)
+
+    if not visible_clean:
+        return 0.0
+
+    tokens = package_tokens_for_matching(pkg)
+    if not tokens:
+        return 0.0
+
+    package_core = "".join(tokens)
+    score = 0.0
+
+    if package_core and len(package_core) >= 6:
+        if package_core in visible_clean:
+            score = max(score, 0.99)
+        lcs = longest_common_substring_len(package_core, visible_clean)
+        lcs_ratio = lcs / max(len(package_core), 1)
+        if lcs >= 6:
+            score = max(score, min(0.94, lcs_ratio + 0.10))
+        fuzzy_ratio = best_window_fuzzy_ratio(package_core, visible_clean)
+        if fuzzy_ratio >= 0.76:
+            score = max(score, fuzzy_ratio)
+
+    exact_hits = []
+    partial_hits = []
+
+    for token in tokens:
+        if token in visible_word_set:
+            exact_hits.append(token)
+            continue
+
+        if len(token) >= 5 and token in visible_clean:
+            exact_hits.append(token)
+            continue
+
+        token_lcs = longest_common_substring_len(token, visible_clean)
+        token_ratio = token_lcs / max(len(token), 1)
+        if len(token) >= 5 and token_lcs >= 5 and token_ratio >= 0.76:
+            partial_hits.append(token)
+            score = max(score, min(0.90, token_ratio))
+            continue
+
+        token_fuzzy = best_window_fuzzy_ratio(token, visible_clean)
+        if len(token) >= 5 and token_fuzzy >= 0.80:
+            partial_hits.append(token)
+            score = max(score, min(0.88, token_fuzzy))
+
+    exact_hits = list(dict.fromkeys(exact_hits))
+    partial_hits = list(dict.fromkeys(partial_hits))
+    total_hits = len(set(exact_hits + partial_hits))
+
+    if len(exact_hits) >= 2:
+        score = max(score, 0.94)
+    elif len(exact_hits) == 1 and len(exact_hits[0]) >= 6:
+        score = max(score, 0.82)
+    elif total_hits >= 2:
+        score = max(score, 0.78)
+
+    return round(score, 4)
+
+
+def get_best_matching_package(headline, description, package_list, min_score=MIN_PACKAGE_MATCH_SCORE):
+    if not package_list:
+        return None, 0.0
+
+    best_pkg = None
+    best_score = 0.0
+
+    for pkg in sorted(package_list):
+        score = score_package_against_text(pkg, headline, description)
+        if score > best_score:
+            best_score = score
+            best_pkg = pkg
+
+    if best_pkg and best_score >= min_score:
+        return best_pkg, best_score
+
+    return None, best_score
 
 
 # =========================
@@ -890,8 +1408,9 @@ def scrape_single_url(url_row):
 
         page = context.new_page()
         captured = {"video_id": "N/A"}
+        package_capture = start_package_cdp_capture(context, page)
 
-        # We reverted this back to your original clean response handler!
+        # ORIGINAL VIDEO RESPONSE HANDLER - kept unchanged.
         def handle_response(response):
             try:
                 if not is_real_video_response(response):
@@ -912,36 +1431,96 @@ def scrape_single_url(url_row):
                 separator = "&" if "?" in url else "?"
                 url = f"{url}{separator}region=anywhere"
 
-            print(f"🔍 Row {row_num}: opening transparency URL")
+            print(f"Row {row_num}: opening transparency URL")
 
             safe_add_log(
                 row_number=row_num,
                 status="STARTED",
                 log_type="COMBINED",
                 url=url,
-                message="Started video ID then app link extraction"
+                message="Started combined video + text package extraction"
             )
 
             page.goto(url, wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(4000)
 
-            # Step 1: extract advertiser from top header
             advertiser = extract_advertiser_from_page(page)
 
-            # Step 2: detect video ID first
+            # Extract text ad details early so video clicks/fallbacks cannot disturb text creatives.
+            early_text_data = wait_and_extract_text_ad_details(page, max_wait_seconds=5)
+
+            # VIDEO LOGIC: same detection flow from your first scraper.
             video_id = detect_video_id(page, captured)
             video_time = get_exact_time()
 
-            if video_id == "N/A":
-                package_name = "N/A"  # No app link extracted yet for non-videos
+            # =========================
+            # VIDEO AD PATH
+            # =========================
+            if video_id != "N/A":
+                print(f"Row {row_num}: video ID found first: {video_id}")
+
+                app_link = wait_and_extract_install_link(page, max_wait_seconds=35)
+                app_link_time = get_exact_time()
+
+                headline, description = wait_and_extract_headline_description(page, max_wait_seconds=15)
+
+                if app_link == "N/A":
+                    status = "VIDEO_FOUND_APP_LINK_NOT_FOUND"
+                    message = "Video ID found, but exact visible install link not found"
+                else:
+                    status = "SUCCESS"
+                    message = "Video ID and app link saved"
+
+                package_name = extract_package_name(app_link)
+
                 data = [
                     advertiser,
                     package_name,
                     url,
-                    "",
-                    "",
-                    "NON_VIDEO",
+                    app_link,
+                    app_link_time,
+                    video_id,      # Column F: actual video ID for video ads
                     video_time
+                ]
+
+                safe_update_combined_row(row_num, data)
+                safe_update_headline_desc(row_num, headline, description)
+
+                safe_add_log(
+                    row_number=row_num,
+                    status=status,
+                    log_type="VIDEO_AD",
+                    url=url,
+                    video_id=video_id,
+                    app_link=app_link,
+                    message=message
+                )
+
+                print(f"Row {row_num}: saved VIDEO ad advertiser + package + video ID + text")
+                return
+
+            # =========================
+            # TEXT / IMAGE AD PATH
+            # =========================
+            print(f"Row {row_num}: no video found, checking text/image ad")
+
+            text_data = early_text_data
+            if not is_valid_text_ad(text_data.get("headline"), text_data.get("description")):
+                text_data = wait_and_extract_text_ad_details(page, max_wait_seconds=15)
+
+            headline = clean_text(text_data.get("headline"))
+            description = clean_text(text_data.get("description"))
+            process_time = get_exact_time()
+
+            if not is_valid_text_ad(headline, description):
+                data = [
+                    advertiser,
+                    "N/A",
+                    url,
+                    "N/A",
+                    process_time,
+                    "text",
+                    process_time
                 ]
 
                 safe_update_combined_row(row_num, data)
@@ -949,43 +1528,65 @@ def scrape_single_url(url_row):
 
                 safe_add_log(
                     row_number=row_num,
-                    status="NON_VIDEO",
+                    status="NO_VIDEO_NO_TEXT",
                     log_type="COMBINED",
                     url=url,
-                    video_id="NON_VIDEO",
-                    message="No video detected. App link not checked."
+                    video_id="text",
+                    app_link="N/A",
+                    message="No video ID and no valid text/image ad headline/description found"
                 )
 
-                print(f"⏭ Row {row_num}: NON_VIDEO at {video_time}")
+                print(f"Row {row_num}: no video and no valid text/image ad found")
                 return
 
-            print(f"🎬 Row {row_num}: video ID found first: {video_id}")
+            print(f"Row {row_num}: text/image headline -> {headline}")
 
-            # Step 3: only after video is found, extract app link
-            app_link = wait_and_extract_install_link(page, max_wait_seconds=35)
-            app_link_time = get_exact_time()
+            visible_app_link = wait_and_extract_install_link(page, max_wait_seconds=8)
+            visible_package = extract_package_name(visible_app_link)
 
-            # Step 4: Extract Headline and Description
-            headline, description = wait_and_extract_headline_description(page, max_wait_seconds=15)
+            all_found_packages = extract_package_candidates_from_page(page, package_capture)
+            if visible_package != "N/A":
+                all_found_packages.add(visible_package)
 
-            if app_link == "N/A":
-                status = "VIDEO_FOUND_APP_LINK_NOT_FOUND"
-                message = "Video ID found, but exact visible install link not found"
-            else:
+            package_name, match_score = get_best_matching_package(
+                headline,
+                description,
+                all_found_packages,
+                min_score=MIN_PACKAGE_MATCH_SCORE
+            )
+
+            if package_name:
+                if visible_package == package_name and visible_app_link != "N/A":
+                    app_link = visible_app_link
+                    message = f"Non-video package matched against headline/description and confirmed by visible app link. score={match_score}"
+                else:
+                    app_link = f"https://play.google.com/store/apps/details?id={package_name}"
+                    message = f"Non-video package extracted from CDP/DOM and matched against headline/description. score={match_score}"
                 status = "SUCCESS"
-                message = "Video ID and app link saved"
-
-            # Extract package name from app_link
-            package_name = extract_package_name(app_link)
+                print(f"Row {row_num}: matched package -> {package_name} | score={match_score}")
+            elif visible_package != "N/A":
+                # Last safe fallback: visible install link belongs to the active creative.
+                package_name = visible_package
+                app_link = visible_app_link
+                match_score = 1.0
+                status = "SUCCESS_VISIBLE_LINK_FALLBACK"
+                message = "Non-video package extracted from visible install link; headline/package score below threshold"
+                print(f"Row {row_num}: package from visible install link fallback -> {package_name}")
+            else:
+                package_name = "N/A"
+                app_link = "N/A"
+                status = "NON_VIDEO_PACKAGE_NOT_FOUND"
+                message = f"Non-video ad found, but package score below {MIN_PACKAGE_MATCH_SCORE}. Best score={match_score}"
+                print(f"Row {row_num}: package not matched, writing N/A | best score={match_score}")
 
             data = [
                 advertiser,
                 package_name,
                 url,
                 app_link,
-                app_link_time,
-                video_id,
-                video_time
+                process_time,
+                "text",       # Column F: text for all non-video ads
+                process_time
             ]
 
             safe_update_combined_row(row_num, data)
@@ -994,19 +1595,18 @@ def scrape_single_url(url_row):
             safe_add_log(
                 row_number=row_num,
                 status=status,
-                log_type="COMBINED",
+                log_type="NON_VIDEO_AD",
                 url=url,
-                video_id=video_id,
+                video_id="text",
                 app_link=app_link,
                 message=message
             )
 
-            print(f"✅ Row {row_num}: saved advertiser + video ID + app link + text")
+            print(f"Row {row_num}: saved NON-VIDEO ad advertiser + package + headline + description")
 
         except Exception as e:
             error_time = get_exact_time()
-
-            print(f"❌ Row {row_num} error at {error_time}: {e}")
+            print(f"Row {row_num} error at {error_time}: {e}")
 
             try:
                 data = [
@@ -1054,8 +1654,8 @@ def run_parallel_combined_scraper(max_workers=2):
         print("No transparency URLs found in column H.")
         return
 
-    print(f"🚀 Starting combined scraper for {len(url_rows)} rows")
-    print(f"⚡ Running parallel with max_workers={max_workers}")
+    print(f"Starting combined VIDEO + TEXT/IMAGE scraper for {len(url_rows)} rows")
+    print(f"Running parallel with max_workers={max_workers}")
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
@@ -1069,7 +1669,7 @@ def run_parallel_combined_scraper(max_workers=2):
             try:
                 future.result()
             except Exception as e:
-                print(f"❌ Worker failed for row {row_num}: {e}")
+                print(f"Worker failed for row {row_num}: {e}")
 
                 try:
                     safe_add_log(
@@ -1081,7 +1681,7 @@ def run_parallel_combined_scraper(max_workers=2):
                 except Exception:
                     pass
 
-    print("✅ Finished combined scraping")
+    print("Finished combined video + text/image scraping")
 
 
 if __name__ == "__main__":
