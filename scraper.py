@@ -610,49 +610,53 @@ def wait_and_extract_install_link(page, max_wait_seconds=35):
 
 def wait_and_extract_headline_description(page, max_wait_seconds=15):
     """
-    Polls for Headline and Description inside iframes ONLY.
-    Uses structural class patterns (-e-15, -e-67) and visibility checks 
-    to avoid grabbing hidden template text.
+    Polls for Headline and Description in main page DOM first,
+    then inside iframes.
+    Uses structural class patterns (-e-15, -e-67) and visibility checks
+    to avoid grabbing hidden/template text.
     """
+    import time
+
     js = r"""
     () => {
         let headText = "N/A";
         let descText = "N/A";
 
-        // Helper to ensure we don't grab hidden/template elements
         const isVisible = (el) => {
             if (!el) return false;
             const rect = el.getBoundingClientRect();
             const style = window.getComputedStyle(el);
-            return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none' && style.opacity !== '0';
+            return (
+                rect.width > 0 &&
+                rect.height > 0 &&
+                style.visibility !== 'hidden' &&
+                style.display !== 'none' &&
+                style.opacity !== '0'
+            );
         };
 
-        // SEARCH HEADLINE: Matches any class containing '-e-15' OR 'headline'
         const headNodes = document.querySelectorAll('[class*="-e-15"], [class*="headline"]');
         for (let el of headNodes) {
             if (isVisible(el)) {
                 let text = (el.innerText || el.textContent || "").replace(/\n/g, ' ').trim();
-                // Ensure it's not a template placeholder like {{headline}}
-                if (text.length > 1 && !text.includes('{{')) { 
-                    headText = text; 
-                    break; 
+                if (text.length > 1 && !text.includes('{{')) {
+                    headText = text;
+                    break;
                 }
             }
         }
 
-        // SEARCH DESCRIPTION: Matches any class containing '-e-67' OR 'long-description'
         const descNodes = document.querySelectorAll('[class*="-e-67"], [class*="long-description"]');
         for (let el of descNodes) {
             if (isVisible(el)) {
                 let text = (el.innerText || el.textContent || "").replace(/\n/g, ' ').trim();
-                if (text.length > 1 && text !== headText && !text.includes('{{')) { 
-                    descText = text; 
-                    break; 
+                if (text.length > 1 && text !== headText && !text.includes('{{')) {
+                    descText = text;
+                    break;
                 }
             }
         }
 
-        // If we found either one, return it
         if (headText !== "N/A" || descText !== "N/A") {
             return { headline: headText, description: descText };
         }
@@ -662,26 +666,35 @@ def wait_and_extract_headline_description(page, max_wait_seconds=15):
     """
 
     start = time.time()
-    
-    # Retry loop: Keeps trying for up to max_wait_seconds (15s)
+
     while time.time() - start < max_wait_seconds:
-        
-        # STRICTLY CHECK IFRAMES ONLY.
+
+        # 1) CHECK MAIN PAGE DOM DIRECTLY FIRST
+        try:
+            result = page.evaluate(js)
+            if result and (
+                result.get("headline", "N/A") != "N/A"
+                or result.get("description", "N/A") != "N/A"
+            ):
+                return result.get("headline", "N/A"), result.get("description", "N/A")
+        except Exception:
+            pass
+
+        # 2) THEN CHECK IFRAMES
         for frame in page.frames:
             try:
                 result = frame.evaluate(js)
-                if result and (result.get("headline", "N/A") != "N/A" or result.get("description", "N/A") != "N/A"):
+                if result and (
+                    result.get("headline", "N/A") != "N/A"
+                    or result.get("description", "N/A") != "N/A"
+                ):
                     return result.get("headline", "N/A"), result.get("description", "N/A")
             except Exception:
                 continue
-        
-        # Wait 1 second and loop again to let the ad iframe fully load
+
         page.wait_for_timeout(1000)
 
-    # If the timer runs out, return N/A
     return "N/A", "N/A"
-
-
 # =========================
 # ADVERTISER LOGIC
 # =========================
