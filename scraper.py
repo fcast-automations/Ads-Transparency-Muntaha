@@ -1,6 +1,8 @@
-# Combined Google Ads Transparency scraper - FIXED VERSION
+# Combined Google Ads Transparency scraper - FIXED VERSION v2
 # Video-ad detection logic is kept from the original scrapper.txt.
 # Non-video ads use text/image extraction + package matching from the uploaded non-video files.
+# 
+# FIX v2: Headline/Description now uses VISUAL HIERARCHY instead of fragile Google class selectors
 
 from playwright.sync_api import sync_playwright
 from urllib.parse import urlparse, parse_qs, unquote
@@ -612,7 +614,7 @@ def wait_and_extract_install_link(page, max_wait_seconds=35):
 
 
 # =========================
-# HEADLINE AND DESCRIPTION LOGIC - FIXED VERSION
+# HEADLINE AND DESCRIPTION LOGIC - FIX v2: VISUAL HIERARCHY
 # =========================
 
 def refresh_frame_context(page):
@@ -629,84 +631,163 @@ def refresh_frame_context(page):
 
 def wait_and_extract_headline_description(page, max_wait_seconds=15, current_url=""):
     """
-    FIX: Polls for Headline and Description inside iframes ONLY.
-    Uses structural class patterns (-e-15, -e-67) and visibility checks 
-    to avoid grabbing hidden template text.
+    FIX v2: Extract headline/description based on VISUAL HIERARCHY, not fragile class names.
     
-    IMPROVEMENTS:
-    1. Uses locator-based iframe access (more stable than page.frames iteration)
-    2. Validates extracted text is not from previous ads (deduplication)
-    3. Enhanced visibility check with viewport bounds
+    Key improvements:
+    1. Find largest text element in ad area (likely headline)
+    2. Find second-largest clearly visible text (likely description)
+    3. Ignore common UI elements (buttons, nav, metadata)
+    4. Validate against visible rendering, not hidden templates
+    5. NO reliance on Google's minified class names like "-e-15" or "-e-67"
     """
     js = r"""
     () => {
         let headText = "N/A";
         let descText = "N/A";
 
-        // FIX: Enhanced visibility check with viewport bounds
         const isVisible = (el) => {
             if (!el) return false;
             const rect = el.getBoundingClientRect();
             const style = window.getComputedStyle(el);
             
-            // Check if element is actually in viewport
+            // Exclude script/style/template tags
+            if (el.tagName && ['SCRIPT', 'STYLE', 'TEMPLATE', 'NOSCRIPT'].includes(el.tagName.toUpperCase())) {
+                return false;
+            }
+            
+            // Must actually be in viewport
             const inViewport = (
                 rect.width > 0 && 
                 rect.height > 0 && 
-                rect.top >= -100 &&
-                rect.left >= -100 &&
-                rect.bottom <= window.innerHeight + 100 &&
-                rect.right <= window.innerWidth + 100
+                rect.top >= -150 &&
+                rect.left >= -150 &&
+                rect.bottom <= window.innerHeight + 150 &&
+                rect.right <= window.innerWidth + 150
             );
             
             return inViewport && 
                    style.visibility !== 'hidden' && 
                    style.display !== 'none' && 
-                   style.opacity !== '0';
+                   style.opacity !== '0' &&
+                   style.pointerEvents !== 'none';
         };
 
-        // SEARCH HEADLINE: Matches any class containing '-e-15' OR 'headline'
-        const headNodes = document.querySelectorAll('[class*="-e-15"], [class*="headline"]');
-        for (let el of headNodes) {
-            if (isVisible(el)) {
-                let text = (el.innerText || el.textContent || "").replace(/\n/g, ' ').trim();
-                // Ensure it's not a template placeholder like {{headline}}
-                if (text.length > 1 && !text.includes('{{')) { 
-                    headText = text; 
-                    break; 
+        const isGarbageText = (txt) => {
+            if (!txt || txt.length < 3) return true;
+            
+            const lower = txt.toLowerCase();
+            const garbage = [
+                'install', 'download', 'get', 'open', 'visit site', 'learn more',
+                'sign in', 'log in', 'google', 'search', 'ad details', 'report',
+                'ads transparency', 'see more ads', 'last shown', 'shown in',
+                'privacy', 'terms', 'help', 'menu', 'home', '{{', '}}',
+                'click here', 'tap here', 'button', 'link', 'more'
+            ];
+            
+            // If it's a short button-like text, reject it
+            if (txt.length < 15 && garbage.some(g => lower === g || lower.startsWith(g + ' '))) {
+                return true;
+            }
+            
+            // Reject if it looks like a single-word button
+            if (txt.length < 20 && txt.split(/\s+/).length === 1 && 
+                ['install', 'download', 'get', 'open'].includes(lower)) {
+                return true;
+            }
+            
+            return false;
+        };
+
+        // Collect all text nodes with their visual metrics
+        const textElements = [];
+
+        document.querySelectorAll('*').forEach(el => {
+            if (el.childElementCount > 0) return; // Only leaf nodes
+            
+            const txt = (el.innerText || el.textContent || "").replace(/\n/g, ' ').trim();
+            if (isGarbageText(txt) || !isVisible(el)) return;
+            if (txt.length < 4 || txt.length > 200) return;
+            
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            const fontSize = parseFloat(style.fontSize || '12');
+            const fontWeight = parseFloat(style.fontWeight || '400');
+            
+            // Visual "importance" score = size + weight
+            const importance = fontSize + (fontWeight / 100) + (rect.width / 200);
+            
+            textElements.push({
+                text: txt,
+                fontSize: fontSize,
+                importance: importance,
+                width: rect.width,
+                height: rect.height,
+                x: rect.x,
+                y: rect.y
+            });
+        });
+
+        // Sort by visual importance (size/weight)
+        textElements.sort((a, b) => b.importance - a.importance);
+
+        // HEADLINE: Largest, most important text (typically 18-32px)
+        if (textElements.length > 0) {
+            const candidate = textElements[0];
+            if (candidate.fontSize >= 14 && candidate.fontSize <= 40 && candidate.text.length >= 5) {
+                headText = candidate.text;
+            }
+        }
+
+        // DESCRIPTION: Second text element, medium size (typically 12-18px), different from headline
+        if (textElements.length > 1) {
+            for (let i = 1; i < textElements.length; i++) {
+                const cand = textElements[i];
+                // Must be clearly different text, reasonable size
+                if (cand.text !== headText && 
+                    cand.fontSize >= 11 && 
+                    cand.fontSize <= 20 && 
+                    cand.text.length >= 15 &&
+                    cand.text.length <= 200) {
+                    descText = cand.text;
+                    break;
                 }
             }
         }
 
-        // SEARCH DESCRIPTION: Matches any class containing '-e-67' OR 'long-description'
-        const descNodes = document.querySelectorAll('[class*="-e-67"], [class*="long-description"]');
-        for (let el of descNodes) {
-            if (isVisible(el)) {
-                let text = (el.innerText || el.textContent || "").replace(/\n/g, ' ').trim();
-                if (text.length > 1 && text !== headText && !text.includes('{{')) { 
-                    descText = text; 
-                    break; 
-                }
-            }
-        }
-
-        // If we found either one, return it
-        if (headText !== "N/A" || descText !== "N/A") {
-            return { headline: headText, description: descText };
-        }
-
-        return null;
+        return { headline: headText, description: descText };
     }
     """
 
     start = time.time()
     
-    # FIX: Use locator-based iframe access instead of page.frames iteration
     while time.time() - start < max_wait_seconds:
         try:
-            # Get all iframes using locator (more stable than page.frames)
+            # Try main page first
+            result = page.evaluate(js)
+            if result and (result.get("headline", "N/A") != "N/A" or result.get("description", "N/A") != "N/A"):
+                headline = result.get("headline", "N/A")
+                description = result.get("description", "N/A")
+                
+                # Deduplication check
+                if current_url in _last_extracted_per_url:
+                    last = _last_extracted_per_url[current_url]
+                    if (headline == last.get("headline") and 
+                        description == last.get("description") and
+                        headline != "N/A"):
+                        continue  # Stale, skip
+                
+                _last_extracted_per_url[current_url] = {
+                    "headline": headline,
+                    "description": description
+                }
+                
+                return headline, description
+        except Exception:
+            pass
+        
+        # Try iframes as fallback
+        try:
             iframes = page.locator("iframe").all()
-            
             for iframe_el in iframes:
                 try:
                     frame = iframe_el.frame
@@ -718,16 +799,11 @@ def wait_and_extract_headline_description(page, max_wait_seconds=15, current_url
                         headline = result.get("headline", "N/A")
                         description = result.get("description", "N/A")
                         
-                        # FIX: Deduplication check - reject if identical to last extraction from same URL
                         if current_url in _last_extracted_per_url:
                             last = _last_extracted_per_url[current_url]
-                            if (headline == last.get("headline") and 
-                                description == last.get("description") and
-                                headline != "N/A"):
-                                # Same as last = likely stale/cached data, skip
+                            if headline == last.get("headline") and description == last.get("description"):
                                 continue
                         
-                        # Store this as the last extracted for this URL
                         _last_extracted_per_url[current_url] = {
                             "headline": headline,
                             "description": description
@@ -739,10 +815,8 @@ def wait_and_extract_headline_description(page, max_wait_seconds=15, current_url
         except Exception:
             pass
         
-        # Wait 1 second and loop again to let the ad iframe fully load
         page.wait_for_timeout(1000)
 
-    # If the timer runs out, return N/A
     return "N/A", "N/A"
 
 
@@ -1253,7 +1327,7 @@ def scrape_single_url(url_row):
                 app_link = wait_and_extract_install_link(page, max_wait_seconds=35)
                 app_link_time = get_exact_time()
 
-                # FIX: Pass current URL to headline extraction for deduplication
+                # FIX v2: Use visual hierarchy extraction
                 headline, description = wait_and_extract_headline_description(page, max_wait_seconds=15, current_url=url)
 
                 if app_link == "N/A":
