@@ -610,77 +610,234 @@ def wait_and_extract_install_link(page, max_wait_seconds=35):
 # HEADLINE AND DESCRIPTION LOGIC
 # =========================
 
+def _frame_visual_score(page, frame):
+    """
+    Scores only the iframe that is actually visible in the current viewport.
+    This prevents headline/description extraction from using old/hidden ad frames.
+    """
+    try:
+        if frame == page.main_frame:
+            return 8.0
+
+        iframe_el = frame.frame_element()
+        if not iframe_el:
+            return 0.0
+
+        try:
+            if hasattr(iframe_el, "is_visible") and not iframe_el.is_visible():
+                return 0.0
+        except Exception:
+            pass
+
+        box = iframe_el.bounding_box()
+        if not box:
+            return 0.0
+
+        width = float(box.get("width") or 0)
+        height = float(box.get("height") or 0)
+        if width < 80 or height < 50:
+            return 0.0
+
+        viewport = page.viewport_size or {"width": 1366, "height": 768}
+        vw = float(viewport.get("width") or 1366)
+        vh = float(viewport.get("height") or 768)
+
+        left = float(box.get("x") or 0)
+        top = float(box.get("y") or 0)
+        right = left + width
+        bottom = top + height
+
+        if right <= 0 or bottom <= 0 or left >= vw or top >= vh:
+            return 0.0
+
+        visible_width = max(0.0, min(right, vw) - max(left, 0.0))
+        visible_height = max(0.0, min(bottom, vh) - max(top, 0.0))
+        visible_area = visible_width * visible_height
+        if visible_area < 4000:
+            return 0.0
+
+        center_x = left + width / 2
+        center_y = top + height / 2
+
+        score = 20.0 + min(visible_area / 8000.0, 100.0)
+        if width >= 200 and height >= 100:
+            score += 40.0
+        if 40 <= center_x <= vw - 40 and 20 <= center_y <= vh - 20:
+            score += 20.0
+        if top > vh * 0.90:
+            score -= 40.0
+
+        return max(score, 0.0)
+
+    except Exception:
+        return 0.0
+
+
+def _ordered_ad_text_targets(page, include_main_page=True):
+    """
+    Returns visible ad frames first, sorted by visual area/position.
+    Main page DOM is only a low-priority fallback.
+    """
+    targets = []
+
+    for frame in page.frames:
+        if frame == page.main_frame:
+            continue
+        score = _frame_visual_score(page, frame)
+        if score > 0:
+            targets.append((score, frame))
+
+    targets.sort(key=lambda item: item[0], reverse=True)
+
+    if include_main_page:
+        targets.append((8.0, page))
+
+    return targets
+
+
 def wait_and_extract_headline_description(page, max_wait_seconds=15):
     """
-    Polls for Headline and Description inside iframes ONLY.
-    Uses structural class patterns (-e-15, -e-67) and visibility checks 
-    to avoid grabbing hidden template text.
+    Extracts headline/description from the visible active creative only.
+    Video detection and all other scraper logic are unchanged.
     """
     js = r"""
     () => {
-        let headText = "N/A";
-        let descText = "N/A";
+        const result = { headline: "N/A", description: "N/A", _score: 0 };
 
-        // Helper to ensure we don't grab hidden/template elements
+        const cleanText = (txt) => String(txt || "")
+            .replace(/\n/g, " ")
+            .replace(/\s+/g, " ")
+            .trim();
+
         const isVisible = (el) => {
             if (!el) return false;
             const rect = el.getBoundingClientRect();
             const style = window.getComputedStyle(el);
-            return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none' && style.opacity !== '0';
+            return (
+                rect.width > 0 &&
+                rect.height > 0 &&
+                rect.bottom > 0 &&
+                rect.right > 0 &&
+                rect.top < window.innerHeight &&
+                rect.left < window.innerWidth &&
+                style.visibility !== 'hidden' &&
+                style.display !== 'none' &&
+                style.opacity !== '0'
+            );
         };
 
-        // SEARCH HEADLINE: Matches any class containing '-e-15' OR 'headline'
-        const headNodes = document.querySelectorAll('[class*="-e-15"], [class*="headline"]');
-        for (let el of headNodes) {
-            if (isVisible(el)) {
-                let text = (el.innerText || el.textContent || "").replace(/\n/g, ' ').trim();
-                // Ensure it's not a template placeholder like {{headline}}
-                if (text.length > 1 && !text.includes('{{')) { 
-                    headText = text; 
-                    break; 
-                }
+        const isBadText = (txt) => {
+            const lower = cleanText(txt).toLowerCase();
+            if (!lower) return true;
+            const exactBlock = [
+                'install', 'download', 'get', 'open', 'visit site', 'learn more',
+                'sign in', 'google', 'search', 'ad details', 'ads transparency',
+                'ads transparency center', 'ads transparency centre', 'report this ad',
+                'see more ads', 'last shown', 'shown in', 'format:'
+            ];
+            if (exactBlock.includes(lower)) return true;
+            if (lower.includes('{{') || lower.includes('}}')) return true;
+            return false;
+        };
+
+        const toCandidate = (el) => {
+            const text = cleanText(el.innerText || el.textContent || "");
+            if (text.length < 2 || text.length > 220 || isBadText(text) || !isVisible(el)) return null;
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return {
+                el,
+                text,
+                x: rect.left,
+                y: rect.top,
+                width: rect.width,
+                height: rect.height,
+                font: parseFloat(style.fontSize || '0'),
+                cls: String(el.className || '').toLowerCase()
+            };
+        };
+
+        const dedupe = (items) => {
+            const seen = new Set();
+            const out = [];
+            for (const item of items) {
+                if (!item) continue;
+                const key = item.text.toLowerCase();
+                if (seen.has(key)) continue;
+                seen.add(key);
+                out.push(item);
             }
+            return out;
+        };
+
+        const headlineSelectors = '[class*="-e-15"], [class*="headline"], [aria-label*="Headline"], [aria-label*="headline"]';
+        let headlineCandidates = dedupe(Array.from(document.querySelectorAll(headlineSelectors)).map(toCandidate));
+        headlineCandidates = headlineCandidates.filter(c => c.text.length >= 2 && c.text.length <= 140);
+
+        headlineCandidates.sort((a, b) => {
+            const scoreA = 200 + a.font * 5 + Math.min(a.width, 500) / 8 - Math.max(a.text.length - 90, 0) * 2 - a.y / 30;
+            const scoreB = 200 + b.font * 5 + Math.min(b.width, 500) / 8 - Math.max(b.text.length - 90, 0) * 2 - b.y / 30;
+            return scoreB - scoreA;
+        });
+
+        let headline = headlineCandidates[0] || null;
+        if (headline) {
+            result.headline = headline.text;
+            result._score += 120;
         }
 
-        // SEARCH DESCRIPTION: Matches any class containing '-e-67' OR 'long-description'
-        const descNodes = document.querySelectorAll('[class*="-e-67"], [class*="long-description"]');
-        for (let el of descNodes) {
-            if (isVisible(el)) {
-                let text = (el.innerText || el.textContent || "").replace(/\n/g, ' ').trim();
-                if (text.length > 1 && text !== headText && !text.includes('{{')) { 
-                    descText = text; 
-                    break; 
-                }
-            }
+        const descSelectors = '[class*="-e-67"], [class*="long-description"], [class*="description"], [aria-label*="Description"], [aria-label*="description"]';
+        let descCandidates = dedupe(Array.from(document.querySelectorAll(descSelectors)).map(toCandidate));
+        descCandidates = descCandidates.filter(c => c.text !== result.headline && c.text.length >= 4 && c.text.length <= 260);
+
+        descCandidates.sort((a, b) => {
+            const relationA = headline ? (a.y >= headline.y - 5 ? 70 : -80) : 0;
+            const relationB = headline ? (b.y >= headline.y - 5 ? 70 : -80) : 0;
+            const scoreA = 180 + relationA + Math.min(a.text.length, 180) + Math.min(a.width, 600) / 12 - a.font;
+            const scoreB = 180 + relationB + Math.min(b.text.length, 180) + Math.min(b.width, 600) / 12 - b.font;
+            return scoreB - scoreA;
+        });
+
+        const description = descCandidates[0] || null;
+        if (description) {
+            result.description = description.text;
+            result._score += 100;
+            if (headline && description.y >= headline.y - 5) result._score += 40;
         }
 
-        // If we found either one, return it
-        if (headText !== "N/A" || descText !== "N/A") {
-            return { headline: headText, description: descText };
+        if (result.headline !== "N/A" || result.description !== "N/A") {
+            return result;
         }
 
         return null;
     }
     """
 
+    def read_target(target, visual_score):
+        try:
+            data = target.evaluate(js)
+            if data and (data.get("headline") != "N/A" or data.get("description") != "N/A"):
+                data["_total_score"] = float(data.get("_score") or 0) + float(visual_score or 0)
+                return data
+        except Exception:
+            return None
+        return None
+
     start = time.time()
-    
-    # Retry loop: Keeps trying for up to max_wait_seconds (15s)
+
     while time.time() - start < max_wait_seconds:
-        
-        # STRICTLY CHECK IFRAMES ONLY.
-        for frame in page.frames:
-            try:
-                result = frame.evaluate(js)
-                if result and (result.get("headline", "N/A") != "N/A" or result.get("description", "N/A") != "N/A"):
-                    return result.get("headline", "N/A"), result.get("description", "N/A")
-            except Exception:
-                continue
-        
-        # Wait 1 second and loop again to let the ad iframe fully load
+        best = None
+
+        for visual_score, target in _ordered_ad_text_targets(page, include_main_page=False):
+            data = read_target(target, visual_score)
+            if data and (best is None or data.get("_total_score", 0) > best.get("_total_score", 0)):
+                best = data
+
+        if best:
+            return best.get("headline", "N/A"), best.get("description", "N/A")
+
         page.wait_for_timeout(1000)
 
-    # If the timer runs out, return N/A
     return "N/A", "N/A"
 
 # =========================
@@ -971,15 +1128,16 @@ def extract_advertiser_from_page(page):
 
 def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
     """
-    Extracts visible headline/description for non-video ads.
-    It checks ad iframes first, then the main page DOM as a fallback.
+    Extracts visible headline/description for non-video ads from the active creative only.
+    It no longer accepts the first iframe that has text; it ranks visible frames and keeps
+    headline + description from the same frame to avoid mixing another ad's text.
     """
     js = r"""
     () => {
-        let result = { headline: "N/A", description: "N/A" };
+        const result = { headline: "N/A", description: "N/A", _score: 0 };
 
         const cleanText = (txt) => {
-            return (txt || "").replace(/\n/g, " ").replace(/\s+/g, " ").trim();
+            return String(txt || "").replace(/\n/g, " ").replace(/\s+/g, " ").trim();
         };
 
         const isVisible = (el) => {
@@ -1005,111 +1163,178 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
                 'install', 'download', 'get', 'open', 'visit site', 'learn more',
                 'sign in', 'google', 'search', 'ad details', 'ads transparency',
                 'ads transparency center', 'ads transparency centre', 'report this ad',
-                'see more ads', 'last shown', 'shown in', 'format:'
+                'see more ads', 'last shown', 'shown in', 'format:', 'close', 'menu'
             ];
             if (!lower) return true;
             if (exactBlock.includes(lower)) return true;
             if (lower.length < 15 && (lower.startsWith('install') || lower.startsWith('download') || lower.startsWith('get '))) return true;
             if (lower.includes('{{') || lower.includes('}}')) return true;
+            if (lower.includes('ads transparency')) return true;
             return false;
         };
 
-        const leafNodes = Array.from(document.querySelectorAll('*')).filter(el => {
-            if (el.childElementCount > 0) return false;
-            const txt = cleanText(el.innerText || el.textContent || "");
-            if (txt.length < 4 || txt.length > 180 || isBadText(txt)) return false;
-            return isVisible(el);
+        const candidateFromElement = (el, sourceType) => {
+            const text = cleanText(el.innerText || el.textContent || "");
+            if (text.length < 4 || text.length > 260 || isBadText(text) || !isVisible(el)) return null;
+
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            const cls = String(el.className || '').toLowerCase();
+            const aria = String(el.getAttribute('aria-label') || '').toLowerCase();
+
+            return {
+                el,
+                text,
+                sourceType,
+                x: rect.left,
+                y: rect.top,
+                width: rect.width,
+                height: rect.height,
+                font: parseFloat(style.fontSize || '0'),
+                weight: String(style.fontWeight || ''),
+                cls,
+                aria
+            };
+        };
+
+        const dedupe = (items) => {
+            const seen = new Set();
+            const out = [];
+            for (const item of items) {
+                if (!item) continue;
+                const key = item.text.toLowerCase();
+                if (seen.has(key)) continue;
+                seen.add(key);
+                out.push(item);
+            }
+            return out;
+        };
+
+        const bodyText = cleanText(document.body ? document.body.innerText : "");
+        if (!bodyText || bodyText.length < 4) return result;
+
+        const installSignal = Array.from(document.querySelectorAll('a, button')).some(el => {
+            if (!isVisible(el)) return false;
+            const text = cleanText(el.innerText || el.textContent || '').toLowerCase();
+            const href = String(el.getAttribute('href') || '').toLowerCase();
+            const cls = String(el.className || '').toLowerCase();
+            return text.includes('install') || text.includes('download') || text === 'get' || cls.includes('install-button') || href.includes('play.google.com') || href.includes('googleadservices.com/pagead/aclk');
         });
 
-        // Prefer known headline classes when Google provides them.
+        const visualSignal = Array.from(document.querySelectorAll('img, picture, canvas, svg, video')).some(el => {
+            if (!isVisible(el)) return false;
+            const rect = el.getBoundingClientRect();
+            return rect.width >= 80 && rect.height >= 50;
+        });
+
         const headlineSelectors = '[class*="-e-15"], [class*="headline"], [aria-label*="Headline"], [aria-label*="headline"]';
-        const knownHeadlines = Array.from(document.querySelectorAll(headlineSelectors)).filter(el => {
-            const txt = cleanText(el.innerText || el.textContent || "");
-            return txt.length >= 4 && txt.length <= 180 && !isBadText(txt) && isVisible(el);
+        let knownHeadlines = dedupe(Array.from(document.querySelectorAll(headlineSelectors)).map(el => candidateFromElement(el, 'knownHeadline')));
+        knownHeadlines = knownHeadlines.filter(c => c.text.length >= 4 && c.text.length <= 150);
+
+        const leafCandidates = dedupe(Array.from(document.querySelectorAll('body *')).map(el => {
+            if (el.childElementCount > 0) return null;
+            return candidateFromElement(el, 'leaf');
+        }));
+
+        const headlinePool = knownHeadlines.length ? knownHeadlines : leafCandidates.filter(c => c.text.length >= 4 && c.text.length <= 110);
+
+        headlinePool.sort((a, b) => {
+            const knownA = a.sourceType === 'knownHeadline' ? 220 : 0;
+            const knownB = b.sourceType === 'knownHeadline' ? 220 : 0;
+            const weightA = /bold|[6-9]00/.test(a.weight) ? 20 : 0;
+            const weightB = /bold|[6-9]00/.test(b.weight) ? 20 : 0;
+            const penaltyA = Math.max(a.text.length - 90, 0) * 2 + a.y / 35;
+            const penaltyB = Math.max(b.text.length - 90, 0) * 2 + b.y / 35;
+            const scoreA = knownA + a.font * 7 + Math.min(a.width, 520) / 8 + weightA - penaltyA;
+            const scoreB = knownB + b.font * 7 + Math.min(b.width, 520) / 8 + weightB - penaltyB;
+            return scoreB - scoreA;
         });
 
-        if (knownHeadlines.length > 0) {
-            result.headline = cleanText(knownHeadlines[0].innerText || knownHeadlines[0].textContent || "");
-        } else {
-            let maxFont = 0;
-            let bestEl = null;
-            for (let el of leafNodes) {
-                const txt = cleanText(el.innerText || el.textContent || "");
-                if (txt.length < 4 || txt.length > 90) continue;
-                const style = window.getComputedStyle(el);
-                const fontSize = parseFloat(style.fontSize || '0');
-                const rect = el.getBoundingClientRect();
-                const score = fontSize + Math.min(rect.width, 400) / 100;
-                if (score > maxFont) {
-                    maxFont = score;
-                    bestEl = el;
-                }
-            }
-            if (bestEl) {
-                result.headline = cleanText(bestEl.innerText || bestEl.textContent || "");
-            }
+        const headline = headlinePool[0] || null;
+        if (headline) {
+            result.headline = headline.text;
+            result._score += headline.sourceType === 'knownHeadline' ? 130 : 70;
         }
 
-        // Prefer known description classes.
         const descSelectors = '[class*="-e-67"], [class*="long-description"], [class*="description"], [aria-label*="Description"], [aria-label*="description"]';
-        const knownDescriptions = Array.from(document.querySelectorAll(descSelectors)).filter(el => {
-            const txt = cleanText(el.innerText || el.textContent || "");
-            return txt.length >= 8 && txt !== result.headline && !isBadText(txt) && isVisible(el);
+        let knownDescriptions = dedupe(Array.from(document.querySelectorAll(descSelectors)).map(el => candidateFromElement(el, 'knownDescription')));
+        knownDescriptions = knownDescriptions.filter(c => c.text !== result.headline && c.text.length >= 8 && c.text.length <= 280);
+
+        let descPool = knownDescriptions.length ? knownDescriptions : leafCandidates.filter(c => {
+            if (c.text === result.headline) return false;
+            if (c.text.length < 12 || c.text.length > 240) return false;
+            return true;
         });
 
-        if (knownDescriptions.length > 0) {
-            result.description = cleanText(knownDescriptions[0].innerText || knownDescriptions[0].textContent || "");
-        } else {
-            let bestScore = 0;
-            let bestDesc = null;
-            for (let el of leafNodes) {
-                const txt = cleanText(el.innerText || el.textContent || "");
-                if (txt === result.headline || txt.length < 12 || txt.length > 220 || isBadText(txt)) continue;
-                const rect = el.getBoundingClientRect();
-                const style = window.getComputedStyle(el);
-                const fontSize = parseFloat(style.fontSize || '0');
-                // Description is normally longer text, not necessarily largest font.
-                const score = Math.min(txt.length, 160) + Math.min(rect.width, 500) / 20 - fontSize;
-                if (score > bestScore) {
-                    bestScore = score;
-                    bestDesc = el;
-                }
-            }
-            if (bestDesc) {
-                result.description = cleanText(bestDesc.innerText || bestDesc.textContent || "");
-            }
+        descPool.sort((a, b) => {
+            const knownA = a.sourceType === 'knownDescription' ? 180 : 0;
+            const knownB = b.sourceType === 'knownDescription' ? 180 : 0;
+            const relationA = headline ? (a.y >= headline.y - 5 ? 80 : -140) : 0;
+            const relationB = headline ? (b.y >= headline.y - 5 ? 80 : -140) : 0;
+            const distanceA = headline ? Math.abs(a.y - headline.y) / 8 : 0;
+            const distanceB = headline ? Math.abs(b.y - headline.y) / 8 : 0;
+            const scoreA = knownA + relationA + Math.min(a.text.length, 190) + Math.min(a.width, 620) / 12 - a.font - distanceA;
+            const scoreB = knownB + relationB + Math.min(b.text.length, 190) + Math.min(b.width, 620) / 12 - b.font - distanceB;
+            return scoreB - scoreA;
+        });
+
+        const description = descPool[0] || null;
+        if (description) {
+            result.description = description.text;
+            result._score += description.sourceType === 'knownDescription' ? 110 : 60;
+            if (headline && description.y >= headline.y - 5) result._score += 35;
         }
+
+        if (installSignal) result._score += 20;
+        if (visualSignal) result._score += 10;
+        if (result.headline !== "N/A" && result.description !== "N/A") result._score += 30;
 
         return result;
     }
     """
 
-    def read_target(target):
+    def read_target(target, visual_score):
         try:
             data = target.evaluate(js)
-            if data and (data.get("headline") != "N/A" or data.get("description") != "N/A"):
-                return data
+            if not data:
+                return None
+
+            headline = data.get("headline", "N/A")
+            description = data.get("description", "N/A")
+            if headline == "N/A" and description == "N/A":
+                return None
+
+            data["_total_score"] = float(data.get("_score") or 0) + float(visual_score or 0)
+            return data
         except Exception:
             return None
-        return None
 
     start_time = time.time()
+    best_overall = None
 
     while time.time() - start_time < max_wait_seconds:
-        # 1) Prefer iframes because the ad creative usually lives there.
-        for frame in page.frames:
-            if frame == page.main_frame:
-                continue
-            data = read_target(frame)
-            if data and is_valid_text_ad(data.get("headline"), data.get("description")):
-                return data
+        candidates = []
 
-        # 2) Fallback: check main page DOM directly too.
-        data = read_target(page)
-        if data and is_valid_text_ad(data.get("headline"), data.get("description")):
-            return data
+        for visual_score, target in _ordered_ad_text_targets(page, include_main_page=True):
+            data = read_target(target, visual_score)
+            if data and is_valid_text_ad(data.get("headline"), data.get("description")):
+                candidates.append(data)
+
+        if candidates:
+            candidates.sort(key=lambda item: item.get("_total_score", 0), reverse=True)
+            best = candidates[0]
+
+            if best_overall is None or best.get("_total_score", 0) > best_overall.get("_total_score", 0):
+                best_overall = best
+
+            # Return immediately only when both fields are present from a strong visible target.
+            if best.get("headline") != "N/A" and best.get("description") != "N/A" and best.get("_total_score", 0) >= 120:
+                return {"headline": best.get("headline", "N/A"), "description": best.get("description", "N/A")}
 
         page.wait_for_timeout(1000)
+
+    if best_overall:
+        return {"headline": best_overall.get("headline", "N/A"), "description": best_overall.get("description", "N/A")}
 
     return {"headline": "N/A", "description": "N/A"}
 
