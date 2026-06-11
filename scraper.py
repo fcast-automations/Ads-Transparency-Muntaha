@@ -620,6 +620,19 @@ def wait_and_extract_headline_description(page, max_wait_seconds=15):
     () => {
         let result = { headline: "N/A", description: "N/A" };
 
+        // 🚨 FIX: Find the active modal/dialog so we DO NOT scan the background grid
+        let rootNode = document;
+        const possibleModals = document.querySelectorAll('material-dialog, [role="dialog"], [aria-modal="true"], dialog, .creative-detail-container');
+        
+        for (let modal of possibleModals) {
+            const rect = modal.getBoundingClientRect();
+            // If the modal has dimensions and is visible, lock our search to ONLY inside this modal
+            if (rect.width > 0 && rect.height > 0 && window.getComputedStyle(modal).visibility !== 'hidden') {
+                rootNode = modal; 
+                break;
+            }
+        }
+
         const cleanText = (txt) => {
             return (txt || "").replace(/\n/g, " ").replace(/\s+/g, " ").trim();
         };
@@ -641,7 +654,6 @@ def wait_and_extract_headline_description(page, max_wait_seconds=15):
             );
         };
 
-        // ADDED MORE BAD WORDS TO FILTER OUT FALSE POSITIVES
         const isBadText = (txt) => {
             const lower = cleanText(txt).toLowerCase();
             const exactBlock = [
@@ -657,24 +669,22 @@ def wait_and_extract_headline_description(page, max_wait_seconds=15):
             return false;
         };
 
-        // FIXED: Replaced strict childElementCount with a smarter container check
-        const textNodes = Array.from(document.querySelectorAll('*')).filter(el => {
-            // Ignore massive layout containers that hold the whole page
+        // Note we are using rootNode.querySelectorAll instead of document.querySelectorAll
+        const textNodes = Array.from(rootNode.querySelectorAll('*')).filter(el => {
             if (['BODY', 'HTML', 'MAIN', 'ARTICLE', 'SECTION', 'FORM'].includes(el.tagName)) return false;
             
             const txt = cleanText(el.innerText || el.textContent || "");
             if (txt.length < 4 || txt.length > 250 || isBadText(txt)) return false;
 
-            // Only ignore if the element contains large block-level children (meaning it's a layout box, not a text box)
             const blockChildren = Array.from(el.children).filter(c => ['DIV', 'P', 'UL', 'LI', 'TABLE'].includes(c.tagName));
             if (blockChildren.length > 1) return false;
 
             return isVisible(el);
         });
 
-        // 1. Check for standard Google classes first (including generic 'headline' or 'title' words)
+        // 1. Extract Headline
         const headlineSelectors = '[class*="-e-15"], [class*="headline"], [class*="title"], [aria-label*="Headline"], [aria-label*="title"]';
-        const knownHeadlines = Array.from(document.querySelectorAll(headlineSelectors)).filter(el => {
+        const knownHeadlines = Array.from(rootNode.querySelectorAll(headlineSelectors)).filter(el => {
             const txt = cleanText(el.innerText || el.textContent || "");
             return txt.length >= 4 && txt.length <= 180 && !isBadText(txt) && isVisible(el);
         });
@@ -682,7 +692,6 @@ def wait_and_extract_headline_description(page, max_wait_seconds=15):
         if (knownHeadlines.length > 0) {
             result.headline = cleanText(knownHeadlines[0].innerText || knownHeadlines[0].textContent || "");
         } else {
-            // Fallback: Find the most prominent text that looks like a headline
             let maxScore = 0;
             let bestEl = null;
             for (let el of textNodes) {
@@ -693,10 +702,9 @@ def wait_and_extract_headline_description(page, max_wait_seconds=15):
                 const fontSize = parseFloat(style.fontSize || '0');
                 const fontWeight = parseFloat(style.fontWeight || '400');
                 
-                // Score based on font size and boldness, favoring text at the top of the ad
                 const rect = el.getBoundingClientRect();
                 let score = fontSize + (fontWeight > 500 ? 5 : 0);
-                if (rect.y < 300) score += 10; // Boost elements higher up on the screen
+                if (rect.y < 300) score += 10; 
                 
                 if (score > maxScore) {
                     maxScore = score;
@@ -708,7 +716,7 @@ def wait_and_extract_headline_description(page, max_wait_seconds=15):
 
         // 2. Extract Description
         const descSelectors = '[class*="-e-67"], [class*="long-description"], [class*="description"], [class*="body"], [aria-label*="Description"]';
-        const knownDescriptions = Array.from(document.querySelectorAll(descSelectors)).filter(el => {
+        const knownDescriptions = Array.from(rootNode.querySelectorAll(descSelectors)).filter(el => {
             const txt = cleanText(el.innerText || el.textContent || "");
             return txt.length >= 15 && txt !== result.headline && !isBadText(txt) && isVisible(el);
         });
@@ -716,7 +724,6 @@ def wait_and_extract_headline_description(page, max_wait_seconds=15):
         if (knownDescriptions.length > 0) {
             result.description = cleanText(knownDescriptions[0].innerText || knownDescriptions[0].textContent || "");
         } else {
-            // Fallback: Find the longest remaining paragraph that isn't the headline
             let bestLength = 0;
             let bestDesc = null;
             for (let el of textNodes) {
