@@ -1,7 +1,3 @@
-# Combined Google Ads Transparency scraper
-# Video-ad detection logic is kept from the original scrapper.txt.
-# Non-video ads use text/image extraction + package matching from the uploaded non-video files.
-
 from playwright.sync_api import sync_playwright
 from urllib.parse import urlparse, parse_qs, unquote
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -606,181 +602,88 @@ def wait_and_extract_install_link(page, max_wait_seconds=35):
     return "N/A"
 
 
-
-def reset_page_to_current_ad_area(page):
-    """
-    Keep extraction tied to the opened Transparency URL's main ad area.
-    Video detection may scroll the page while looking for media; without this reset,
-    headline/description can be picked from another visible ad lower on the page.
-    """
-    try:
-        page.evaluate("""() => {
-            window.scrollTo(0, 0);
-            const adDetails = Array.from(document.querySelectorAll('*')).find(el => {
-                const txt = (el.innerText || el.textContent || '').trim().toLowerCase();
-                return txt === 'ad details' || txt.includes('information about this ad');
-            });
-            if (adDetails) {
-                adDetails.scrollIntoView({block: 'start', inline: 'nearest'});
-                window.scrollBy(0, -80);
-            }
-        }""")
-        page.wait_for_timeout(700)
-    except Exception:
-        pass
-
-
-def _frame_visible_score(frame):
-    """
-    Return a score only for iframes visible in the current viewport.
-    Higher score = closer to the active top creative area.
-    """
-    try:
-        element = frame.frame_element()
-        box = element.bounding_box(timeout=1200)
-        if not box:
-            return None
-
-        width = float(box.get('width') or 0)
-        height = float(box.get('height') or 0)
-        x = float(box.get('x') or 0)
-        y = float(box.get('y') or 0)
-
-        if width < 80 or height < 50:
-            return None
-        if x > 1400 or x + width < 0:
-            return None
-        if y > 850 or y + height < -20:
-            return None
-
-        # Prefer visible creative frames near the top/current ad area.
-        area_bonus = min((width * height) / 1000.0, 350.0)
-        top_bonus = max(0.0, 900.0 - max(y, 0.0))
-        return top_bonus + area_bonus
-    except Exception:
-        return None
-
-
-def _visible_frames_by_priority(page):
-    scored = []
-    for frame in page.frames:
-        if frame == page.main_frame:
-            continue
-        score = _frame_visible_score(frame)
-        if score is None:
-            continue
-        scored.append((score, frame))
-    scored.sort(key=lambda item: item[0], reverse=True)
-    return [frame for _, frame in scored]
-
 # =========================
 # HEADLINE AND DESCRIPTION LOGIC
 # =========================
 
 def wait_and_extract_headline_description(page, max_wait_seconds=15):
     """
-    Extract headline/description only from the active visible creative for the opened URL.
-    Uses the requested selectors:
-      headline:    [class*="-e-15"], [class*="headline"]
-      description: [class*="-e-67"], [class*="long-description"]
+    Polls for Headline and Description inside iframes ONLY.
+    Uses structural class patterns (-e-15, -e-67) and visibility checks 
+    to avoid grabbing hidden template text.
     """
     js = r"""
     () => {
         let headText = "N/A";
         let descText = "N/A";
 
-        const cleanText = (txt) => {
-            return (txt || "").replace(/\n/g, " ").replace(/\s+/g, " ").trim();
-        };
-
+        // Helper to ensure we don't grab hidden/template elements
         const isVisible = (el) => {
             if (!el) return false;
             const rect = el.getBoundingClientRect();
             const style = window.getComputedStyle(el);
-            return (
-                rect.width > 0 &&
-                rect.height > 0 &&
-                rect.bottom > 0 &&
-                rect.right > 0 &&
-                rect.top < window.innerHeight &&
-                rect.left < window.innerWidth &&
-                style.visibility !== 'hidden' &&
-                style.display !== 'none' &&
-                style.opacity !== '0'
-            );
+            return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none' && style.opacity !== '0';
         };
 
-        const badText = (txt) => {
-            const lower = cleanText(txt).toLowerCase();
-            if (!lower) return true;
-            if (lower.includes('{{') || lower.includes('}}')) return true;
-            const block = [
-                'install', 'download', 'get', 'open', 'visit site', 'learn more',
-                'sign in', 'google', 'search', 'ad details', 'ads transparency',
-                'ads transparency center', 'ads transparency centre', 'report this ad',
-                'see more ads', 'last shown', 'shown in', 'format:'
-            ];
-            return block.includes(lower);
-        };
-
-        const headNodes = Array.from(document.querySelectorAll('[class*="-e-15"], [class*="headline"]'));
+        // SEARCH HEADLINE: Matches any class containing '-e-15' OR 'headline'
+        const headNodes = document.querySelectorAll('[class*="-e-15"], [class*="headline"]');
         for (let el of headNodes) {
-            const text = cleanText(el.innerText || el.textContent || "");
-            if (isVisible(el) && text.length > 1 && !badText(text)) {
-                headText = text;
-                break;
+            if (isVisible(el)) {
+                let text = (el.innerText || el.textContent || "").replace(/\n/g, ' ').trim();
+                // Ensure it's not a template placeholder like {{headline}}
+                if (text.length > 1 && !text.includes('{{')) { 
+                    headText = text; 
+                    break; 
+                }
             }
         }
 
-        const descNodes = Array.from(document.querySelectorAll('[class*="-e-67"], [class*="long-description"]'));
+        // SEARCH DESCRIPTION: Matches any class containing '-e-67' OR 'long-description'
+        const descNodes = document.querySelectorAll('[class*="-e-67"], [class*="long-description"]');
         for (let el of descNodes) {
-            const text = cleanText(el.innerText || el.textContent || "");
-            if (isVisible(el) && text.length > 1 && text !== headText && !badText(text)) {
-                descText = text;
-                break;
+            if (isVisible(el)) {
+                let text = (el.innerText || el.textContent || "").replace(/\n/g, ' ').trim();
+                if (text.length > 1 && text !== headText && !text.includes('{{')) { 
+                    descText = text; 
+                    break; 
+                }
             }
         }
 
+        // If we found either one, return it
         if (headText !== "N/A" || descText !== "N/A") {
             return { headline: headText, description: descText };
         }
+
         return null;
     }
     """
 
-    def read_target(target):
-        try:
-            result = target.evaluate(js)
-            if result and (result.get("headline", "N/A") != "N/A" or result.get("description", "N/A") != "N/A"):
-                return result.get("headline", "N/A"), result.get("description", "N/A")
-        except Exception:
-            pass
-        return None
-
     start = time.time()
+    
+    # Retry loop: Keeps trying for up to max_wait_seconds (15s)
     while time.time() - start < max_wait_seconds:
-        reset_page_to_current_ad_area(page)
-
-        # 1) Only visible top/current creative iframes, not every loaded iframe.
-        for frame in _visible_frames_by_priority(page):
-            result = read_target(frame)
-            if result:
-                return result
-
-        # 2) Fallback: main DOM of this same opened Transparency URL.
-        result = read_target(page)
-        if result:
-            return result
-
+        
+        # STRICTLY CHECK IFRAMES ONLY.
+        for frame in page.frames:
+            try:
+                result = frame.evaluate(js)
+                if result and (result.get("headline", "N/A") != "N/A" or result.get("description", "N/A") != "N/A"):
+                    return result.get("headline", "N/A"), result.get("description", "N/A")
+            except Exception:
+                continue
+        
+        # Wait 1 second and loop again to let the ad iframe fully load
         page.wait_for_timeout(1000)
 
+    # If the timer runs out, return N/A
     return "N/A", "N/A"
 
 # =========================
 # STRICT TEXT-AD PACKAGE MATCHER
 # =========================
 
-MIN_PACKAGE_MATCH_SCORE = 0.76
+MIN_PACKAGE_MATCH_SCORE = 0.92
 
 _GENERIC_PACKAGE_TOKENS = {
     "com", "net", "org", "co", "io", "app", "apps", "android", "mobile",
@@ -890,7 +793,7 @@ def score_package_against_text(pkg, headline, description):
 def get_best_matching_package(headline, description, package_list, min_score=MIN_PACKAGE_MATCH_SCORE):
     """
     Compare headline + description with every found package.
-    Returns (package, score). If no package score is at least 0.76, returns (None, best_score).
+    Returns (package, score). If no package score is at least 0.92, returns (None, best_score).
     """
     if not package_list:
         return None, 0.0
@@ -1063,22 +966,79 @@ def extract_advertiser_from_page(page):
     return "N/A"
 
 def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
-    """
-    Non-video headline/description extraction.
-    Uses ONLY the requested selectors through wait_and_extract_headline_description():
-      headline:    [class*="-e-15"], [class*="headline"]
-      description: [class*="-e-67"], [class*="long-description"]
+    js = r"""
+    () => {
+        let result = { headline: "N/A", description: "N/A" };
+        const isBadText = (txt) => {
+            const lower = txt.toLowerCase();
+            const exactBlock = ['install', 'download', 'get', 'open', 'visit site', 'learn more', 'sign in', 'google', 'search', 'ad details', 'ads transparency'];
+            if (exactBlock.includes(lower)) return true;
+            if (lower.length < 15 && (lower.startsWith('install') || lower.startsWith('download') || lower.startsWith('get '))) return true;
+            return false;
+        };
+        
+        // 1. EXTRACT HEADLINE (Visual only)
+        let maxFont = 0;
+        let bestEl = null;
+        for (let el of document.querySelectorAll('*')) {
+            if (el.childElementCount > 0) continue;
+            let txt = (el.innerText || "").trim();
+            if (txt.length < 4 || isBadText(txt)) continue;
+            
+            let rect = el.getBoundingClientRect();
+            if (rect.width === 0 || rect.height === 0) continue;
 
-    This keeps extraction tied to the active visible creative frame for the opened URL.
-    """
-    headline, description = wait_and_extract_headline_description(
-        page,
-        max_wait_seconds=max_wait_seconds
-    )
-    return {
-        "headline": clean_text(headline),
-        "description": clean_text(description)
+            let style = window.getComputedStyle(el);
+            if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') continue;
+            
+            let fontSize = parseFloat(style.fontSize || '0');
+            if (fontSize > maxFont) {
+                maxFont = fontSize;
+                bestEl = el;
+            }
+        }
+
+        if (bestEl) {
+            result.headline = bestEl.innerText.replace(/\n/g, ' ').trim();
+            
+            // 2. EXTRACT DESCRIPTION (Visual only)
+            let maxLen = 0;
+            for (let el of document.querySelectorAll('*')) {
+                if (el.childElementCount > 0) continue;
+                let txt = (el.innerText || "").replace(/\n/g, ' ').trim();
+                if (txt === result.headline || txt.length < 15 || isBadText(txt)) continue;
+                
+                let rect = el.getBoundingClientRect();
+                if (rect.width === 0 || rect.height === 0) continue;
+
+                let style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden') continue;
+                
+                if (txt.length > maxLen) {
+                    maxLen = txt.length;
+                    result.description = txt;
+                }
+            }
+        }
+        return result;
     }
+    """
+
+    start_time = time.time()
+
+    while time.time() - start_time < max_wait_seconds:
+        for frame in page.frames:
+            if frame == page.main_frame:
+                continue
+            try:
+                data = frame.evaluate(js)
+                if data["headline"] != "N/A":
+                    return data
+            except Exception:
+                continue
+        page.wait_for_timeout(1000)
+
+    return {"headline": "N/A", "description": "N/A"}
 
 # =========================
 # MAIN COMBINED SCRAPER: VIDEO ADS + TEXT ADS
@@ -1089,62 +1049,6 @@ def is_valid_text_ad(headline, description):
         return True
     if description and description != "N/A" and len(clean_text(description)) >= 15:
         return True
-    return False
-
-def has_visible_image_creative(page):
-    """
-    Detects likely image/display creative for non-video ads.
-    Used only after video detection returns N/A.
-    """
-    js = r"""
-    () => {
-        const isVisible = (el) => {
-            if (!el) return false;
-            const rect = el.getBoundingClientRect();
-            const style = window.getComputedStyle(el);
-            return (
-                rect.width >= 120 &&
-                rect.height >= 80 &&
-                rect.bottom > 0 &&
-                rect.right > 0 &&
-                rect.top < window.innerHeight &&
-                rect.left < window.innerWidth &&
-                style.visibility !== 'hidden' &&
-                style.display !== 'none' &&
-                style.opacity !== '0'
-            );
-        };
-
-        const imageLike = Array.from(document.querySelectorAll('img, picture, canvas, svg')).some(el => {
-            const src = String(el.getAttribute('src') || '').toLowerCase();
-            const alt = String(el.getAttribute('alt') || '').toLowerCase();
-            if (src.includes('googlelogo') || alt.includes('google')) return false;
-            return isVisible(el);
-        });
-
-        if (imageLike) return true;
-
-        return Array.from(document.querySelectorAll('*')).some(el => {
-            if (!isVisible(el)) return false;
-            const bg = window.getComputedStyle(el).backgroundImage || '';
-            return bg && bg !== 'none' && bg.includes('url(');
-        });
-    }
-    """
-
-    try:
-        if page.evaluate(js):
-            return True
-    except Exception:
-        pass
-
-    for frame in page.frames:
-        try:
-            if frame.evaluate(js):
-                return True
-        except Exception:
-            continue
-
     return False
 
 
@@ -1174,7 +1078,7 @@ def scrape_single_url(url_row):
         page = context.new_page()
         captured = {"video_id": "N/A"}
 
-        # ORIGINAL VIDEO RESPONSE HANDLER - kept unchanged.
+        # YOUR ORIGINAL VIDEO RESPONSE HANDLER - unchanged.
         def handle_response(response):
             try:
                 if not is_real_video_response(response):
@@ -1202,7 +1106,7 @@ def scrape_single_url(url_row):
                 status="STARTED",
                 log_type="COMBINED",
                 url=url,
-                message="Started combined video/text/image ad extraction"
+                message="Started combined video/text ad extraction"
             )
 
             page.goto(url, wait_until="domcontentloaded", timeout=60000)
@@ -1210,11 +1114,12 @@ def scrape_single_url(url_row):
 
             advertiser = extract_advertiser_from_page(page)
 
-            # VIDEO LOGIC: same original flow. No text/image extraction runs before this.
+            # Capture visible text-ad data early, before video fallback clicks can disturb text creatives.
+            early_text_data = wait_and_extract_text_ad_details(page, max_wait_seconds=5)
+
+            # VIDEO LOGIC: kept same detection flow.
             video_id = detect_video_id(page, captured)
             video_time = get_exact_time()
-
-            reset_page_to_current_ad_area(page)
 
             # =========================
             # VIDEO AD PATH
@@ -1225,7 +1130,6 @@ def scrape_single_url(url_row):
                 app_link = wait_and_extract_install_link(page, max_wait_seconds=35)
                 app_link_time = get_exact_time()
 
-                reset_page_to_current_ad_area(page)
                 headline, description = wait_and_extract_headline_description(page, max_wait_seconds=15)
 
                 if app_link == "N/A":
@@ -1264,24 +1168,19 @@ def scrape_single_url(url_row):
                 return
 
             # =========================
-            # NON-VIDEO PATH: TEXT + IMAGE ADS
+            # TEXT AD PATH
             # =========================
-            print(f"📄 Row {row_num}: no video found, checking text/image ad")
+            print(f"📄 Row {row_num}: no video found, checking text ad")
 
-            text_data = wait_and_extract_text_ad_details(page, max_wait_seconds=15)
+            text_data = early_text_data
+            if not is_valid_text_ad(text_data.get("headline"), text_data.get("description")):
+                text_data = wait_and_extract_text_ad_details(page, max_wait_seconds=15)
+
             headline = clean_text(text_data.get("headline"))
             description = clean_text(text_data.get("description"))
             process_time = get_exact_time()
-            has_text = is_valid_text_ad(headline, description)
 
-            # First try visible install/app link from the active creative.
-            visible_app_link = wait_and_extract_install_link(page, max_wait_seconds=8)
-            visible_package = extract_package_name(visible_app_link)
-
-            is_image_like = has_visible_image_creative(page)
-            ad_type = "text" if has_text else "image" if (is_image_like or visible_package != "N/A") else "N/A"
-
-            if not has_text and visible_package == "N/A" and not is_image_like:
+            if not is_valid_text_ad(headline, description):
                 data = [
                     advertiser,
                     "N/A",
@@ -1297,76 +1196,74 @@ def scrape_single_url(url_row):
 
                 safe_add_log(
                     row_number=row_num,
-                    status="NO_VIDEO_NO_TEXT_IMAGE",
+                    status="NO_VIDEO_NO_TEXT",
                     log_type="COMBINED",
                     url=url,
                     video_id="N/A",
                     app_link="N/A",
-                    message="No video ID and no valid text/image creative found"
+                    message="No video ID and no valid text ad headline/description found"
                 )
 
-                print(f"⏭ Row {row_num}: no video and no valid text/image ad found")
+                print(f"⏭ Row {row_num}: no video and no valid text ad found")
                 return
 
-            if has_text:
-                print(f"🔎 Row {row_num}: text/image headline -> {headline}")
-            else:
-                print(f"🖼 Row {row_num}: likely image ad, headline/description not found")
-
+            print(f"🔎 Row {row_num}: text/image headline -> {headline}")
             print(f"📦 Row {row_num}: resolving package from visible install link first")
+
+            # BEST SOURCE FOR IMAGE ADS:
+            # Use the visible install/app link from the active creative, not the first package hidden in HTML.
+            visible_app_link = wait_and_extract_install_link(page, max_wait_seconds=8)
+            visible_package = extract_package_name(visible_app_link)
 
             if visible_package != "N/A":
                 package_name = visible_package
                 app_link = visible_app_link
                 match_score = 1.0
                 status = "SUCCESS"
-                message = f"Non-video {ad_type} ad package extracted from visible install link"
+                message = "Non-video ad package extracted from visible install link"
                 print(f"✅ Row {row_num}: package from visible install link -> {package_name}")
             else:
-                package_name = None
-                match_score = 0.0
+                print(f"📦 Row {row_num}: visible install link not found, strict matching with headline + description")
 
-                if has_text:
-                    print(f"📦 Row {row_num}: visible install link not found, strict matching with headline + description")
-                    all_found_packages = extract_package_from_page(page)
-                    package_name, match_score = get_best_matching_package(headline, description, all_found_packages)
+                all_found_packages = extract_package_from_page(page)
+                package_name, match_score = get_best_matching_package(headline, description, all_found_packages)
 
                 if package_name:
                     app_link = f"https://play.google.com/store/apps/details?id={package_name}"
                     status = "SUCCESS"
-                    message = f"Non-video {ad_type} ad package strictly matched with score {match_score}"
+                    message = f"Non-video ad package strictly matched with score {match_score}"
                     print(f"✅ Row {row_num}: strict matched package -> {package_name} | score={match_score}")
                 else:
                     package_name = "N/A"
                     app_link = "N/A"
                     status = "NON_VIDEO_PACKAGE_NOT_FOUND"
-                    message = f"Non-video {ad_type} ad found, but package score below 0.76. Best score={match_score}"
-                    print(f"⚠️ Row {row_num}: package score below 0.76, writing N/A | best score={match_score}")
+                    message = f"Non-video ad found, but package score below 0.92. Best score={match_score}"
+                    print(f"⚠️ Row {row_num}: package score below 0.92, writing N/A | best score={match_score}")
 
             data = [
                 advertiser,
-                package_name,
+                package_name,  # N/A when package not matched
                 url,
                 app_link,
                 process_time,
-                ad_type,      # Column F: text/image for non-video ads
+                "text",       # Column F: text for text ads
                 process_time
             ]
 
             safe_update_combined_row(row_num, data)
-            safe_update_headline_desc(row_num, headline if has_text else "N/A", description if has_text else "N/A")
+            safe_update_headline_desc(row_num, headline, description)
 
             safe_add_log(
                 row_number=row_num,
                 status=status,
                 log_type="NON_VIDEO_AD",
                 url=url,
-                video_id=ad_type,
+                video_id="text",
                 app_link=app_link,
                 message=message
             )
 
-            print(f"✅ Row {row_num}: saved NON-VIDEO {ad_type} ad advertiser + package + headline + description")
+            print(f"✅ Row {row_num}: saved NON-VIDEO ad advertiser + package + headline + description")
 
         except Exception as e:
             error_time = get_exact_time()
@@ -1403,6 +1300,7 @@ def scrape_single_url(url_row):
             page.close()
             context.close()
             browser.close()
+
 
 def run_parallel_combined_scraper(max_workers=2):
     urls = sheets.get_urls_with_retry()
