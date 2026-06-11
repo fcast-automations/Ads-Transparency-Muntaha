@@ -683,7 +683,10 @@ def wait_and_extract_headline_description(page, max_wait_seconds=15):
 # STRICT TEXT-AD PACKAGE MATCHER
 # =========================
 
-MIN_PACKAGE_MATCH_SCORE = 0.92
+# Character matching threshold for non-video/text/image ads.
+# 0.76 is intentionally lower than 0.92 because text ads often have
+# package tokens joined differently from the visible headline/description.
+MIN_PACKAGE_MATCH_SCORE = 0.76
 
 _GENERIC_PACKAGE_TOKENS = {
     "com", "net", "org", "co", "io", "app", "apps", "android", "mobile",
@@ -707,7 +710,7 @@ def split_words_for_comparison(text):
 
 
 def package_tokens_for_matching(pkg):
-    """Turn com.example.musicplayer into useful tokens like example/musicplayer."""
+    """Turn com.example.musicplayer into useful non-generic tokens."""
     if not pkg:
         return []
 
@@ -725,75 +728,161 @@ def package_tokens_for_matching(pkg):
     return tokens
 
 
+def package_variants_for_matching(pkg):
+    """
+    Build continuous-character variants from a package name.
+    Example: com.ai.musicplayer.mp3player.playmusic.audioplayer.all.formats
+    -> musicplayer, mp3player, playmusic, audioplayer,
+       musicplayermp3player, playmusicaudioplayer, etc.
+    """
+    tokens = package_tokens_for_matching(pkg)
+    variants = []
+
+    for token in tokens:
+        variants.append(token)
+
+    # Adjacent joined tokens catch packages where Play title is written without dots.
+    for span in (2, 3):
+        for i in range(0, max(0, len(tokens) - span + 1)):
+            joined = "".join(tokens[i:i + span])
+            if len(joined) >= 6:
+                variants.append(joined)
+
+    core = "".join(tokens)
+    if len(core) >= 6:
+        variants.append(core)
+
+    # Keep order but remove duplicates.
+    return list(dict.fromkeys(v for v in variants if v))
+
+
+def longest_common_substring_length(a, b):
+    """Length of the longest continuous character overlap between two strings."""
+    if not a or not b:
+        return 0
+
+    # Keep it fast for GitHub runs. Headline+description is normally short.
+    if len(a) > len(b):
+        short, long = b, a
+    else:
+        short, long = a, b
+
+    previous = [0] * (len(short) + 1)
+    best = 0
+
+    for ch_long in long:
+        current = [0]
+        for j, ch_short in enumerate(short, start=1):
+            if ch_long == ch_short:
+                value = previous[j - 1] + 1
+                if value > best:
+                    best = value
+                current.append(value)
+            else:
+                current.append(0)
+        previous = current
+
+    return best
+
+
+def continuous_char_score(needle, haystack):
+    """
+    Score one package variant against visible headline+description using
+    continuous character overlap, not word matching.
+    """
+    needle = clean_text_for_comparison(needle)
+    haystack = clean_text_for_comparison(haystack)
+
+    if not needle or not haystack or len(needle) < 3:
+        return 0.0
+
+    if needle in haystack:
+        # Long exact continuous matches are strong. Short exact matches alone
+        # stay below threshold to avoid generic false matches like "player".
+        if len(needle) >= 8:
+            return 0.96
+        if len(needle) >= 6:
+            return 0.73
+        return 0.62
+
+    common_len = longest_common_substring_length(needle, haystack)
+    coverage = common_len / max(len(needle), 1)
+
+    # A long continuous overlap should pass even if the full package token is longer.
+    if common_len >= 10 and coverage >= 0.60:
+        return min(0.93, 0.68 + coverage * 0.30)
+    if common_len >= 8 and coverage >= 0.65:
+        return min(0.88, 0.62 + coverage * 0.30)
+    if common_len >= 6 and coverage >= 0.75:
+        return min(0.80, 0.56 + coverage * 0.25)
+
+    return round(min(0.75, coverage * 0.85), 4)
+
+
 def score_package_against_text(pkg, headline, description):
     """
-    STRICT score for non-video ads: compare package ONLY with visible headline + description.
-    This prevents image ads from using random hidden package names from the page HTML.
+    Character-based non-video matcher.
+    Compares all Play Store package candidates against visible headline + description.
+    It does NOT rely on word matching and does NOT pick the first hidden package.
     """
     visible_raw = f"{headline or ''} {description or ''}"
     visible_clean = clean_text_for_comparison(visible_raw)
-    visible_words = split_words_for_comparison(visible_raw)
-    visible_word_set = set(visible_words)
 
-    if not visible_clean or not visible_words:
+    if not visible_clean:
         return 0.0
 
     tokens = package_tokens_for_matching(pkg)
-    if not tokens:
+    variants = package_variants_for_matching(pkg)
+
+    if not tokens or not variants:
         return 0.0
 
-    package_core = "".join(tokens)
-    score = 0.0
+    best_variant_score = 0.0
+    best_variant = ""
 
-    # Very strong signal: useful package core appears directly in visible ad text.
-    if package_core and len(package_core) >= 6 and package_core in visible_clean:
-        score = max(score, 0.98)
+    for variant in variants:
+        score = continuous_char_score(variant, visible_clean)
+        if score > best_variant_score:
+            best_variant_score = score
+            best_variant = variant
 
-    # Direct token hits only. Generic tokens were already removed by package_tokens_for_matching().
-    exact_hits = []
-    partial_hits = []
+    # Count how many useful package tokens have continuous character overlap.
+    strong_token_hits = []
+    medium_token_hits = []
 
     for token in tokens:
-        if token in visible_word_set:
-            exact_hits.append(token)
-            continue
+        token_score = continuous_char_score(token, visible_clean)
+        if token_score >= 0.76:
+            strong_token_hits.append(token)
+        elif token_score >= 0.68:
+            medium_token_hits.append(token)
 
-        # Allow long tokens like musicplayer/pdfreader to match joined visible text.
-        if len(token) >= 6 and token in visible_clean:
-            exact_hits.append(token)
-            continue
+    score = best_variant_score
 
-        for word in visible_words:
-            if len(token) >= 5 and len(word) >= 5 and (token in word or word in token):
-                partial_hits.append(token)
-                break
+    # Multiple token signals make the package more reliable.
+    if len(strong_token_hits) >= 2:
+        score = max(score, 0.90)
+    elif len(strong_token_hits) == 1 and len(strong_token_hits[0]) >= 8:
+        score = max(score, 0.86)
+    elif len(strong_token_hits) == 1 and medium_token_hits:
+        score = max(score, 0.80)
 
-    exact_hits = list(dict.fromkeys(exact_hits))
-    partial_hits = list(dict.fromkeys(partial_hits))
-    total_hits = len(set(exact_hits + partial_hits))
+    # Direct visible package core signal.
+    core = "".join(tokens)
+    if len(core) >= 8 and core in visible_clean:
+        score = max(score, 0.98)
 
-    # One weak/fuzzy word is NOT enough now. This is the main image-ad false-match fix.
-    if len(exact_hits) >= 2:
-        score = max(score, 0.92)
-    elif len(exact_hits) == 1 and len(exact_hits[0]) >= 8:
-        score = max(score, 0.78)
-    elif total_hits >= 2:
-        score = max(score, 0.76)
-
-    # Fuzzy matching can only boost when the whole package core is extremely close.
-    # It cannot pass alone on one random similar word.
-    if package_core and len(package_core) >= 8:
-        core_ratio = difflib.SequenceMatcher(None, visible_clean, package_core).ratio()
-        if core_ratio >= 0.88:
-            score = max(score, 0.82)
+    # Do not let one short generic-looking exact token pass by itself.
+    if score >= MIN_PACKAGE_MATCH_SCORE and len(best_variant) < 8 and len(strong_token_hits) < 2:
+        score = 0.74
 
     return round(score, 4)
 
 
 def get_best_matching_package(headline, description, package_list, min_score=MIN_PACKAGE_MATCH_SCORE):
     """
-    Compare headline + description with every found package.
-    Returns (package, score). If no package score is at least 0.92, returns (None, best_score).
+    Compare headline + description characters with every Play Store package candidate.
+    Returns (package, score). If no package score is at least 0.76, returns (None, best_score).
     """
     if not package_list:
         return None, 0.0
@@ -801,7 +890,7 @@ def get_best_matching_package(headline, description, package_list, min_score=MIN
     best_pkg = None
     best_score = 0.0
 
-    for pkg in sorted(package_list):
+    for pkg in sorted(set(package_list)):
         score = score_package_against_text(pkg, headline, description)
         if score > best_score:
             best_score = score
@@ -1208,37 +1297,40 @@ def scrape_single_url(url_row):
                 return
 
             print(f"🔎 Row {row_num}: text/image headline -> {headline}")
-            print(f"📦 Row {row_num}: resolving package from visible install link first")
+            print(f"📦 Row {row_num}: resolving Play Store package by character matching")
 
-            # BEST SOURCE FOR IMAGE ADS:
-            # Use the visible install/app link from the active creative, not the first package hidden in HTML.
+            # Collect Play Store package candidates from the current page/frames.
+            # The visible install link package is added as a candidate, but we no longer
+            # blindly trust the first package found in hidden HTML.
             visible_app_link = wait_and_extract_install_link(page, max_wait_seconds=8)
             visible_package = extract_package_name(visible_app_link)
 
+            all_found_packages = set(extract_package_from_page(page))
             if visible_package != "N/A":
-                package_name = visible_package
-                app_link = visible_app_link
-                match_score = 1.0
-                status = "SUCCESS"
-                message = "Non-video ad package extracted from visible install link"
-                print(f"✅ Row {row_num}: package from visible install link -> {package_name}")
-            else:
-                print(f"📦 Row {row_num}: visible install link not found, strict matching with headline + description")
+                all_found_packages.add(visible_package)
 
-                all_found_packages = extract_package_from_page(page)
-                package_name, match_score = get_best_matching_package(headline, description, all_found_packages)
+            package_name, match_score = get_best_matching_package(
+                headline,
+                description,
+                all_found_packages,
+                min_score=MIN_PACKAGE_MATCH_SCORE
+            )
 
-                if package_name:
-                    app_link = f"https://play.google.com/store/apps/details?id={package_name}"
-                    status = "SUCCESS"
-                    message = f"Non-video ad package strictly matched with score {match_score}"
-                    print(f"✅ Row {row_num}: strict matched package -> {package_name} | score={match_score}")
+            if package_name:
+                if visible_package == package_name and visible_app_link != "N/A":
+                    app_link = visible_app_link
                 else:
-                    package_name = "N/A"
-                    app_link = "N/A"
-                    status = "NON_VIDEO_PACKAGE_NOT_FOUND"
-                    message = f"Non-video ad found, but package score below 0.92. Best score={match_score}"
-                    print(f"⚠️ Row {row_num}: package score below 0.92, writing N/A | best score={match_score}")
+                    app_link = f"https://play.google.com/store/apps/details?id={package_name}"
+
+                status = "SUCCESS"
+                message = f"Non-video ad package matched by headline/description characters. Score={match_score}"
+                print(f"✅ Row {row_num}: character matched package -> {package_name} | score={match_score}")
+            else:
+                package_name = "N/A"
+                app_link = "N/A"
+                status = "NON_VIDEO_PACKAGE_NOT_FOUND"
+                message = f"Non-video ad found, but character match score below {MIN_PACKAGE_MATCH_SCORE}. Best score={match_score}"
+                print(f"⚠️ Row {row_num}: package character score below {MIN_PACKAGE_MATCH_SCORE}, writing N/A | best score={match_score}")
 
             data = [
                 advertiser,
