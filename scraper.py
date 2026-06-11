@@ -602,82 +602,274 @@ def wait_and_extract_install_link(page, max_wait_seconds=35):
     return "N/A"
 
 
+
 # =========================
 # HEADLINE AND DESCRIPTION LOGIC
 # =========================
 
-def wait_and_extract_headline_description(page, max_wait_seconds=15):
-    """
-    Polls for Headline and Description inside iframes ONLY.
-    Uses structural class patterns (-e-15, -e-67) and visibility checks 
-    to avoid grabbing hidden template text.
-    """
-    js = r"""
-    () => {
-        let headText = "N/A";
-        let descText = "N/A";
+_VISIBLE_AD_TEXT_JS = r"""
+() => {
+    const normalize = (txt) => (txt || "")
+        .replace(/\u00a0/g, " ")
+        .replace(/\n/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
 
-        // Helper to ensure we don't grab hidden/template elements
-        const isVisible = (el) => {
-            if (!el) return false;
-            const rect = el.getBoundingClientRect();
-            const style = window.getComputedStyle(el);
-            return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none' && style.opacity !== '0';
+    const badExact = new Set([
+        "install", "download", "get", "open", "visit site", "learn more",
+        "sign in", "log in", "google", "search", "ad details",
+        "ads transparency", "why this ad?", "sponsored", "advertisement",
+        "privacy", "terms", "menu", "home", "help", "close"
+    ]);
+
+    const isBadText = (txt) => {
+        txt = normalize(txt);
+        if (!txt) return true;
+        const lower = txt.toLowerCase();
+
+        if (badExact.has(lower)) return true;
+        if (lower.includes("{{") || lower.includes("}}")) return true;
+        if (lower.includes("ads transparency")) return true;
+        if (lower.includes("ad details")) return true;
+        if (lower.includes("why this ad")) return true;
+        if (lower.includes("google.com")) return true;
+        if (/https?:\/\//i.test(lower)) return true;
+        if (/^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*){2,}$/i.test(txt)) return true;
+        if (/^\d+$/.test(lower)) return true;
+        if (lower.length < 15 && (lower.startsWith("install") || lower.startsWith("download") || lower.startsWith("get "))) return true;
+        return false;
+    };
+
+    const isVisible = (el) => {
+        if (!el) return false;
+        const rect = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+        const opacity = parseFloat(style.opacity || "1");
+        const winW = window.innerWidth || document.documentElement.clientWidth || 0;
+        const winH = window.innerHeight || document.documentElement.clientHeight || 0;
+
+        return (
+            rect.width > 2 &&
+            rect.height > 2 &&
+            rect.bottom > 0 &&
+            rect.right > 0 &&
+            rect.top < winH &&
+            rect.left < winW &&
+            style.visibility !== "hidden" &&
+            style.display !== "none" &&
+            opacity > 0.05
+        );
+    };
+
+    const candidates = [];
+    const seen = new Map();
+
+    for (const el of Array.from(document.querySelectorAll("body *"))) {
+        const cls = String(el.className || "").toLowerCase();
+        const aria = String(el.getAttribute("aria-label") || "").toLowerCase();
+
+        let txt = normalize(el.innerText || el.textContent || "");
+        if (txt.length < 3 || txt.length > 260 || isBadText(txt)) continue;
+        if (!isVisible(el)) continue;
+
+        // Avoid wrapper containers that duplicate all child text, unless the class is clearly ad-copy related.
+        if (el.childElementCount > 0) {
+            const usefulWrapper = (
+                cls.includes("headline") ||
+                cls.includes("description") ||
+                cls.includes("long-description") ||
+                cls.includes("-e-15") ||
+                cls.includes("-e-67") ||
+                aria.includes("headline") ||
+                aria.includes("description")
+            );
+            if (!usefulWrapper) continue;
+        }
+
+        const rect = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+        const fontSize = parseFloat(style.fontSize || "0");
+        const fontWeight = parseInt(style.fontWeight || "0", 10) || 0;
+        const area = rect.width * rect.height;
+
+        let baseScore = 0;
+        baseScore += fontSize * 4;
+        baseScore += Math.min(area / 1000, 25);
+        baseScore += Math.min(txt.length, 80) * 0.15;
+        if (fontWeight >= 600) baseScore += 8;
+        if (cls.includes("headline") || aria.includes("headline") || cls.includes("-e-15")) baseScore += 35;
+        if (cls.includes("description") || cls.includes("long-description") || aria.includes("description") || cls.includes("-e-67")) baseScore += 20;
+
+        const key = txt.toLowerCase().replace(/[^a-z0-9]/g, "");
+        if (!key) continue;
+
+        const item = {
+            text: txt,
+            top: rect.top,
+            left: rect.left,
+            bottom: rect.bottom,
+            width: rect.width,
+            height: rect.height,
+            fontSize: fontSize,
+            fontWeight: fontWeight,
+            cls: cls,
+            aria: aria,
+            baseScore: baseScore
         };
 
-        // SEARCH HEADLINE: Matches any class containing '-e-15' OR 'headline'
-        const headNodes = document.querySelectorAll('[class*="-e-15"], [class*="headline"]');
-        for (let el of headNodes) {
-            if (isVisible(el)) {
-                let text = (el.innerText || el.textContent || "").replace(/\n/g, ' ').trim();
-                // Ensure it's not a template placeholder like {{headline}}
-                if (text.length > 1 && !text.includes('{{')) { 
-                    headText = text; 
-                    break; 
-                }
-            }
+        const old = seen.get(key);
+        if (!old || item.baseScore > old.baseScore) {
+            seen.set(key, item);
         }
-
-        // SEARCH DESCRIPTION: Matches any class containing '-e-67' OR 'long-description'
-        const descNodes = document.querySelectorAll('[class*="-e-67"], [class*="long-description"]');
-        for (let el of descNodes) {
-            if (isVisible(el)) {
-                let text = (el.innerText || el.textContent || "").replace(/\n/g, ' ').trim();
-                if (text.length > 1 && text !== headText && !text.includes('{{')) { 
-                    descText = text; 
-                    break; 
-                }
-            }
-        }
-
-        // If we found either one, return it
-        if (headText !== "N/A" || descText !== "N/A") {
-            return { headline: headText, description: descText };
-        }
-
-        return null;
     }
-    """
 
+    for (const item of seen.values()) candidates.push(item);
+
+    if (!candidates.length) {
+        return {headline: "N/A", description: "N/A", confidence: 0, count: 0};
+    }
+
+    const headlineCandidates = candidates
+        .filter(c => c.text.length >= 4 && c.text.length <= 120)
+        .map(c => {
+            let headlineScore = c.baseScore;
+            if (c.cls.includes("headline") || c.aria.includes("headline") || c.cls.includes("-e-15")) headlineScore += 45;
+            if (c.text.length > 90) headlineScore -= 15;
+            if (c.text.length <= 12 && c.fontSize < 12) headlineScore -= 10;
+            return {...c, headlineScore};
+        })
+        .sort((a, b) => b.headlineScore - a.headlineScore);
+
+    if (!headlineCandidates.length) {
+        return {headline: "N/A", description: "N/A", confidence: 0, count: candidates.length};
+    }
+
+    const headline = headlineCandidates[0];
+    const descCandidates = candidates
+        .filter(c => c.text !== headline.text && c.text.length >= 12 && c.text.length <= 260)
+        .map(c => {
+            let descScore = c.baseScore;
+            if (c.cls.includes("description") || c.cls.includes("long-description") || c.aria.includes("description") || c.cls.includes("-e-67")) descScore += 50;
+            if (c.top >= headline.top - 8) descScore += 22;
+            if (c.top > headline.bottom - 2) descScore += 18;
+            if (Math.abs(c.left - headline.left) <= 350) descScore += 10;
+            if (c.fontSize > headline.fontSize + 4) descScore -= 20;
+            if (c.text.length < 18) descScore -= 8;
+            return {...c, descScore};
+        })
+        .sort((a, b) => b.descScore - a.descScore);
+
+    const description = descCandidates.length ? descCandidates[0] : null;
+    const confidence = headline.headlineScore + (description ? description.descScore : 0) + Math.min(candidates.length, 20);
+
+    return {
+        headline: headline.text || "N/A",
+        description: description ? description.text : "N/A",
+        confidence: confidence,
+        count: candidates.length
+    };
+}
+"""
+
+
+def _frame_visible_bonus(page, frame):
+    """
+    Rejects off-screen/tiny iframes and gives preference to the active creative iframe.
+    This is important on GitHub/headless Chromium because hidden iframes can still have DOM text.
+    """
+    if frame == page.main_frame:
+        return True, 5
+
+    try:
+        owner = frame.frame_element()
+        box = owner.bounding_box()
+        if not box:
+            return False, 0
+
+        viewport = page.viewport_size or {"width": 1366, "height": 768}
+        vw = viewport.get("width", 1366)
+        vh = viewport.get("height", 768)
+
+        if box["width"] < 80 or box["height"] < 50:
+            return False, 0
+
+        if (
+            box["x"] + box["width"] <= 0 or
+            box["y"] + box["height"] <= 0 or
+            box["x"] >= vw or
+            box["y"] >= vh
+        ):
+            return False, 0
+
+        area_bonus = min((box["width"] * box["height"]) / 10000, 50)
+        center_y = box["y"] + box["height"] / 2
+        if 30 <= center_y <= vh + 250:
+            area_bonus += 15
+
+        return True, area_bonus
+
+    except Exception:
+        # Some frames do not expose owner element cleanly; allow them but without bonus.
+        return True, 0
+
+
+def _extract_best_visible_ad_text(page, max_wait_seconds=15, include_main=True):
     start = time.time()
-    
-    # Retry loop: Keeps trying for up to max_wait_seconds (15s)
+    best = None
+
     while time.time() - start < max_wait_seconds:
-        
-        # STRICTLY CHECK IFRAMES ONLY.
-        for frame in page.frames:
+        results = []
+
+        if include_main:
             try:
-                result = frame.evaluate(js)
-                if result and (result.get("headline", "N/A") != "N/A" or result.get("description", "N/A") != "N/A"):
-                    return result.get("headline", "N/A"), result.get("description", "N/A")
+                data = page.evaluate(_VISIBLE_AD_TEXT_JS)
+                if data and data.get("headline") != "N/A":
+                    data["confidence"] = float(data.get("confidence", 0)) + 5
+                    data["source"] = "main"
+                    results.append(data)
+            except Exception:
+                pass
+
+        for frame in page.frames:
+            if frame == page.main_frame:
+                continue
+
+            visible_ok, bonus = _frame_visible_bonus(page, frame)
+            if not visible_ok:
+                continue
+
+            try:
+                data = frame.evaluate(_VISIBLE_AD_TEXT_JS)
+                if data and data.get("headline") != "N/A":
+                    data["confidence"] = float(data.get("confidence", 0)) + bonus
+                    data["source"] = frame.url
+                    results.append(data)
             except Exception:
                 continue
-        
-        # Wait 1 second and loop again to let the ad iframe fully load
+
+        if results:
+            results.sort(key=lambda x: float(x.get("confidence", 0)), reverse=True)
+            best = results[0]
+            return {
+                "headline": clean_text(best.get("headline")),
+                "description": clean_text(best.get("description")),
+                "confidence": round(float(best.get("confidence", 0)), 2),
+                "source": best.get("source", "N/A")
+            }
+
         page.wait_for_timeout(1000)
 
-    # If the timer runs out, return N/A
-    return "N/A", "N/A"
+    return {"headline": "N/A", "description": "N/A", "confidence": 0, "source": "N/A"}
+
+
+def wait_and_extract_headline_description(page, max_wait_seconds=15):
+    """
+    Robust visible headline/description extraction.
+    Chooses the best visible ad-copy frame instead of returning the first iframe match.
+    """
+    data = _extract_best_visible_ad_text(page, max_wait_seconds=max_wait_seconds, include_main=True)
+    return data.get("headline", "N/A"), data.get("description", "N/A")
+
 
 # =========================
 # STRICT TEXT-AD PACKAGE MATCHER
@@ -965,80 +1157,17 @@ def extract_advertiser_from_page(page):
         pass
     return "N/A"
 
+
 def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
-    js = r"""
-    () => {
-        let result = { headline: "N/A", description: "N/A" };
-        const isBadText = (txt) => {
-            const lower = txt.toLowerCase();
-            const exactBlock = ['install', 'download', 'get', 'open', 'visit site', 'learn more', 'sign in', 'google', 'search', 'ad details', 'ads transparency'];
-            if (exactBlock.includes(lower)) return true;
-            if (lower.length < 15 && (lower.startsWith('install') || lower.startsWith('download') || lower.startsWith('get '))) return true;
-            return false;
-        };
-        
-        // 1. EXTRACT HEADLINE (Visual only)
-        let maxFont = 0;
-        let bestEl = null;
-        for (let el of document.querySelectorAll('*')) {
-            if (el.childElementCount > 0) continue;
-            let txt = (el.innerText || "").trim();
-            if (txt.length < 4 || isBadText(txt)) continue;
-            
-            let rect = el.getBoundingClientRect();
-            if (rect.width === 0 || rect.height === 0) continue;
-
-            let style = window.getComputedStyle(el);
-            if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') continue;
-            
-            let fontSize = parseFloat(style.fontSize || '0');
-            if (fontSize > maxFont) {
-                maxFont = fontSize;
-                bestEl = el;
-            }
-        }
-
-        if (bestEl) {
-            result.headline = bestEl.innerText.replace(/\n/g, ' ').trim();
-            
-            // 2. EXTRACT DESCRIPTION (Visual only)
-            let maxLen = 0;
-            for (let el of document.querySelectorAll('*')) {
-                if (el.childElementCount > 0) continue;
-                let txt = (el.innerText || "").replace(/\n/g, ' ').trim();
-                if (txt === result.headline || txt.length < 15 || isBadText(txt)) continue;
-                
-                let rect = el.getBoundingClientRect();
-                if (rect.width === 0 || rect.height === 0) continue;
-
-                let style = window.getComputedStyle(el);
-                if (style.display === 'none' || style.visibility === 'hidden') continue;
-                
-                if (txt.length > maxLen) {
-                    maxLen = txt.length;
-                    result.description = txt;
-                }
-            }
-        }
-        return result;
-    }
     """
-
-    start_time = time.time()
-
-    while time.time() - start_time < max_wait_seconds:
-        for frame in page.frames:
-            if frame == page.main_frame:
-                continue
-            try:
-                data = frame.evaluate(js)
-                if data["headline"] != "N/A":
-                    return data
-            except Exception:
-                continue
-        page.wait_for_timeout(1000)
-
-    return {"headline": "N/A", "description": "N/A"}
+    Extracts the best visible headline/description for text/image ads.
+    Fixes GitHub/headless wrong rows by:
+    1) rejecting off-screen/tiny iframes,
+    2) checking viewport visibility, not only width/height,
+    3) ranking all frames instead of accepting the first iframe,
+    4) choosing description near/below the headline instead of simply the longest text.
+    """
+    return _extract_best_visible_ad_text(page, max_wait_seconds=max_wait_seconds, include_main=True)
 
 # =========================
 # MAIN COMBINED SCRAPER: VIDEO ADS + TEXT ADS
@@ -1173,8 +1302,17 @@ def scrape_single_url(url_row):
             print(f"📄 Row {row_num}: no video found, checking text ad")
 
             text_data = early_text_data
-            if not is_valid_text_ad(text_data.get("headline"), text_data.get("description")):
-                text_data = wait_and_extract_text_ad_details(page, max_wait_seconds=15)
+            early_confidence = float(text_data.get("confidence", 0) or 0) if isinstance(text_data, dict) else 0
+
+            if not is_valid_text_ad(text_data.get("headline"), text_data.get("description")) or early_confidence < 90:
+                fresh_text_data = wait_and_extract_text_ad_details(page, max_wait_seconds=15)
+                fresh_confidence = float(fresh_text_data.get("confidence", 0) or 0) if isinstance(fresh_text_data, dict) else 0
+
+                if (
+                    is_valid_text_ad(fresh_text_data.get("headline"), fresh_text_data.get("description"))
+                    and fresh_confidence >= early_confidence
+                ):
+                    text_data = fresh_text_data
 
             headline = clean_text(text_data.get("headline"))
             description = clean_text(text_data.get("description"))
