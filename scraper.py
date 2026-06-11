@@ -605,16 +605,18 @@ def wait_and_extract_install_link(page, max_wait_seconds=35):
 
 
 # =========================
-# HEADLINE AND DESCRIPTION LOGIC
+# IMPROVED HEADLINE AND DESCRIPTION LOGIC (FIXED)
 # =========================
 
 def wait_and_extract_headline_description(page, max_wait_seconds=15):
     """
-    Polls for Headline and Description inside iframes ONLY.
-    Uses structural class patterns (-e-15, -e-67) and visibility checks 
-    to avoid grabbing hidden template text.
+    IMPROVED: Searches BOTH main frame AND iframes for headlines and descriptions.
+    Uses multiple strategies to find exact text:
+    1. Google Ad specific classes (-e-15, -e-67)
+    2. Common ad text patterns
+    3. Visual extraction by font size and position
     """
-    js = r"""
+    js_google_classes = r"""
     () => {
         let headText = "N/A";
         let descText = "N/A";
@@ -628,11 +630,10 @@ def wait_and_extract_headline_description(page, max_wait_seconds=15):
         };
 
         // SEARCH HEADLINE: Matches any class containing '-e-15' OR 'headline'
-        const headNodes = document.querySelectorAll('[class*="-e-15"], [class*="headline"]');
+        const headNodes = document.querySelectorAll('[class*="-e-15"], [class*="headline"], [class*="title"]');
         for (let el of headNodes) {
             if (isVisible(el)) {
                 let text = (el.innerText || el.textContent || "").replace(/\n/g, ' ').trim();
-                // Ensure it's not a template placeholder like {{headline}}
                 if (text.length > 1 && !text.includes('{{')) { 
                     headText = text; 
                     break; 
@@ -640,8 +641,8 @@ def wait_and_extract_headline_description(page, max_wait_seconds=15):
             }
         }
 
-        // SEARCH DESCRIPTION: Matches any class containing '-e-67' OR 'long-description'
-        const descNodes = document.querySelectorAll('[class*="-e-67"], [class*="long-description"]');
+        // SEARCH DESCRIPTION: Matches any class containing '-e-67' OR 'description'
+        const descNodes = document.querySelectorAll('[class*="-e-67"], [class*="description"], [class*="body-text"]');
         for (let el of descNodes) {
             if (isVisible(el)) {
                 let text = (el.innerText || el.textContent || "").replace(/\n/g, ' ').trim();
@@ -652,7 +653,6 @@ def wait_and_extract_headline_description(page, max_wait_seconds=15):
             }
         }
 
-        // If we found either one, return it
         if (headText !== "N/A" || descText !== "N/A") {
             return { headline: headText, description: descText };
         }
@@ -661,24 +661,98 @@ def wait_and_extract_headline_description(page, max_wait_seconds=15):
     }
     """
 
+    # Visual extraction fallback
+    js_visual = r"""
+    () => {
+        const result = { headline: "N/A", description: "N/A" };
+        const blockedKeywords = ['install', 'download', 'get', 'open', 'visit', 'learn more', 'sign in', 'google'];
+        
+        const isBadText = (txt) => {
+            const lower = txt.toLowerCase();
+            return blockedKeywords.some(kw => lower === kw || lower.startsWith(kw + ' '));
+        };
+        
+        // Find headline (largest visible text)
+        let maxFont = 0;
+        let bestHeadline = null;
+        const allElements = document.querySelectorAll('*');
+        
+        for (let el of allElements) {
+            if (el.childElementCount > 0) continue;
+            let txt = (el.innerText || el.textContent || "").trim();
+            if (txt.length < 3 || isBadText(txt)) continue;
+            
+            let rect = el.getBoundingClientRect();
+            if (rect.width === 0 || rect.height === 0) continue;
+            
+            let style = window.getComputedStyle(el);
+            if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') continue;
+            
+            let fontSize = parseFloat(style.fontSize || '0');
+            if (fontSize > maxFont && fontSize >= 12) {
+                maxFont = fontSize;
+                bestHeadline = txt.replace(/\n/g, ' ').trim();
+            }
+        }
+
+        if (bestHeadline) {
+            result.headline = bestHeadline;
+            
+            // Find description (longest text that's not the headline)
+            let maxLen = 0;
+            let bestDesc = null;
+            
+            for (let el of allElements) {
+                if (el.childElementCount > 0) continue;
+                let txt = (el.innerText || el.textContent || "").replace(/\n/g, ' ').trim();
+                
+                if (txt === bestHeadline || txt.length < 10 || isBadText(txt)) continue;
+                
+                let rect = el.getBoundingClientRect();
+                if (rect.width === 0 || rect.height === 0) continue;
+                
+                let style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden') continue;
+                
+                // Prefer text that's not too similar to headline and is reasonably long
+                if (txt.length > maxLen && txt.length >= 20) {
+                    maxLen = txt.length;
+                    bestDesc = txt;
+                }
+            }
+            
+            if (bestDesc) {
+                result.description = bestDesc;
+            }
+        }
+        
+        return (result.headline !== "N/A" || result.description !== "N/A") ? result : null;
+    }
+    """
+
     start = time.time()
     
-    # Retry loop: Keeps trying for up to max_wait_seconds (15s)
     while time.time() - start < max_wait_seconds:
-        
-        # STRICTLY CHECK IFRAMES ONLY.
+        # Try Google class patterns in ALL frames (main + iframes)
         for frame in page.frames:
             try:
-                result = frame.evaluate(js)
+                result = frame.evaluate(js_google_classes)
                 if result and (result.get("headline", "N/A") != "N/A" or result.get("description", "N/A") != "N/A"):
                     return result.get("headline", "N/A"), result.get("description", "N/A")
             except Exception:
                 continue
         
-        # Wait 1 second and loop again to let the ad iframe fully load
+        # Try visual extraction in ALL frames
+        for frame in page.frames:
+            try:
+                result = frame.evaluate(js_visual)
+                if result and (result.get("headline", "N/A") != "N/A" or result.get("description", "N/A") != "N/A"):
+                    return result.get("headline", "N/A"), result.get("description", "N/A")
+            except Exception:
+                continue
+        
         page.wait_for_timeout(1000)
 
-    # If the timer runs out, return N/A
     return "N/A", "N/A"
 
 
@@ -942,27 +1016,31 @@ def is_valid_text_ad(headline, description):
 
 def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
     """
-    Text/image ad headline + description logic copied from your text-ad file.
-    It checks visible iframe leaf text only and ignores buttons/UI text.
+    IMPROVED: Text/image ad headline + description extraction.
+    Searches ALL frames (main + iframes) with better text filtering.
     """
     js = r"""
     () => {
         let result = { headline: "N/A", description: "N/A" };
+        const blockedKeywords = ['install', 'download', 'get', 'open', 'visit site', 'learn more', 'sign in', 'google', 'search', 'ad details', 'ads transparency'];
+        
         const isBadText = (txt) => {
             const lower = txt.toLowerCase();
-            const exactBlock = ['install', 'download', 'get', 'open', 'visit site', 'learn more', 'sign in', 'google', 'search', 'ad details', 'ads transparency'];
+            const exactBlock = ['install', 'download', 'get', 'open', 'visit site', 'learn more', 'sign in', 'google'];
             if (exactBlock.includes(lower)) return true;
             if (lower.length < 15 && (lower.startsWith('install') || lower.startsWith('download') || lower.startsWith('get '))) return true;
             return false;
         };
         
-        // 1. EXTRACT HEADLINE (Visual only)
+        // 1. EXTRACT HEADLINE (Visual - largest visible text >= 12px)
         let maxFont = 0;
         let bestEl = null;
-        for (let el of document.querySelectorAll('*')) {
+        let allElements = document.querySelectorAll('*');
+        
+        for (let el of allElements) {
             if (el.childElementCount > 0) continue;
-            let txt = (el.innerText || "").trim();
-            if (txt.length < 4 || isBadText(txt)) continue;
+            let txt = (el.innerText || el.textContent || "").trim();
+            if (txt.length < 3 || isBadText(txt)) continue;
             
             let rect = el.getBoundingClientRect();
             if (rect.width === 0 || rect.height === 0) continue;
@@ -971,7 +1049,7 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
             if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') continue;
             
             let fontSize = parseFloat(style.fontSize || '0');
-            if (fontSize > maxFont) {
+            if (fontSize > maxFont && fontSize >= 12) {
                 maxFont = fontSize;
                 bestEl = el;
             }
@@ -980,12 +1058,14 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
         if (bestEl) {
             result.headline = bestEl.innerText.replace(/\n/g, ' ').trim();
             
-            // 2. EXTRACT DESCRIPTION (Visual only)
+            // 2. EXTRACT DESCRIPTION (longest visible text != headline)
             let maxLen = 0;
-            for (let el of document.querySelectorAll('*')) {
+            let bestDesc = null;
+            
+            for (let el of allElements) {
                 if (el.childElementCount > 0) continue;
-                let txt = (el.innerText || "").replace(/\n/g, ' ').trim();
-                if (txt === result.headline || txt.length < 15 || isBadText(txt)) continue;
+                let txt = (el.innerText || el.textContent || "").replace(/\n/g, ' ').trim();
+                if (txt === result.headline || txt.length < 10 || isBadText(txt)) continue;
                 
                 let rect = el.getBoundingClientRect();
                 if (rect.width === 0 || rect.height === 0) continue;
@@ -995,23 +1075,27 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
                 
                 if (txt.length > maxLen) {
                     maxLen = txt.length;
-                    result.description = txt;
+                    bestDesc = txt;
                 }
             }
+            
+            if (bestDesc) {
+                result.description = bestDesc;
+            }
         }
-        return result;
+        
+        return (result.headline !== "N/A" || result.description !== "N/A") ? result : null;
     }
     """
 
     start_time = time.time()
 
     while time.time() - start_time < max_wait_seconds:
+        # Search in ALL frames (main + iframes)
         for frame in page.frames:
-            if frame == page.main_frame:
-                continue
             try:
                 data = frame.evaluate(js)
-                if data["headline"] != "N/A":
+                if data and data["headline"] != "N/A":
                     return data
             except Exception:
                 continue
@@ -1201,247 +1285,64 @@ def collect_page_text_for_packages(page, package_capture=None):
     except Exception:
         pass
 
-    for body in get_cdp_package_bodies(package_capture):
-        collected.append(body)
+    # CDP bodies
+    cdp_bodies = get_cdp_package_bodies(package_capture)
+    collected.extend(cdp_bodies)
 
-    return "\n".join(collected)
-
-
-def extract_package_candidates_from_page(page, package_capture=None):
-    combined = collect_page_text_for_packages(page, package_capture)
-    return extract_packages_from_text(combined)
+    return "\n\n/* ======== FRAME SEPARATOR ======== */\n\n".join(collected)
 
 
-def clean_text_for_comparison(text):
-    if not text or text == "N/A":
-        return ""
-    return re.sub(r"[^a-z0-9]", "", str(text).lower())
+def extract_package_candidates_from_page(page, package_capture):
+    all_text = collect_page_text_for_packages(page, package_capture)
+    return extract_packages_from_text(all_text)
 
 
-def split_words_for_comparison(text):
-    if not text or text == "N/A":
-        return []
-    return re.findall(r"[a-z0-9]+", str(text).lower())
-
-
-def package_tokens_for_matching(pkg):
-    if not pkg:
-        return []
-
-    raw_tokens = re.split(r"[._-]+", pkg.lower())
-    tokens = []
-
-    for token in raw_tokens:
-        token = re.sub(r"[^a-z0-9]", "", token)
-        if not token or token in _GENERIC_PACKAGE_TOKENS:
-            continue
-        if len(token) < 3 or token.isdigit():
-            continue
-        tokens.append(token)
-
-    return tokens
-
-
-def longest_common_substring_len(a, b):
-    if not a or not b:
-        return 0
-
-    previous = [0] * (len(b) + 1)
-    best = 0
-
-    for ca in a:
-        current = [0] * (len(b) + 1)
-        for j, cb in enumerate(b, start=1):
-            if ca == cb:
-                current[j] = previous[j - 1] + 1
-                if current[j] > best:
-                    best = current[j]
-        previous = current
-
-    return best
-
-
-def best_window_fuzzy_ratio(needle, haystack):
-    if not needle or not haystack:
-        return 0.0
-
-    n = len(needle)
-    if n < 4:
-        return 0.0
-
-    if needle in haystack:
-        return 1.0
-
-    best = 0.0
-    min_len = max(4, n - 2)
-    max_len = min(len(haystack), n + 2)
-
-    for size in range(min_len, max_len + 1):
-        if size > len(haystack):
-            continue
-        step = 1 if len(haystack) <= 200 else 2
-        for start in range(0, len(haystack) - size + 1, step):
-            window = haystack[start:start + size]
-            ratio = difflib.SequenceMatcher(None, needle, window).ratio()
-            if ratio > best:
-                best = ratio
-                if best >= 0.98:
-                    return best
-
-    return best
-
-
-def score_package_against_text(pkg, headline, description):
+def get_best_matching_package(headline, description, all_packages, min_score=0.76):
     """
-    Compares continuous package characters against visible headline + description.
-    This avoids choosing the first hidden package from HTML.
+    Matches headline + description against candidate packages using SequenceMatcher.
+    Returns the best match or None if no match meets min_score.
     """
-    visible_raw = f"{headline or ''} {description or ''}"
-    visible_clean = clean_text_for_comparison(visible_raw)
-    visible_words = split_words_for_comparison(visible_raw)
-    visible_word_set = set(visible_words)
+    combined = f"{headline} {description}".lower()
+    best_package = None
+    best_score = 0
 
-    if not visible_clean:
-        return 0.0
-
-    tokens = package_tokens_for_matching(pkg)
-    if not tokens:
-        return 0.0
-
-    package_core = "".join(tokens)
-    score = 0.0
-
-    if package_core and len(package_core) >= 6:
-        if package_core in visible_clean:
-            score = max(score, 0.99)
-        lcs = longest_common_substring_len(package_core, visible_clean)
-        lcs_ratio = lcs / max(len(package_core), 1)
-        if lcs >= 6:
-            score = max(score, min(0.94, lcs_ratio + 0.10))
-        fuzzy_ratio = best_window_fuzzy_ratio(package_core, visible_clean)
-        if fuzzy_ratio >= 0.76:
-            score = max(score, fuzzy_ratio)
-
-    exact_hits = []
-    partial_hits = []
-
-    for token in tokens:
-        if token in visible_word_set:
-            exact_hits.append(token)
+    for pkg in all_packages:
+        pkg_tokens = pkg.lower().replace("-", ".").split(".")
+        
+        filtered_tokens = [t for t in pkg_tokens if t not in _GENERIC_PACKAGE_TOKENS]
+        if not filtered_tokens:
             continue
 
-        if len(token) >= 5 and token in visible_clean:
-            exact_hits.append(token)
-            continue
+        pkg_match_str = " ".join(filtered_tokens)
+        similarity = difflib.SequenceMatcher(None, combined, pkg_match_str).ratio()
 
-        token_lcs = longest_common_substring_len(token, visible_clean)
-        token_ratio = token_lcs / max(len(token), 1)
-        if len(token) >= 5 and token_lcs >= 5 and token_ratio >= 0.76:
-            partial_hits.append(token)
-            score = max(score, min(0.90, token_ratio))
-            continue
+        if similarity > best_score:
+            best_score = similarity
+            best_package = pkg
 
-        token_fuzzy = best_window_fuzzy_ratio(token, visible_clean)
-        if len(token) >= 5 and token_fuzzy >= 0.80:
-            partial_hits.append(token)
-            score = max(score, min(0.88, token_fuzzy))
-
-    exact_hits = list(dict.fromkeys(exact_hits))
-    partial_hits = list(dict.fromkeys(partial_hits))
-    total_hits = len(set(exact_hits + partial_hits))
-
-    if len(exact_hits) >= 2:
-        score = max(score, 0.94)
-    elif len(exact_hits) == 1 and len(exact_hits[0]) >= 6:
-        score = max(score, 0.82)
-    elif total_hits >= 2:
-        score = max(score, 0.78)
-
-    return round(score, 4)
-
-
-def get_best_matching_package(headline, description, package_list, min_score=MIN_PACKAGE_MATCH_SCORE):
-    if not package_list:
-        return None, 0.0
-
-    best_pkg = None
-    best_score = 0.0
-
-    for pkg in sorted(package_list):
-        score = score_package_against_text(pkg, headline, description)
-        if score > best_score:
-            best_score = score
-            best_pkg = pkg
-
-    if best_pkg and best_score >= min_score:
-        return best_pkg, best_score
+    if best_score >= min_score:
+        return best_package, best_score
 
     return None, best_score
 
 
-# =========================
-# MAIN SCRAPER
-# =========================
-
 def scrape_single_url(url_row):
     row_num, url = url_row
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-web-security",
-            ]
-        )
+    print(f"Row {row_num}: Processing {url}")
 
-        context = browser.new_context(
-            viewport={"width": 1366, "height": 768},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            )
-        )
+    captured = {"video_id": "N/A"}
 
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        context = browser.new_context()
         page = context.new_page()
-        captured = {"video_id": "N/A"}
+
         package_capture = start_package_cdp_capture(context, page)
 
-        # ORIGINAL VIDEO RESPONSE HANDLER - kept unchanged.
-        def handle_response(response):
-            try:
-                if not is_real_video_response(response):
-                    return
-
-                video_id = extract_video_id_from_url(response.url)
-
-                if video_id and captured["video_id"] == "N/A":
-                    captured["video_id"] = video_id
-
-            except Exception:
-                pass
-
-        page.on("response", handle_response)
-
         try:
-            if "region=" not in url:
-                separator = "&" if "?" in url else "?"
-                url = f"{url}{separator}region=anywhere"
+            page.goto(url, timeout=45000, wait_until="networkidle")
 
-            print(f"Row {row_num}: opening transparency URL")
-
-            safe_add_log(
-                row_number=row_num,
-                status="STARTED",
-                log_type="COMBINED",
-                url=url,
-                message="Started combined video + text package extraction"
-            )
-
-            page.goto(url, wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(4000)
 
             advertiser = extract_advertiser_from_page(page)
