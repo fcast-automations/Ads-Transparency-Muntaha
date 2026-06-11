@@ -603,81 +603,389 @@ def wait_and_extract_install_link(page, max_wait_seconds=35):
 
 
 # =========================
+# ACTIVE CREATIVE SCOPE HELPERS
+# =========================
+
+HEADLINE_SELECTOR = '[class*="-e-15"], [class*="headline"]'
+DESCRIPTION_SELECTOR = '[class*="-e-67"], [class*="long-description"]'
+
+
+def _is_page_target(target):
+    return hasattr(target, "main_frame")
+
+
+def _get_target_label(target):
+    try:
+        return "MAIN_PAGE" if _is_page_target(target) else f"FRAME::{target.url}"
+    except Exception:
+        return "UNKNOWN_TARGET"
+
+
+def _frame_visible_area(frame, viewport_width=1366, viewport_height=768):
+    """
+    Returns visible iframe area and box. Hidden/offscreen iframes return 0.
+    This is important because Google transparency pages can contain multiple ad frames.
+    """
+    try:
+        element = frame.frame_element()
+        box = element.bounding_box()
+        if not box:
+            return 0, None
+
+        left = max(0, box.get("x", 0))
+        top = max(0, box.get("y", 0))
+        right = min(viewport_width, box.get("x", 0) + box.get("width", 0))
+        bottom = min(viewport_height, box.get("y", 0) + box.get("height", 0))
+
+        width = max(0, right - left)
+        height = max(0, bottom - top)
+        area = width * height
+        return area, box
+    except Exception:
+        return 0, None
+
+
+def _extract_structured_ad_text_from_target(target):
+    """
+    Extract headline/description from ONE target only.
+    No cross-frame scanning here.
+    """
+    js = r"""
+    () => {
+        const cleanText = (txt) => String(txt || '')
+            .replace(/\n/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+
+        const isVisible = (el) => {
+            if (!el) return false;
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return (
+                rect.width > 0 &&
+                rect.height > 0 &&
+                rect.bottom > 0 &&
+                rect.right > 0 &&
+                rect.top < window.innerHeight &&
+                rect.left < window.innerWidth &&
+                style.visibility !== 'hidden' &&
+                style.display !== 'none' &&
+                style.opacity !== '0'
+            );
+        };
+
+        const badText = (txt) => {
+            const lower = cleanText(txt).toLowerCase();
+            const exact = [
+                'install', 'download', 'get', 'open', 'visit site', 'learn more',
+                'sign in', 'google', 'search', 'ad details', 'ads transparency',
+                'see more ads', 'about this ad'
+            ];
+            if (!lower || exact.includes(lower)) return true;
+            if (lower.includes('{{') || lower.includes('}}')) return true;
+            if (lower.length < 3) return true;
+            return false;
+        };
+
+        const collect = (selector, minLen) => {
+            const out = [];
+            for (const el of document.querySelectorAll(selector)) {
+                if (!isVisible(el)) continue;
+                const text = cleanText(el.innerText || el.textContent || '');
+                if (text.length < minLen || badText(text)) continue;
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                const cls = String(el.className || '').toLowerCase();
+                const font = parseFloat(style.fontSize || '0') || 0;
+                out.push({
+                    text,
+                    top: rect.top,
+                    left: rect.left,
+                    width: rect.width,
+                    height: rect.height,
+                    font,
+                    cls
+                });
+            }
+            return out;
+        };
+
+        const headlineCandidates = collect('[class*="-e-15"], [class*="headline"]', 3);
+        const descriptionCandidates = collect('[class*="-e-67"], [class*="long-description"]', 5);
+
+        const scoreHeadline = (c) => {
+            let score = 0;
+            if (c.cls.includes('-e-15')) score += 100;
+            if (c.cls.includes('headline')) score += 90;
+            score += Math.min(40, c.font * 1.5);
+            score += Math.min(30, c.width / 12);
+            score += Math.max(0, 30 - Math.abs(c.top - 220) / 12);
+            return score;
+        };
+
+        const scoreDescription = (c, headline) => {
+            let score = 0;
+            if (c.text === headline) return -9999;
+            if (c.cls.includes('-e-67')) score += 100;
+            if (c.cls.includes('long-description')) score += 90;
+            score += Math.min(40, c.text.length / 3);
+            score += Math.min(25, c.width / 16);
+            return score;
+        };
+
+        headlineCandidates.sort((a, b) => scoreHeadline(b) - scoreHeadline(a));
+        const headline = headlineCandidates.length ? headlineCandidates[0].text : 'N/A';
+
+        descriptionCandidates.sort((a, b) => scoreDescription(b, headline) - scoreDescription(a, headline));
+        const description = descriptionCandidates.length ? descriptionCandidates[0].text : 'N/A';
+
+        const bodyText = cleanText(document.body ? document.body.innerText : '');
+        const hrefs = Array.from(document.querySelectorAll('a[href], a[data-href]'))
+            .map(a => a.href || a.getAttribute('href') || a.getAttribute('data-href') || '')
+            .filter(Boolean);
+
+        return {
+            headline,
+            description,
+            headline_count: headlineCandidates.length,
+            description_count: descriptionCandidates.length,
+            body_text_length: bodyText.length,
+            hrefs,
+            html: document.documentElement ? document.documentElement.outerHTML : ''
+        };
+    }
+    """
+    try:
+        data = target.evaluate(js)
+        return data or {
+            "headline": "N/A",
+            "description": "N/A",
+            "headline_count": 0,
+            "description_count": 0,
+            "hrefs": [],
+            "html": ""
+        }
+    except Exception:
+        return {
+            "headline": "N/A",
+            "description": "N/A",
+            "headline_count": 0,
+            "description_count": 0,
+            "hrefs": [],
+            "html": ""
+        }
+
+
+def extract_install_link_from_target(target):
+    """
+    Extract install/app link from ONE target only.
+    Does not scan other frames, so headline and package stay from same creative.
+    """
+    try:
+        candidates = get_visible_install_candidates_from_target(target)
+        if candidates:
+            candidates.sort(key=lambda x: x["score"], reverse=True)
+            best = candidates[0]
+            if best.get("score", 0) > 0:
+                return clean_googleadservices_link(best.get("href"))
+    except Exception:
+        pass
+
+    js = r"""
+    () => {
+        const anchors = Array.from(document.querySelectorAll('a[href], a[data-href]'));
+        const candidates = anchors.map(a => {
+            const href = a.href || a.getAttribute('href') || a.getAttribute('data-href') || '';
+            const text = (a.innerText || a.textContent || '').trim().toLowerCase();
+            const cls = String(a.className || '').toLowerCase();
+            const aria = String(a.getAttribute('aria-label') || '').toLowerCase();
+            const rect = a.getBoundingClientRect();
+
+            const goodLink =
+                href.includes('googleadservices.com/pagead/aclk') ||
+                href.includes('play.google.com') ||
+                href.includes('apps.apple.com') ||
+                href.includes('itunes.apple.com');
+
+            const looksInstall =
+                cls.includes('install-button-anchor') ||
+                text.includes('install') ||
+                text.includes('get') ||
+                text.includes('download') ||
+                aria.includes('install');
+
+            const visible =
+                rect.width > 20 &&
+                rect.height > 10 &&
+                rect.bottom > 0 &&
+                rect.right > 0 &&
+                rect.top < window.innerHeight &&
+                rect.left < window.innerWidth;
+
+            if (!goodLink || !looksInstall || !visible) return null;
+
+            let score = 0;
+            if (cls.includes('install-button-anchor')) score += 100;
+            if (text.includes('install')) score += 80;
+            if (text.includes('get') || text.includes('download')) score += 40;
+            const cx = rect.left + rect.width / 2;
+            const cy = rect.top + rect.height / 2;
+            if (cx >= 250 && cx <= 1000) score += 40;
+            if (cy >= 20 && cy <= 740) score += 40;
+            if (cy > 760) score -= 100;
+            return { href, score };
+        }).filter(Boolean);
+
+        candidates.sort((a, b) => b.score - a.score);
+        return candidates.length ? candidates[0].href : null;
+    }
+    """
+
+    try:
+        href = target.evaluate(js)
+        if href and is_good_app_link(href):
+            return clean_googleadservices_link(href)
+    except Exception:
+        pass
+
+    return "N/A"
+
+
+def wait_and_extract_install_link_from_target(target, max_wait_seconds=8):
+    start = time.time()
+    while time.time() - start < max_wait_seconds:
+        app_link = extract_install_link_from_target(target)
+        if app_link != "N/A":
+            return app_link
+        try:
+            target.wait_for_timeout(1000)
+        except Exception:
+            time.sleep(1)
+    return "N/A"
+
+
+def extract_package_from_target(target):
+    """
+    Extract package candidates from ONE target only.
+    This prevents packages from another ad frame/link being selected.
+    """
+    try:
+        data = _extract_structured_ad_text_from_target(target)
+        parts = []
+        if data.get("html"):
+            parts.append(data["html"])
+        hrefs = data.get("hrefs") or []
+        if hrefs:
+            parts.append("\n".join(hrefs))
+        if data.get("headline"):
+            parts.append(data["headline"])
+        if data.get("description"):
+            parts.append(data["description"])
+        return extract_packages_from_text("\n".join(parts))
+    except Exception:
+        return set()
+
+
+def wait_for_active_ad_scope(page, max_wait_seconds=15):
+    """
+    Finds ONE visible active creative target and extracts everything from that same target.
+    This is the main fix for wrong headline/description/package from another ad.
+    """
+    start = time.time()
+    best_scope = None
+
+    while time.time() - start < max_wait_seconds:
+        targets = []
+
+        # Main page fallback only. Frames are preferred because ad creatives usually live there.
+        targets.append((page, 1, None, 0, "MAIN_PAGE"))
+
+        for idx, frame in enumerate(page.frames):
+            if frame == page.main_frame:
+                continue
+            area, box = _frame_visible_area(frame)
+            if area < 1200:
+                continue
+            targets.append((frame, 5, box, area, f"FRAME_{idx}"))
+
+        for target, base_priority, box, area, label in targets:
+            data = _extract_structured_ad_text_from_target(target)
+            headline = clean_text(data.get("headline"))
+            description = clean_text(data.get("description"))
+            headline_count = int(data.get("headline_count") or 0)
+            description_count = int(data.get("description_count") or 0)
+
+            if headline == "N/A" and description == "N/A":
+                continue
+
+            score = base_priority
+            if headline != "N/A":
+                score += 120
+            if description != "N/A":
+                score += 100
+            if headline_count:
+                score += min(30, headline_count * 5)
+            if description_count:
+                score += min(30, description_count * 5)
+
+            if box:
+                # Prefer visible ad frames near the top/center of the current page.
+                top = box.get("y", 9999)
+                width = box.get("width", 0)
+                height = box.get("height", 0)
+                score += min(80, area / 3000)
+                score += min(35, width / 25)
+                score += min(35, height / 18)
+                score += max(0, 45 - abs(top - 180) / 8)
+            else:
+                # Main page can contain navigation/sidebar text, so it gets a penalty.
+                score -= 35
+
+            if not best_scope or score > best_scope["_score"]:
+                best_scope = {
+                    "headline": headline,
+                    "description": description,
+                    "_target": target,
+                    "_source": label,
+                    "_score": round(score, 2),
+                    "_box": box,
+                    "packages": set(),
+                    "app_link": "N/A"
+                }
+
+        if best_scope:
+            target = best_scope.get("_target")
+            app_link = extract_install_link_from_target(target) if target else "N/A"
+            packages = extract_package_from_target(target) if target else set()
+            best_scope["app_link"] = app_link
+            best_scope["packages"] = packages
+            return best_scope
+
+        page.wait_for_timeout(1000)
+
+    return {
+        "headline": "N/A",
+        "description": "N/A",
+        "_target": None,
+        "_source": "NONE",
+        "_score": 0,
+        "_box": None,
+        "packages": set(),
+        "app_link": "N/A"
+    }
+
+
+# =========================
 # HEADLINE AND DESCRIPTION LOGIC
 # =========================
 
 def wait_and_extract_headline_description(page, max_wait_seconds=15):
     """
-    Polls for Headline and Description inside iframes ONLY.
-    Uses structural class patterns (-e-15, -e-67) and visibility checks 
-    to avoid grabbing hidden template text.
+    Extract headline/description from the SAME active visible creative only.
+    Does not scan all frames independently.
     """
-    js = r"""
-    () => {
-        let headText = "N/A";
-        let descText = "N/A";
-
-        // Helper to ensure we don't grab hidden/template elements
-        const isVisible = (el) => {
-            if (!el) return false;
-            const rect = el.getBoundingClientRect();
-            const style = window.getComputedStyle(el);
-            return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none' && style.opacity !== '0';
-        };
-
-        // SEARCH HEADLINE: Matches any class containing '-e-15' OR 'headline'
-        const headNodes = document.querySelectorAll('[class*="-e-15"], [class*="headline"]');
-        for (let el of headNodes) {
-            if (isVisible(el)) {
-                let text = (el.innerText || el.textContent || "").replace(/\n/g, ' ').trim();
-                // Ensure it's not a template placeholder like {{headline}}
-                if (text.length > 1 && !text.includes('{{')) { 
-                    headText = text; 
-                    break; 
-                }
-            }
-        }
-
-        // SEARCH DESCRIPTION: Matches any class containing '-e-67' OR 'long-description'
-        const descNodes = document.querySelectorAll('[class*="-e-67"], [class*="long-description"]');
-        for (let el of descNodes) {
-            if (isVisible(el)) {
-                let text = (el.innerText || el.textContent || "").replace(/\n/g, ' ').trim();
-                if (text.length > 1 && text !== headText && !text.includes('{{')) { 
-                    descText = text; 
-                    break; 
-                }
-            }
-        }
-
-        // If we found either one, return it
-        if (headText !== "N/A" || descText !== "N/A") {
-            return { headline: headText, description: descText };
-        }
-
-        return null;
-    }
-    """
-
-    start = time.time()
-    
-    # Retry loop: Keeps trying for up to max_wait_seconds (15s)
-    while time.time() - start < max_wait_seconds:
-        
-        # STRICTLY CHECK IFRAMES ONLY.
-        for frame in page.frames:
-            try:
-                result = frame.evaluate(js)
-                if result and (result.get("headline", "N/A") != "N/A" or result.get("description", "N/A") != "N/A"):
-                    return result.get("headline", "N/A"), result.get("description", "N/A")
-            except Exception:
-                continue
-        
-        # Wait 1 second and loop again to let the ad iframe fully load
-        page.wait_for_timeout(1000)
-
-    # If the timer runs out, return N/A
-    return "N/A", "N/A"
+    scope = wait_for_active_ad_scope(page, max_wait_seconds=max_wait_seconds)
+    return scope.get("headline", "N/A"), scope.get("description", "N/A")
 
 # =========================
 # STRICT TEXT-AD PACKAGE MATCHER
@@ -1055,79 +1363,21 @@ def extract_advertiser_from_page(page):
     return "N/A"
 
 def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
-    js = r"""
-    () => {
-        let result = { headline: "N/A", description: "N/A" };
-        const isBadText = (txt) => {
-            const lower = txt.toLowerCase();
-            const exactBlock = ['install', 'download', 'get', 'open', 'visit site', 'learn more', 'sign in', 'google', 'search', 'ad details', 'ads transparency'];
-            if (exactBlock.includes(lower)) return true;
-            if (lower.length < 15 && (lower.startsWith('install') || lower.startsWith('download') || lower.startsWith('get '))) return true;
-            return false;
-        };
-        
-        // 1. EXTRACT HEADLINE (Visual only)
-        let maxFont = 0;
-        let bestEl = null;
-        for (let el of document.querySelectorAll('*')) {
-            if (el.childElementCount > 0) continue;
-            let txt = (el.innerText || "").trim();
-            if (txt.length < 4 || isBadText(txt)) continue;
-            
-            let rect = el.getBoundingClientRect();
-            if (rect.width === 0 || rect.height === 0) continue;
-
-            let style = window.getComputedStyle(el);
-            if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') continue;
-            
-            let fontSize = parseFloat(style.fontSize || '0');
-            if (fontSize > maxFont) {
-                maxFont = fontSize;
-                bestEl = el;
-            }
-        }
-
-        if (bestEl) {
-            result.headline = bestEl.innerText.replace(/\n/g, ' ').trim();
-            
-            // 2. EXTRACT DESCRIPTION (Visual only)
-            let maxLen = 0;
-            for (let el of document.querySelectorAll('*')) {
-                if (el.childElementCount > 0) continue;
-                let txt = (el.innerText || "").replace(/\n/g, ' ').trim();
-                if (txt === result.headline || txt.length < 15 || isBadText(txt)) continue;
-                
-                let rect = el.getBoundingClientRect();
-                if (rect.width === 0 || rect.height === 0) continue;
-
-                let style = window.getComputedStyle(el);
-                if (style.display === 'none' || style.visibility === 'hidden') continue;
-                
-                if (txt.length > maxLen) {
-                    maxLen = txt.length;
-                    result.description = txt;
-                }
-            }
-        }
-        return result;
-    }
     """
-
-    start_time = time.time()
-
-    while time.time() - start_time < max_wait_seconds:
-        for frame in page.frames:
-            if frame == page.main_frame:
-                continue
-            try:
-                data = frame.evaluate(js)
-                if data["headline"] != "N/A":
-                    return data
-            except Exception:
-                continue
-        page.wait_for_timeout(1000)
-
-    return {"headline": "N/A", "description": "N/A"}
+    Non-video text extraction from ONE active visible creative only.
+    Returns headline/description plus the selected target so package/app link can be
+    extracted from the same frame, not from another ad on the transparency page.
+    """
+    scope = wait_for_active_ad_scope(page, max_wait_seconds=max_wait_seconds)
+    return {
+        "headline": scope.get("headline", "N/A"),
+        "description": scope.get("description", "N/A"),
+        "_target": scope.get("_target"),
+        "_source": scope.get("_source", "NONE"),
+        "_score": scope.get("_score", 0),
+        "app_link": scope.get("app_link", "N/A"),
+        "packages": scope.get("packages", set()) or set(),
+    }
 
 # =========================
 # MAIN COMBINED SCRAPER: VIDEO ADS + TEXT ADS
@@ -1296,16 +1546,26 @@ def scrape_single_url(url_row):
                 print(f"⏭ Row {row_num}: no video and no valid text ad found")
                 return
 
+            source = text_data.get("_source", "NONE")
             print(f"🔎 Row {row_num}: text/image headline -> {headline}")
-            print(f"📦 Row {row_num}: resolving Play Store package by character matching")
+            print(f"🎯 Row {row_num}: active creative source -> {source}")
+            print(f"📦 Row {row_num}: resolving Play Store package from SAME creative only")
 
-            # Collect Play Store package candidates from the current page/frames.
-            # The visible install link package is added as a candidate, but we no longer
-            # blindly trust the first package found in hidden HTML.
-            visible_app_link = wait_and_extract_install_link(page, max_wait_seconds=8)
+            # Important fix:
+            # Do NOT scan the full transparency page here. That page may contain multiple ads.
+            # Use only the same active target/frame that produced this headline + description.
+            active_target = text_data.get("_target")
+            visible_app_link = clean_text(text_data.get("app_link"))
+
+            if visible_app_link == "N/A" and active_target is not None:
+                visible_app_link = wait_and_extract_install_link_from_target(active_target, max_wait_seconds=8)
+
             visible_package = extract_package_name(visible_app_link)
 
-            all_found_packages = set(extract_package_from_page(page))
+            all_found_packages = set(text_data.get("packages") or [])
+            if not all_found_packages and active_target is not None:
+                all_found_packages = set(extract_package_from_target(active_target))
+
             if visible_package != "N/A":
                 all_found_packages.add(visible_package)
 
@@ -1323,14 +1583,14 @@ def scrape_single_url(url_row):
                     app_link = f"https://play.google.com/store/apps/details?id={package_name}"
 
                 status = "SUCCESS"
-                message = f"Non-video ad package matched by headline/description characters. Score={match_score}"
-                print(f"✅ Row {row_num}: character matched package -> {package_name} | score={match_score}")
+                message = f"Non-video package matched inside same creative frame. Source={source}. Score={match_score}"
+                print(f"✅ Row {row_num}: SAME-FRAME matched package -> {package_name} | score={match_score}")
             else:
                 package_name = "N/A"
                 app_link = "N/A"
                 status = "NON_VIDEO_PACKAGE_NOT_FOUND"
-                message = f"Non-video ad found, but character match score below {MIN_PACKAGE_MATCH_SCORE}. Best score={match_score}"
-                print(f"⚠️ Row {row_num}: package character score below {MIN_PACKAGE_MATCH_SCORE}, writing N/A | best score={match_score}")
+                message = f"Non-video ad found, but same-frame character score below {MIN_PACKAGE_MATCH_SCORE}. Best score={match_score}. Source={source}"
+                print(f"⚠️ Row {row_num}: SAME-FRAME package score below {MIN_PACKAGE_MATCH_SCORE}, writing N/A | best score={match_score}")
 
             data = [
                 advertiser,
