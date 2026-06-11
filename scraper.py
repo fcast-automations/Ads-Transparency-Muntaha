@@ -661,13 +661,15 @@ def _extract_structured_ad_text_from_target(target):
             if (!el) return false;
             const rect = el.getBoundingClientRect();
             const style = window.getComputedStyle(el);
+
+            // IMPORTANT:
+            // Do NOT require rect.top < window.innerHeight here.
+            // In GitHub/headless Chromium, Google ad iframe contents can be loaded
+            // but technically outside the current viewport until scrolled.
+            // Requiring viewport visibility caused headline/description to become N/A.
             return (
                 rect.width > 0 &&
                 rect.height > 0 &&
-                rect.bottom > 0 &&
-                rect.right > 0 &&
-                rect.top < window.innerHeight &&
-                rect.left < window.innerWidth &&
                 style.visibility !== 'hidden' &&
                 style.display !== 'none' &&
                 style.opacity !== '0'
@@ -888,8 +890,12 @@ def extract_package_from_target(target):
 
 def wait_for_active_ad_scope(page, max_wait_seconds=15):
     """
-    Finds ONE visible active creative target and extracts everything from that same target.
-    This is the main fix for wrong headline/description/package from another ad.
+    Finds ONE target (frame or main page) and keeps headline, description,
+    app link and package candidates from that same target only.
+
+    This version is intentionally NOT strict about iframe on-screen bounding boxes,
+    because GitHub/headless Chromium often reports the correct creative iframe as
+    offscreen/zero-area even when its DOM is already loaded.
     """
     start = time.time()
     best_scope = None
@@ -897,16 +903,15 @@ def wait_for_active_ad_scope(page, max_wait_seconds=15):
     while time.time() - start < max_wait_seconds:
         targets = []
 
-        # Main page fallback only. Frames are preferred because ad creatives usually live there.
-        targets.append((page, 1, None, 0, "MAIN_PAGE"))
-
+        # Search frames first. Google ad creatives usually live inside frames.
         for idx, frame in enumerate(page.frames):
             if frame == page.main_frame:
                 continue
             area, box = _frame_visible_area(frame)
-            if area < 1200:
-                continue
-            targets.append((frame, 5, box, area, f"FRAME_{idx}"))
+            targets.append((frame, 10, box, area, f"FRAME_{idx}"))
+
+        # Main page last as a fallback. It may contain navigation/other page text.
+        targets.append((page, 1, None, 0, "MAIN_PAGE"))
 
         for target, base_priority, box, area, label in targets:
             data = _extract_structured_ad_text_from_target(target)
@@ -918,28 +923,46 @@ def wait_for_active_ad_scope(page, max_wait_seconds=15):
             if headline == "N/A" and description == "N/A":
                 continue
 
-            score = base_priority
-            if headline != "N/A":
-                score += 120
-            if description != "N/A":
-                score += 100
-            if headline_count:
-                score += min(30, headline_count * 5)
-            if description_count:
-                score += min(30, description_count * 5)
+            # Keep all app/package information from this same target only.
+            app_link = extract_install_link_from_target(target)
+            packages = extract_package_from_target(target)
 
-            if box:
-                # Prefer visible ad frames near the top/center of the current page.
+            score = base_priority
+
+            # Strongest signal: target has the actual structured classes you asked for.
+            if headline != "N/A":
+                score += 300
+            if description != "N/A":
+                score += 260
+            if headline != "N/A" and description != "N/A":
+                score += 500
+
+            # Prefer targets that also contain the Play Store destination / package.
+            if app_link != "N/A":
+                score += 220
+            if packages:
+                score += 160
+
+            # Prefer exact selector hits, but do not require visible iframe bounds.
+            if headline_count:
+                score += min(80, headline_count * 15)
+            if description_count:
+                score += min(80, description_count * 15)
+
+            # If iframe bounds are available, use them only as a small bonus.
+            # Never reject a frame only because the box is unavailable/zero in headless mode.
+            if box and area > 0:
                 top = box.get("y", 9999)
                 width = box.get("width", 0)
                 height = box.get("height", 0)
-                score += min(80, area / 3000)
-                score += min(35, width / 25)
-                score += min(35, height / 18)
-                score += max(0, 45 - abs(top - 180) / 8)
-            else:
-                # Main page can contain navigation/sidebar text, so it gets a penalty.
-                score -= 35
+                score += min(60, area / 5000)
+                score += min(25, width / 40)
+                score += min(25, height / 30)
+                score += max(0, 25 - abs(top - 180) / 20)
+
+            # Main page is noisy, so penalize it unless it has structured ad classes.
+            if label == "MAIN_PAGE":
+                score -= 120
 
             if not best_scope or score > best_scope["_score"]:
                 best_scope = {
@@ -949,16 +972,11 @@ def wait_for_active_ad_scope(page, max_wait_seconds=15):
                     "_source": label,
                     "_score": round(score, 2),
                     "_box": box,
-                    "packages": set(),
-                    "app_link": "N/A"
+                    "packages": packages or set(),
+                    "app_link": app_link
                 }
 
         if best_scope:
-            target = best_scope.get("_target")
-            app_link = extract_install_link_from_target(target) if target else "N/A"
-            packages = extract_package_from_target(target) if target else set()
-            best_scope["app_link"] = app_link
-            best_scope["packages"] = packages
             return best_scope
 
         page.wait_for_timeout(1000)
@@ -973,7 +991,6 @@ def wait_for_active_ad_scope(page, max_wait_seconds=15):
         "packages": set(),
         "app_link": "N/A"
     }
-
 
 # =========================
 # HEADLINE AND DESCRIPTION LOGIC
