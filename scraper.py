@@ -978,19 +978,6 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
     () => {
         let result = { headline: "N/A", description: "N/A" };
 
-        // 🚨 FIX: Find the active modal/dialog so we DO NOT scan the background grid
-        let rootNode = document;
-        const possibleModals = document.querySelectorAll('material-dialog, [role="dialog"], [aria-modal="true"], dialog, .creative-detail-container');
-        
-        for (let modal of possibleModals) {
-            const rect = modal.getBoundingClientRect();
-            // If the modal has dimensions and is visible, lock our search to ONLY inside this modal
-            if (rect.width > 0 && rect.height > 0 && window.getComputedStyle(modal).visibility !== 'hidden') {
-                rootNode = modal; 
-                break;
-            }
-        }
-
         const cleanText = (txt) => {
             return (txt || "").replace(/\n/g, " ").replace(/\s+/g, " ").trim();
         };
@@ -1015,9 +1002,9 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
         const isBadText = (txt) => {
             const lower = cleanText(txt).toLowerCase();
             const exactBlock = [
-                'install', 'download', 'get', 'open', 'visit site', 'learn more', 'shop now', 'book now', 'apply now',
-                'sign in', 'google', 'search', 'ad details', 'ads transparency', 'subscribe', 'play now',
-                'ads transparency center', 'ads transparency centre', 'report this ad', 'about this ad',
+                'install', 'download', 'get', 'open', 'visit site', 'learn more',
+                'sign in', 'google', 'search', 'ad details', 'ads transparency',
+                'ads transparency center', 'ads transparency centre', 'report this ad',
                 'see more ads', 'last shown', 'shown in', 'format:'
             ];
             if (!lower) return true;
@@ -1027,22 +1014,16 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
             return false;
         };
 
-        // Note we are using rootNode.querySelectorAll instead of document.querySelectorAll
-        const textNodes = Array.from(rootNode.querySelectorAll('*')).filter(el => {
-            if (['BODY', 'HTML', 'MAIN', 'ARTICLE', 'SECTION', 'FORM'].includes(el.tagName)) return false;
-            
+        const leafNodes = Array.from(document.querySelectorAll('*')).filter(el => {
+            if (el.childElementCount > 0) return false;
             const txt = cleanText(el.innerText || el.textContent || "");
-            if (txt.length < 4 || txt.length > 250 || isBadText(txt)) return false;
-
-            const blockChildren = Array.from(el.children).filter(c => ['DIV', 'P', 'UL', 'LI', 'TABLE'].includes(c.tagName));
-            if (blockChildren.length > 1) return false;
-
+            if (txt.length < 4 || txt.length > 180 || isBadText(txt)) return false;
             return isVisible(el);
         });
 
-        // 1. Extract Headline
-        const headlineSelectors = '[class*="-e-15"], [class*="headline"], [class*="title"], [aria-label*="Headline"], [aria-label*="title"]';
-        const knownHeadlines = Array.from(rootNode.querySelectorAll(headlineSelectors)).filter(el => {
+        // Prefer known headline classes when Google provides them.
+        const headlineSelectors = '[class*="-e-15"], [class*="headline"], [aria-label*="Headline"], [aria-label*="headline"]';
+        const knownHeadlines = Array.from(document.querySelectorAll(headlineSelectors)).filter(el => {
             const txt = cleanText(el.innerText || el.textContent || "");
             return txt.length >= 4 && txt.length <= 180 && !isBadText(txt) && isVisible(el);
         });
@@ -1050,50 +1031,53 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
         if (knownHeadlines.length > 0) {
             result.headline = cleanText(knownHeadlines[0].innerText || knownHeadlines[0].textContent || "");
         } else {
-            let maxScore = 0;
+            let maxFont = 0;
             let bestEl = null;
-            for (let el of textNodes) {
+            for (let el of leafNodes) {
                 const txt = cleanText(el.innerText || el.textContent || "");
-                if (txt.length < 4 || txt.length > 120) continue; 
-                
+                if (txt.length < 4 || txt.length > 90) continue;
                 const style = window.getComputedStyle(el);
                 const fontSize = parseFloat(style.fontSize || '0');
-                const fontWeight = parseFloat(style.fontWeight || '400');
-                
                 const rect = el.getBoundingClientRect();
-                let score = fontSize + (fontWeight > 500 ? 5 : 0);
-                if (rect.y < 300) score += 10; 
-                
-                if (score > maxScore) {
-                    maxScore = score;
+                const score = fontSize + Math.min(rect.width, 400) / 100;
+                if (score > maxFont) {
+                    maxFont = score;
                     bestEl = el;
                 }
             }
-            if (bestEl) result.headline = cleanText(bestEl.innerText || bestEl.textContent || "");
+            if (bestEl) {
+                result.headline = cleanText(bestEl.innerText || bestEl.textContent || "");
+            }
         }
 
-        // 2. Extract Description
-        const descSelectors = '[class*="-e-67"], [class*="long-description"], [class*="description"], [class*="body"], [aria-label*="Description"]';
-        const knownDescriptions = Array.from(rootNode.querySelectorAll(descSelectors)).filter(el => {
+        // Prefer known description classes.
+        const descSelectors = '[class*="-e-67"], [class*="long-description"], [class*="description"], [aria-label*="Description"], [aria-label*="description"]';
+        const knownDescriptions = Array.from(document.querySelectorAll(descSelectors)).filter(el => {
             const txt = cleanText(el.innerText || el.textContent || "");
-            return txt.length >= 15 && txt !== result.headline && !isBadText(txt) && isVisible(el);
+            return txt.length >= 8 && txt !== result.headline && !isBadText(txt) && isVisible(el);
         });
 
         if (knownDescriptions.length > 0) {
             result.description = cleanText(knownDescriptions[0].innerText || knownDescriptions[0].textContent || "");
         } else {
-            let bestLength = 0;
+            let bestScore = 0;
             let bestDesc = null;
-            for (let el of textNodes) {
+            for (let el of leafNodes) {
                 const txt = cleanText(el.innerText || el.textContent || "");
-                if (txt === result.headline || txt.length < 20 || txt.length > 300 || isBadText(txt)) continue;
-                
-                if (txt.length > bestLength) {
-                    bestLength = txt.length;
+                if (txt === result.headline || txt.length < 12 || txt.length > 220 || isBadText(txt)) continue;
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                const fontSize = parseFloat(style.fontSize || '0');
+                // Description is normally longer text, not necessarily largest font.
+                const score = Math.min(txt.length, 160) + Math.min(rect.width, 500) / 20 - fontSize;
+                if (score > bestScore) {
+                    bestScore = score;
                     bestDesc = el;
                 }
             }
-            if (bestDesc) result.description = cleanText(bestDesc.innerText || bestDesc.textContent || "");
+            if (bestDesc) {
+                result.description = cleanText(bestDesc.innerText || bestDesc.textContent || "");
+            }
         }
 
         return result;
