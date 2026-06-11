@@ -1064,151 +1064,21 @@ def extract_advertiser_from_page(page):
 
 def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
     """
-    Extracts visible headline/description for non-video ads from the current ad only.
-    It checks visible top creative iframes first, then the main page DOM as fallback.
+    Non-video headline/description extraction.
+    Uses ONLY the requested selectors through wait_and_extract_headline_description():
+      headline:    [class*="-e-15"], [class*="headline"]
+      description: [class*="-e-67"], [class*="long-description"]
+
+    This keeps extraction tied to the active visible creative frame for the opened URL.
     """
-    js = r"""
-    () => {
-        let result = { headline: "N/A", description: "N/A" };
-
-        const cleanText = (txt) => {
-            return (txt || "").replace(/\n/g, " ").replace(/\s+/g, " ").trim();
-        };
-
-        const isVisible = (el) => {
-            if (!el) return false;
-            const rect = el.getBoundingClientRect();
-            const style = window.getComputedStyle(el);
-            return (
-                rect.width > 0 &&
-                rect.height > 0 &&
-                rect.bottom > 0 &&
-                rect.right > 0 &&
-                rect.top < window.innerHeight &&
-                rect.left < window.innerWidth &&
-                style.visibility !== 'hidden' &&
-                style.display !== 'none' &&
-                style.opacity !== '0'
-            );
-        };
-
-        const isBadText = (txt) => {
-            const lower = cleanText(txt).toLowerCase();
-            const exactBlock = [
-                'install', 'download', 'get', 'open', 'visit site', 'learn more',
-                'sign in', 'google', 'search', 'ad details', 'ads transparency',
-                'ads transparency center', 'ads transparency centre', 'report this ad',
-                'see more ads', 'last shown', 'shown in', 'format:'
-            ];
-            if (!lower) return true;
-            if (exactBlock.includes(lower)) return true;
-            if (lower.length < 15 && (lower.startsWith('install') || lower.startsWith('download') || lower.startsWith('get '))) return true;
-            if (lower.includes('{{') || lower.includes('}}')) return true;
-            return false;
-        };
-
-        // Use your exact selectors first.
-        const headlineSelectors = '[class*="-e-15"], [class*="headline"]';
-        const descSelectors = '[class*="-e-67"], [class*="long-description"]';
-
-        const knownHeadlines = Array.from(document.querySelectorAll(headlineSelectors)).filter(el => {
-            const txt = cleanText(el.innerText || el.textContent || "");
-            return txt.length >= 4 && txt.length <= 180 && !isBadText(txt) && isVisible(el);
-        });
-
-        if (knownHeadlines.length > 0) {
-            result.headline = cleanText(knownHeadlines[0].innerText || knownHeadlines[0].textContent || "");
-        }
-
-        const knownDescriptions = Array.from(document.querySelectorAll(descSelectors)).filter(el => {
-            const txt = cleanText(el.innerText || el.textContent || "");
-            return txt.length >= 8 && txt !== result.headline && !isBadText(txt) && isVisible(el);
-        });
-
-        if (knownDescriptions.length > 0) {
-            result.description = cleanText(knownDescriptions[0].innerText || knownDescriptions[0].textContent || "");
-        }
-
-        // Fallback only inside this same selected target/frame.
-        if (result.headline === "N/A" || result.description === "N/A") {
-            const leafNodes = Array.from(document.querySelectorAll('*')).filter(el => {
-                if (el.childElementCount > 0) return false;
-                const txt = cleanText(el.innerText || el.textContent || "");
-                if (txt.length < 4 || txt.length > 220 || isBadText(txt)) return false;
-                return isVisible(el);
-            });
-
-            if (result.headline === "N/A") {
-                let bestScore = 0;
-                let bestEl = null;
-                for (let el of leafNodes) {
-                    const txt = cleanText(el.innerText || el.textContent || "");
-                    if (txt.length < 4 || txt.length > 100) continue;
-                    const style = window.getComputedStyle(el);
-                    const rect = el.getBoundingClientRect();
-                    const fontSize = parseFloat(style.fontSize || '0');
-                    const score = fontSize * 3 + Math.min(rect.width, 500) / 80 - Math.max(rect.top, 0) / 250;
-                    if (score > bestScore) {
-                        bestScore = score;
-                        bestEl = el;
-                    }
-                }
-                if (bestEl) {
-                    result.headline = cleanText(bestEl.innerText || bestEl.textContent || "");
-                }
-            }
-
-            if (result.description === "N/A") {
-                let bestScore = 0;
-                let bestDesc = null;
-                for (let el of leafNodes) {
-                    const txt = cleanText(el.innerText || el.textContent || "");
-                    if (txt === result.headline || txt.length < 12 || txt.length > 260) continue;
-                    const rect = el.getBoundingClientRect();
-                    const score = Math.min(txt.length, 180) + Math.min(rect.width, 600) / 20 - Math.max(rect.top, 0) / 300;
-                    if (score > bestScore) {
-                        bestScore = score;
-                        bestDesc = el;
-                    }
-                }
-                if (bestDesc) {
-                    result.description = cleanText(bestDesc.innerText || bestDesc.textContent || "");
-                }
-            }
-        }
-
-        return result;
+    headline, description = wait_and_extract_headline_description(
+        page,
+        max_wait_seconds=max_wait_seconds
+    )
+    return {
+        "headline": clean_text(headline),
+        "description": clean_text(description)
     }
-    """
-
-    def read_target(target):
-        try:
-            data = target.evaluate(js)
-            if data and (data.get("headline") != "N/A" or data.get("description") != "N/A"):
-                return data
-        except Exception:
-            return None
-        return None
-
-    start_time = time.time()
-
-    while time.time() - start_time < max_wait_seconds:
-        reset_page_to_current_ad_area(page)
-
-        # 1) Prefer only visible top/current creative iframes.
-        for frame in _visible_frames_by_priority(page):
-            data = read_target(frame)
-            if data and is_valid_text_ad(data.get("headline"), data.get("description")):
-                return data
-
-        # 2) Fallback: check main page DOM directly for this opened URL.
-        data = read_target(page)
-        if data and is_valid_text_ad(data.get("headline"), data.get("description")):
-            return data
-
-        page.wait_for_timeout(1000)
-
-    return {"headline": "N/A", "description": "N/A"}
 
 # =========================
 # MAIN COMBINED SCRAPER: VIDEO ADS + TEXT ADS
