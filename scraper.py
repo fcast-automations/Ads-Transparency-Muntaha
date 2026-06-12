@@ -8,6 +8,33 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import difflib
 import re
+
+def get_best_matching_package_for_text_ad(headline, description, package_list, min_score=0.70):
+    """Matches package names with headline + description using character-level comparison."""
+    import difflib
+    def clean_text_for_comparison(text):
+        if not text or text == "N/A":
+            return ""
+        return re.sub(r"[^a-z0-9]", "", text.lower())
+
+    ad_text = clean_text_for_comparison(str(headline) + str(description))
+
+    best_pkg = None
+    best_score = 0.0
+
+    for pkg in package_list:
+        pkg_clean = clean_text_for_comparison(pkg)
+        if not pkg_clean:
+            continue
+        ratio = difflib.SequenceMatcher(None, ad_text, pkg_clean).ratio()
+        if ratio > best_score:
+            best_score = ratio
+            best_pkg = pkg
+
+    if best_score >= min_score:
+        return best_pkg, best_score
+    return None, best_score
+
 import time
 import threading
 import sheets
@@ -969,18 +996,29 @@ def extract_advertiser_from_page(page):
         pass
     return "N/A"
 
-def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
+def _frame_parent_box(frame):
     """
-    Extracts visible headline/description for non-video ads.
-    It checks ad iframes first, then the main page DOM as a fallback.
+    Returns the iframe element box in the parent page.
+    This is important because a hidden/stale iframe can still return text from inside itself.
+    """
+    try:
+        iframe_el = frame.frame_element()
+        box = iframe_el.bounding_box()
+        if not box:
+            return None
+        return box
+    except Exception:
+        return None
+
+
+def _score_non_video_target(target):
+    """
+    Scores a page/frame by checking whether it looks like the active ad creative.
+    Higher score = more likely to be the current transparency URL preview.
     """
     js = r"""
     () => {
-        let result = { headline: "N/A", description: "N/A" };
-
-        const cleanText = (txt) => {
-            return (txt || "").replace(/\n/g, " ").replace(/\s+/g, " ").trim();
-        };
+        const cleanText = (txt) => (txt || '').replace(/\n/g, ' ').replace(/\s+/g, ' ').trim();
 
         const isVisible = (el) => {
             if (!el) return false;
@@ -999,88 +1037,168 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
             );
         };
 
-        const isBadText = (txt) => {
-            const lower = cleanText(txt).toLowerCase();
-            const exactBlock = [
-                'install', 'download', 'get', 'open', 'visit site', 'learn more',
-                'sign in', 'google', 'search', 'ad details', 'ads transparency',
-                'ads transparency center', 'ads transparency centre', 'report this ad',
-                'see more ads', 'last shown', 'shown in', 'format:'
-            ];
-            if (!lower) return true;
-            if (exactBlock.includes(lower)) return true;
-            if (lower.length < 15 && (lower.startsWith('install') || lower.startsWith('download') || lower.startsWith('get '))) return true;
-            if (lower.includes('{{') || lower.includes('}}')) return true;
-            return false;
-        };
+        const visibleText = cleanText(document.body ? document.body.innerText : '');
+        const lowerText = visibleText.toLowerCase();
 
-        const leafNodes = Array.from(document.querySelectorAll('*')).filter(el => {
+        const headlineNodes = Array.from(document.querySelectorAll(
+            '[class*="-e-15"], [class*="headline"], [aria-label*="Headline"], [aria-label*="headline"]'
+        )).filter(el => {
+            const txt = cleanText(el.innerText || el.textContent || '');
+            return txt.length >= 4 && txt.length <= 180 && isVisible(el) && !txt.includes('{{');
+        });
+
+        const descNodes = Array.from(document.querySelectorAll(
+            '[class*="-e-67"], [class*="long-description"], [class*="description"], [aria-label*="Description"], [aria-label*="description"]'
+        )).filter(el => {
+            const txt = cleanText(el.innerText || el.textContent || '');
+            return txt.length >= 8 && txt.length <= 260 && isVisible(el) && !txt.includes('{{');
+        });
+
+        const installNodes = Array.from(document.querySelectorAll('a[href], a[data-href], button')).filter(el => {
+            const txt = cleanText(el.innerText || el.textContent || '').toLowerCase();
+            const cls = String(el.className || '').toLowerCase();
+            const aria = String(el.getAttribute('aria-label') || '').toLowerCase();
+            const href = String(el.href || el.getAttribute('href') || el.getAttribute('data-href') || '').toLowerCase();
+            const looksInstall = cls.includes('install-button-anchor') || txt.includes('install') || txt === 'get' || txt.includes('download') || aria.includes('install');
+            const goodHref = href.includes('googleadservices.com/pagead/aclk') || href.includes('play.google.com') || href.includes('apps.apple.com') || href.includes('itunes.apple.com');
+            return isVisible(el) && (looksInstall || goodHref);
+        });
+
+        const imageNodes = Array.from(document.querySelectorAll('img, picture, canvas, svg')).filter(el => {
+            const src = String(el.getAttribute('src') || '').toLowerCase();
+            const alt = String(el.getAttribute('alt') || '').toLowerCase();
+            if (src.includes('googlelogo') || alt.includes('google')) return false;
+            const rect = el.getBoundingClientRect();
+            return isVisible(el) && rect.width >= 80 && rect.height >= 50;
+        });
+
+        const leafTextNodes = Array.from(document.querySelectorAll('*')).filter(el => {
             if (el.childElementCount > 0) return false;
-            const txt = cleanText(el.innerText || el.textContent || "");
-            if (txt.length < 4 || txt.length > 180 || isBadText(txt)) return false;
+            const txt = cleanText(el.innerText || el.textContent || '');
+            if (txt.length < 4 || txt.length > 220) return false;
+            if (txt.includes('{{') || txt.includes('}}')) return false;
             return isVisible(el);
         });
 
-        // Prefer known headline classes when Google provides them.
-        const headlineSelectors = '[class*="-e-15"], [class*="headline"], [aria-label*="Headline"], [aria-label*="headline"]';
-        const knownHeadlines = Array.from(document.querySelectorAll(headlineSelectors)).filter(el => {
-            const txt = cleanText(el.innerText || el.textContent || "");
-            return txt.length >= 4 && txt.length <= 180 && !isBadText(txt) && isVisible(el);
-        });
+        let score = 0;
+        score += Math.min(headlineNodes.length, 2) * 120;
+        score += Math.min(descNodes.length, 2) * 100;
+        score += Math.min(installNodes.length, 2) * 80;
+        score += Math.min(imageNodes.length, 3) * 25;
+        score += Math.min(leafTextNodes.length, 8) * 8;
 
-        if (knownHeadlines.length > 0) {
-            result.headline = cleanText(knownHeadlines[0].innerText || knownHeadlines[0].textContent || "");
-        } else {
-            let maxFont = 0;
-            let bestEl = null;
-            for (let el of leafNodes) {
-                const txt = cleanText(el.innerText || el.textContent || "");
-                if (txt.length < 4 || txt.length > 90) continue;
-                const style = window.getComputedStyle(el);
-                const fontSize = parseFloat(style.fontSize || '0');
-                const rect = el.getBoundingClientRect();
-                const score = fontSize + Math.min(rect.width, 400) / 100;
-                if (score > maxFont) {
-                    maxFont = score;
-                    bestEl = el;
-                }
-            }
-            if (bestEl) {
-                result.headline = cleanText(bestEl.innerText || bestEl.textContent || "");
-            }
+        // The Google transparency shell/page chrome should not beat the actual creative iframe.
+        if (lowerText.includes('ads transparency center') || lowerText.includes('ads transparency centre')) score -= 180;
+        if (lowerText.includes('see more ads') || lowerText.includes('report this ad')) score -= 90;
+        if (lowerText.includes('last shown') || lowerText.includes('shown in')) score -= 50;
+
+        return {
+            score,
+            headlineCount: headlineNodes.length,
+            descriptionCount: descNodes.length,
+            installCount: installNodes.length,
+            imageCount: imageNodes.length,
+            leafTextCount: leafTextNodes.length,
+            visibleTextLength: visibleText.length
+        };
+    }
+    """
+    try:
+        return target.evaluate(js) or {"score": 0}
+    except Exception:
+        return {"score": 0}
+
+
+def get_ranked_non_video_targets(page):
+    """
+    Returns frames/page ordered by the most likely active creative.
+    Old logic checked page.frames in browser order, which can be wrong for repeated ads.
+    """
+    ranked = []
+
+    for frame in page.frames:
+        if frame == page.main_frame:
+            continue
+
+        parent_bonus = 0
+        box = _frame_parent_box(frame)
+
+        if box:
+            width = box.get("width", 0) or 0
+            height = box.get("height", 0) or 0
+            y = box.get("y", 99999) or 99999
+            area = width * height
+
+            # Active ad preview iframe is normally visible and reasonably large.
+            if width >= 120 and height >= 70:
+                parent_bonus += min(area / 8000, 80)
+            else:
+                parent_bonus -= 120
+
+            # Prefer currently visible/near-top preview, not repeated ads farther down the page.
+            if -50 <= y <= 900:
+                parent_bonus += 80
+            elif 900 < y <= 1400:
+                parent_bonus += 20
+            else:
+                parent_bonus -= 80
+        else:
+            parent_bonus -= 40
+
+        inner = _score_non_video_target(frame)
+        final_score = float(inner.get("score", 0) or 0) + parent_bonus
+
+        if final_score > 0:
+            ranked.append((final_score, frame, "iframe", inner))
+
+    # Main page is only a fallback. It contains Google page chrome, so keep it below real creative frames.
+    main_inner = _score_non_video_target(page)
+    main_score = float(main_inner.get("score", 0) or 0) - 60
+    if main_score > 0:
+        ranked.append((main_score, page, "main_page", main_inner))
+
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return ranked
+
+
+def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
+    """
+    Extracts headline and description for non-video ads.
+    - Prefers visible elements from the active creative (main DOM).
+    - Uses specific selectors: <div role="link">, div.HFTpmd-WsjYwc-hgDUwe, div.cS4Vcb-vnv8ic
+    - Falls back to iframe if necessary.
+    - Relaxed visibility check to allow offscreen or special-language creatives (e.g., Arabic).
+    """
+    js = r"""
+    () => {
+        const cleanText = (txt) => (txt || "").replace(/\n/g, " ").replace(/\s+/g, " ").trim();
+
+        // RELAXED visibility: ignore offscreen top/bottom/left/right but still require positive width/height
+        const isVisible = (el) => {
+            if (!el) return false;
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return rect.width > 0 && rect.height > 0 &&
+                   style.visibility !== 'hidden' &&
+                   style.display !== 'none' &&
+                   style.opacity !== '0';
+        };
+
+        let headline = "N/A";
+        let description = "N/A";
+
+        // 1️⃣ Main visible creative first
+        const headlineEl = document.querySelector('div[role="link"] span, div.HFTpmd-WsjYwc-hgDUwe, div.cS4Vcb-vnv8ic');
+        if (headlineEl && isVisible(headlineEl)) {
+            headline = cleanText(headlineEl.innerText || headlineEl.textContent);
         }
 
-        // Prefer known description classes.
-        const descSelectors = '[class*="-e-67"], [class*="long-description"], [class*="description"], [aria-label*="Description"], [aria-label*="description"]';
-        const knownDescriptions = Array.from(document.querySelectorAll(descSelectors)).filter(el => {
-            const txt = cleanText(el.innerText || el.textContent || "");
-            return txt.length >= 8 && txt !== result.headline && !isBadText(txt) && isVisible(el);
-        });
-
-        if (knownDescriptions.length > 0) {
-            result.description = cleanText(knownDescriptions[0].innerText || knownDescriptions[0].textContent || "");
-        } else {
-            let bestScore = 0;
-            let bestDesc = null;
-            for (let el of leafNodes) {
-                const txt = cleanText(el.innerText || el.textContent || "");
-                if (txt === result.headline || txt.length < 12 || txt.length > 220 || isBadText(txt)) continue;
-                const rect = el.getBoundingClientRect();
-                const style = window.getComputedStyle(el);
-                const fontSize = parseFloat(style.fontSize || '0');
-                // Description is normally longer text, not necessarily largest font.
-                const score = Math.min(txt.length, 160) + Math.min(rect.width, 500) / 20 - fontSize;
-                if (score > bestScore) {
-                    bestScore = score;
-                    bestDesc = el;
-                }
-            }
-            if (bestDesc) {
-                result.description = cleanText(bestDesc.innerText || bestDesc.textContent || "");
-            }
+        const descriptionEl = document.querySelector('div.HFTpmd-WsjYwc-hgDUwe, div.cS4Vcb-vnv8ic');
+        if (descriptionEl && isVisible(descriptionEl)) {
+            description = cleanText(descriptionEl.innerText || descriptionEl.textContent);
         }
 
-        return result;
+        return { headline, description };
     }
     """
 
@@ -1096,23 +1214,22 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
     start_time = time.time()
 
     while time.time() - start_time < max_wait_seconds:
-        # 1) Prefer iframes because the ad creative usually lives there.
+        # 1) Check main page DOM first (active visible creative)
+        data = read_target(page)
+        if data:
+            return data
+
+        # 2) Fallback: check iframes only if main DOM didn't yield headline/description
         for frame in page.frames:
             if frame == page.main_frame:
                 continue
             data = read_target(frame)
-            if data and is_valid_text_ad(data.get("headline"), data.get("description")):
+            if data:
                 return data
-
-        # 2) Fallback: check main page DOM directly too.
-        data = read_target(page)
-        if data and is_valid_text_ad(data.get("headline"), data.get("description")):
-            return data
 
         page.wait_for_timeout(1000)
 
     return {"headline": "N/A", "description": "N/A"}
-
 # =========================
 # MAIN COMBINED SCRAPER: VIDEO ADS + TEXT ADS
 # =========================
@@ -1197,6 +1314,7 @@ def scrape_single_url(url_row):
 
         context = browser.new_context(
             viewport={"width": 1366, "height": 768},
+            service_workers="block",
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
