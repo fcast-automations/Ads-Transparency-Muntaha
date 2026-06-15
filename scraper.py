@@ -141,6 +141,88 @@ def extract_package_name(app_link):
 
 
 # =========================
+# EXTRACT PACKAGE FROM SCRIPT VAR DATA APPIID
+# =========================
+
+def extract_package_from_script_var(page):
+    """
+    Extracts package name from script variable data.appId.
+    Looks for patterns like: var data = {google_width: ..., appId: 'com.example.app', ...}
+    """
+    js = r"""
+    () => {
+        let foundPackage = null;
+
+        // Method 1: Direct window variable access
+        if (window.data && window.data.appId) {
+            const appId = String(window.data.appId).trim();
+            if (appId && appId.length > 0 && appId !== 'null' && appId !== 'undefined') {
+                foundPackage = appId;
+            }
+        }
+
+        // Method 2: Scan all script tags for var data = {...appId...}
+        if (!foundPackage) {
+            const scripts = Array.from(document.querySelectorAll('script'));
+            for (let script of scripts) {
+                if (!script.textContent) continue;
+                
+                // Pattern 1: var data = {..., appId: 'com.example.app', ...}
+                const match1 = script.textContent.match(/var\s+data\s*=\s*\{[^}]*appId\s*:\s*['"]([^'"]+)['"]/i);
+                if (match1 && match1[1]) {
+                    const pkg = match1[1].trim();
+                    if (pkg && pkg.includes('.') && !pkg.includes('null') && !pkg.includes('undefined')) {
+                        foundPackage = pkg;
+                        break;
+                    }
+                }
+
+                // Pattern 2: appId: 'com.example.app'
+                const match2 = script.textContent.match(/appId\s*:\s*['"]([^'"]+)['"]/i);
+                if (match2 && match2[1]) {
+                    const pkg = match2[1].trim();
+                    if (pkg && pkg.includes('.') && !pkg.includes('null') && !pkg.includes('undefined')) {
+                        foundPackage = pkg;
+                        break;
+                    }
+                }
+
+                // Pattern 3: destination_url with id parameter
+                const match3 = script.textContent.match(/[?&]id=([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*){2,})/i);
+                if (match3 && match3[1]) {
+                    foundPackage = match3[1];
+                    break;
+                }
+            }
+        }
+
+        return foundPackage;
+    }
+    """
+
+    try:
+        package = page.evaluate(js)
+        if package and isinstance(package, str) and len(package) > 0:
+            # Validate it looks like a package name
+            if package.count('.') >= 2 and not package.lower().includes('null'):
+                return package
+    except Exception:
+        pass
+
+    # Also check iframes
+    for frame in page.frames:
+        try:
+            package = frame.evaluate(js)
+            if package and isinstance(package, str) and len(package) > 0:
+                if package.count('.') >= 2:
+                    return package
+        except Exception:
+            continue
+
+    return "N/A"
+
+
+# =========================
 # VIDEO ID LOGIC (REVERTED TO YOUR ORIGINAL WORKING LOGIC)
 # =========================
 
@@ -742,7 +824,7 @@ def extract_primary_image_url(page):
 
 
 # =========================
-# HEADLINE AND DESCRIPTION LOGIC - UPDATED
+# HEADLINE AND DESCRIPTION LOGIC
 # =========================
 
 def wait_and_extract_headline_description(page, max_wait_seconds=15):
@@ -1471,6 +1553,9 @@ def scrape_single_url(url_row):
                 
                 # Extract image URL for video ads too
                 image_url = extract_primary_image_url(page)
+                
+                # Try to extract package from script var data.appId
+                script_package = extract_package_from_script_var(page)
 
                 if app_link == "N/A":
                     status = "VIDEO_FOUND_APP_LINK_NOT_FOUND"
@@ -1480,6 +1565,11 @@ def scrape_single_url(url_row):
                     message = "Video ID and app link saved"
 
                 package_name = extract_package_name(app_link)
+                
+                # If no package from app link, try script variable
+                if package_name == "N/A" and script_package != "N/A":
+                    package_name = script_package
+                    print(f"✅ Row {row_num}: extracted package from script var: {package_name}")
 
                 data = [
                     advertiser,
@@ -1530,32 +1620,42 @@ def scrape_single_url(url_row):
             ad_type = "text" if has_text else "image" if (is_image_like or visible_package != "N/A") else "N/A"
 
             if not has_text and visible_package == "N/A" and not is_image_like:
-                data = [
-                    advertiser,
-                    "N/A",
-                    url,
-                    "N/A",
-                    process_time,
-                    "N/A",
-                    process_time
-                ]
+                # Try to get package from script var
+                script_package = extract_package_from_script_var(page)
+                
+                if script_package != "N/A":
+                    package_name = script_package
+                    app_link = f"https://play.google.com/store/apps/details?id={package_name}"
+                    status = "SUCCESS"
+                    message = f"Non-video image ad package extracted from script var: {package_name}"
+                    print(f"✅ Row {row_num}: package from script var -> {package_name}")
+                else:
+                    data = [
+                        advertiser,
+                        "N/A",
+                        url,
+                        "N/A",
+                        process_time,
+                        "N/A",
+                        process_time
+                    ]
 
-                safe_update_combined_row(row_num, data)
-                safe_update_headline_desc(row_num, "N/A", "N/A")
-                safe_update_image_url(row_num, "N/A")
+                    safe_update_combined_row(row_num, data)
+                    safe_update_headline_desc(row_num, "N/A", "N/A")
+                    safe_update_image_url(row_num, "N/A")
 
-                safe_add_log(
-                    row_number=row_num,
-                    status="NO_VIDEO_NO_TEXT_IMAGE",
-                    log_type="COMBINED",
-                    url=url,
-                    video_id="N/A",
-                    app_link="N/A",
-                    message="No video ID and no valid text/image creative found"
-                )
+                    safe_add_log(
+                        row_number=row_num,
+                        status="NO_VIDEO_NO_TEXT_IMAGE",
+                        log_type="COMBINED",
+                        url=url,
+                        video_id="N/A",
+                        app_link="N/A",
+                        message="No video ID and no valid text/image creative found"
+                    )
 
-                print(f"⏭ Row {row_num}: no video and no valid text/image ad found")
-                return
+                    print(f"⏭ Row {row_num}: no video and no valid text/image ad found")
+                    return
 
             if has_text:
                 print(f"🔎 Row {row_num}: text/image headline -> {headline}")
@@ -1580,11 +1680,19 @@ def scrape_single_url(url_row):
                     all_found_packages = extract_package_from_page(page)
                     package_name, match_score = get_best_matching_package(headline, description, all_found_packages)
 
+                # Try script var if text matching didn't work
+                if not package_name:
+                    script_package = extract_package_from_script_var(page)
+                    if script_package != "N/A":
+                        package_name = script_package
+                        match_score = 0.95  # High score for script var extraction
+                        print(f"✅ Row {row_num}: package from script var -> {package_name}")
+
                 if package_name:
                     app_link = f"https://play.google.com/store/apps/details?id={package_name}"
                     status = "SUCCESS"
-                    message = f"Non-video {ad_type} ad package strictly matched with score {match_score}"
-                    print(f"✅ Row {row_num}: strict matched package -> {package_name} | score={match_score}")
+                    message = f"Non-video {ad_type} ad package extracted with score {match_score}"
+                    print(f"✅ Row {row_num}: matched package -> {package_name} | score={match_score}")
                 else:
                     package_name = "N/A"
                     app_link = "N/A"
