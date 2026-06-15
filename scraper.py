@@ -1384,12 +1384,12 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15, preferred_target
     """
     Extract headline/description from the SAME creative target where the image URL was found.
 
-    Fix for repeated headline/description:
-    - Do not scan random page/frame first when image target is known.
-    - Do not pick Install/Get/Download/Open/Learn more.
-    - Candidate headline = longer visible text near/below the image.
-    - Candidate description = next visible text directly under headline.
-    - If same target has no usable text, return N/A instead of copying text from another ad/frame.
+    Updated rule for your current Google ad layout:
+    - Use Install/Get/Download/Open/Learn more only as an ANCHOR, never as headline/description.
+    - First usable visible text BELOW the install anchor = headline.
+    - Next usable visible text BELOW headline = description.
+    - Description is selected by vertical position, not by length.
+    - If no install anchor is found, fallback picks first usable text below/near the image, then the next text below it.
     """
     js = r"""
     (imageBox) => {
@@ -1405,6 +1405,18 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15, preferred_target
                 .map(n => n.textContent || "")
                 .join(" ")
         );
+
+        const rectObj = (el) => {
+            const rect = el.getBoundingClientRect();
+            return {
+                top: rect.top,
+                bottom: rect.bottom,
+                left: rect.left,
+                right: rect.right,
+                width: rect.width,
+                height: rect.height
+            };
+        };
 
         const isVisible = (el) => {
             if (!el) return false;
@@ -1423,12 +1435,32 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15, preferred_target
             );
         };
 
-        const isBadText = (txt) => {
+        const horizontalOverlapRatio = (a, b) => {
+            const overlap = Math.max(0, Math.min(a.right, b.right) - Math.max(a.left, b.left));
+            return overlap / Math.max(1, Math.min(a.width, b.width));
+        };
+
+        const centerX = (b) => b.left + b.width / 2;
+        const img = imageBox && imageBox.url !== "N/A" ? imageBox : null;
+
+        const isInstallAnchorText = (txt) => {
             const lower = cleanText(txt).toLowerCase();
+            if (!lower) return false;
+            if (["install", "get", "download", "open", "learn more", "try now"].includes(lower)) return true;
+            // Button text sometimes includes spaces/newlines or localized extra symbols.
+            if (lower.length <= 25 && /\b(install|get|download|open|learn more|try now)\b/i.test(lower)) return true;
+            return false;
+        };
+
+        const isBadText = (txt) => {
+            const original = cleanText(txt);
+            const lower = original.toLowerCase();
             if (!lower) return true;
 
+            // Button labels are anchors only; never save them as headline/description.
+            if (isInstallAnchorText(lower)) return true;
+
             const exactBad = new Set([
-                "install", "get", "download", "open", "learn more", "try now",
                 "play", "close", "menu", "search", "sign in", "log in",
                 "privacy", "terms", "help", "ad", "ads", "skip", "next"
             ]);
@@ -1459,25 +1491,61 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15, preferred_target
             return false;
         };
 
-        const horizontalOverlapRatio = (a, b) => {
-            const overlap = Math.max(0, Math.min(a.right, b.right) - Math.max(a.left, b.left));
-            return overlap / Math.max(1, Math.min(a.width, b.width));
+        const insideOrNearImage = (box) => {
+            if (!img) return true;
+            const imageBoxForOverlap = {
+                top: img.top,
+                bottom: img.bottom,
+                left: img.left,
+                right: img.right,
+                width: img.width,
+                height: img.height
+            };
+            const alignedWithImage = horizontalOverlapRatio(box, imageBoxForOverlap) >= 0.10;
+            const verticalNearImage = box.top >= img.top - 40 && box.top <= img.bottom + 650;
+            const overlayOrInsideImage = box.top >= img.top - 20 && box.bottom <= img.bottom + 120;
+            return alignedWithImage && (verticalNearImage || overlayOrInsideImage);
         };
 
-        const img = imageBox && imageBox.url !== "N/A" ? imageBox : null;
-        const candidates = [];
+        const installAnchors = [];
+        const textCandidates = [];
 
         for (const el of Array.from(document.querySelectorAll("body *"))) {
             if (!isVisible(el)) continue;
 
             const rawText = cleanText(el.innerText || el.textContent || "");
-            if (rawText.length < 3 || rawText.length > 220) continue;
-            if (rawText.includes("{{") || rawText.includes("}}")) continue;
-            if (isBadText(rawText)) continue;
+            if (!rawText) continue;
 
             const cls = String(el.className || "").toLowerCase();
             const aria = String(el.getAttribute("aria-label") || "").toLowerCase();
             const role = String(el.getAttribute("role") || "").toLowerCase();
+            const href = String(el.getAttribute("href") || el.href || el.getAttribute("data-href") || "").toLowerCase();
+            const box = rectObj(el);
+            if (box.width < 10 || box.height < 6) continue;
+
+            const looksInstallByClass =
+                cls.includes("install-button") ||
+                cls.includes("install") ||
+                aria.includes("install") ||
+                href.includes("googleadservices.com/pagead/aclk") ||
+                href.includes("play.google.com/store/apps/details");
+
+            if ((isInstallAnchorText(rawText) || looksInstallByClass) && insideOrNearImage(box)) {
+                let score = 0;
+                if (isInstallAnchorText(rawText)) score += 200;
+                if (cls.includes("install-button")) score += 160;
+                if (role === "link" || el.tagName.toLowerCase() === "a" || el.tagName.toLowerCase() === "button") score += 60;
+                if (img) {
+                    score -= Math.min(Math.abs(box.top - img.bottom), 500) / 2;
+                    score -= Math.min(Math.abs(centerX(box) - centerX(img)), 500) / 5;
+                }
+                installAnchors.push({ text: rawText, ...box, score });
+                continue;
+            }
+
+            if (rawText.length < 3 || rawText.length > 240) continue;
+            if (rawText.includes("{{") || rawText.includes("}}")) continue;
+            if (isBadText(rawText)) continue;
 
             const looksLikeTextNode =
                 cls.includes("headline") ||
@@ -1489,126 +1557,128 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15, preferred_target
                 aria.includes("description") ||
                 role === "heading";
 
-            // Avoid wrapper containers that combine image/text/button and cause repeated same output.
+            // Avoid wrapper containers that combine button + headline + description.
             const directText = directTextOnly(el);
-            if (el.children.length > 0 && !looksLikeTextNode && directText.length < 3) {
-                continue;
-            }
-
-            const rect = el.getBoundingClientRect();
-            if (rect.width < 20 || rect.height < 8) continue;
-
-            const box = {
-                top: rect.top,
-                bottom: rect.bottom,
-                left: rect.left,
-                right: rect.right,
-                width: rect.width,
-                height: rect.height
-            };
-
-            let nearImage = true;
-            let distanceFromImage = 0;
-
-            if (img) {
-                const imageBoxForOverlap = {
-                    top: img.top,
-                    bottom: img.bottom,
-                    left: img.left,
-                    right: img.right,
-                    width: img.width,
-                    height: img.height
-                };
-
-                const belowImage = box.top >= img.bottom - 25 && box.top <= img.bottom + 520;
-                const overlayOrInsideImage = box.top >= img.top - 10 && box.bottom <= img.bottom + 80;
-                const alignedWithImage = horizontalOverlapRatio(box, imageBoxForOverlap) >= 0.15;
-
-                nearImage = alignedWithImage && (belowImage || overlayOrInsideImage);
-                distanceFromImage = Math.max(0, box.top - img.bottom);
-            }
-
-            if (!nearImage) continue;
+            if (el.children.length > 0 && !looksLikeTextNode && directText.length < 3) continue;
+            if (!insideOrNearImage(box)) continue;
 
             const style = window.getComputedStyle(el);
             const fontSize = parseFloat(style.fontSize || "0") || 0;
             const weightRaw = String(style.fontWeight || "400");
             const fontWeight = weightRaw === "bold" ? 700 : (parseInt(weightRaw, 10) || 400);
 
-            candidates.push({
+            textCandidates.push({
                 text: rawText,
-                top: box.top,
-                bottom: box.bottom,
-                left: box.left,
-                right: box.right,
-                width: box.width,
-                height: box.height,
+                ...box,
                 fontSize,
                 fontWeight,
-                distanceFromImage,
                 isHeadlineClass: cls.includes("headline") || cls.includes("-e-15") || aria.includes("headline"),
                 isDescriptionClass: cls.includes("description") || cls.includes("long-description") || cls.includes("-e-67") || aria.includes("description")
             });
         }
 
-        if (!candidates.length) {
-            return { headline: "N/A", description: "N/A", candidateCount: 0 };
-        }
-
         const unique = [];
-        const seenText = new Set();
-        for (const c of candidates) {
+        const seen = new Set();
+        for (const c of textCandidates) {
+            // Keep same text only once; prefer the visually top/left smaller element, not wrapper duplicates.
             const key = c.text.toLowerCase();
-            if (seenText.has(key)) continue;
-            seenText.add(key);
+            if (seen.has(key)) continue;
+            seen.add(key);
             unique.push(c);
         }
 
-        const headlineCandidates = unique.map(c => {
-            const wordCount = c.text.split(/\s+/).filter(Boolean).length;
-            let score = c.text.length * 10;
-            score += c.fontSize * 5;
-            if (c.fontWeight >= 600) score += 40;
-            if (c.isHeadlineClass) score += 140;
-            if (c.isDescriptionClass) score -= 80;
-            if (wordCount > 18) score -= 60;
-            score -= Math.min(c.distanceFromImage, 400) / 4;
-            return { ...c, headlineScore: score };
-        }).sort((a, b) => b.headlineScore - a.headlineScore);
-
-        const headlineObj = headlineCandidates[0];
-        const headline = headlineObj ? headlineObj.text : "N/A";
-
-        let descriptionObj = null;
-        if (headlineObj) {
-            const below = unique
-                .filter(c => c.text !== headlineObj.text)
-                .filter(c => c.top >= headlineObj.bottom - 8)
-                .filter(c => c.top <= headlineObj.bottom + 280)
-                .filter(c => {
-                    const overlap = Math.max(
-                        0,
-                        Math.min(c.right, headlineObj.right) - Math.max(c.left, headlineObj.left)
-                    );
-                    return overlap >= Math.min(c.width, headlineObj.width) * 0.15;
-                })
-                .map(c => {
-                    const distance = Math.max(0, c.top - headlineObj.bottom);
-                    let score = 500 - Math.min(distance, 500);
-                    score += Math.min(c.text.length, 160);
-                    if (c.isDescriptionClass) score += 140;
-                    if (c.fontSize <= headlineObj.fontSize + 3) score += 40;
-                    if (c.fontSize > headlineObj.fontSize + 5) score -= 80;
-                    score -= Math.min(Math.abs(c.left - headlineObj.left), 120) / 2;
-                    return { ...c, descScore: score };
-                })
-                .sort((a, b) => b.descScore - a.descScore);
-
-            descriptionObj = below.length ? below[0] : null;
+        if (!unique.length) {
+            return { headline: "N/A", description: "N/A", mode: "no_text" };
         }
 
-        const description = descriptionObj ? descriptionObj.text : "N/A";
-        return { headline, description, candidateCount: unique.length };
+        unique.sort((a, b) => {
+            if (Math.abs(a.top - b.top) > 6) return a.top - b.top;
+            return a.left - b.left;
+        });
+
+        let headlineObj = null;
+        let descriptionObj = null;
+        let mode = "fallback_image_order";
+
+        if (installAnchors.length) {
+            installAnchors.sort((a, b) => b.score - a.score);
+            const anchor = installAnchors[0];
+            mode = "install_anchor";
+
+            const belowInstall = unique
+                .filter(c => c.top >= anchor.bottom - 12)
+                .filter(c => c.top <= anchor.bottom + 360)
+                .filter(c => Math.abs(centerX(c) - centerX(anchor)) <= Math.max(420, anchor.width * 3))
+                .map(c => {
+                    const distance = Math.max(0, c.top - anchor.bottom);
+                    let score = 1000 - Math.min(distance, 1000);
+                    if (c.isHeadlineClass) score += 180;
+                    if (c.isDescriptionClass) score -= 90;
+                    if (c.fontWeight >= 600) score += 50;
+                    if (img) score -= Math.min(Math.abs(centerX(c) - centerX(img)), 500) / 8;
+                    return { ...c, score };
+                })
+                .sort((a, b) => {
+                    // Main rule: first usable visible text below install.
+                    if (Math.abs(a.top - b.top) > 8) return a.top - b.top;
+                    return b.score - a.score;
+                });
+
+            headlineObj = belowInstall.length ? belowInstall[0] : null;
+        }
+
+        // Fallback when install anchor is not available: first usable text below/near the image.
+        if (!headlineObj) {
+            let pool = unique;
+            if (img) {
+                pool = unique.filter(c => c.top >= img.bottom - 30 || (c.top >= img.top - 20 && c.bottom <= img.bottom + 120));
+            }
+
+            pool = pool.map(c => {
+                let score = 0;
+                if (img) score -= Math.min(Math.max(0, c.top - img.bottom), 600);
+                if (c.isHeadlineClass) score += 150;
+                if (c.isDescriptionClass) score -= 80;
+                if (c.fontWeight >= 600) score += 30;
+                return { ...c, score };
+            }).sort((a, b) => {
+                if (Math.abs(a.top - b.top) > 8) return a.top - b.top;
+                return b.score - a.score;
+            });
+
+            headlineObj = pool.length ? pool[0] : unique[0];
+        }
+
+        if (headlineObj) {
+            const belowHeadline = unique
+                .filter(c => c.text !== headlineObj.text)
+                .filter(c => c.top >= headlineObj.bottom - 10)
+                .filter(c => c.top <= headlineObj.bottom + 320)
+                .filter(c => Math.abs(centerX(c) - centerX(headlineObj)) <= Math.max(420, headlineObj.width * 2.5))
+                .map(c => {
+                    const distance = Math.max(0, c.top - headlineObj.bottom);
+                    let score = 1000 - Math.min(distance, 1000);
+                    if (c.isDescriptionClass) score += 180;
+                    if (c.isHeadlineClass) score -= 80;
+                    if (c.fontSize <= headlineObj.fontSize + 4) score += 30;
+                    return { ...c, score };
+                })
+                .sort((a, b) => {
+                    // Main rule: next usable visible text below headline.
+                    if (Math.abs(a.top - b.top) > 8) return a.top - b.top;
+                    return b.score - a.score;
+                });
+
+            descriptionObj = belowHeadline.length ? belowHeadline[0] : null;
+        }
+
+        return {
+            headline: headlineObj ? headlineObj.text : "N/A",
+            description: descriptionObj ? descriptionObj.text : "N/A",
+            mode,
+            textCount: unique.length,
+            installCount: installAnchors.length
+        };
     }
     """
 
