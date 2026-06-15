@@ -251,7 +251,9 @@ def update_headline_and_description(row_index, headline, description):
         sheet.update(cell_range, [[headline, description]])
     except gspread.exceptions.APIError as e:
         print(f"⚠ Failed to update headline/desc for row {row_index}: {e}")
-
+def update_image_url(row_num, image_url):
+    image_url = image_url or "N/A"
+    sheet.update_cell(row_num, 15, image_url)  # Column O = 15
 # Add the get_urls_with_retry helper function which was originally called in SCRAPEER.py
 def get_urls_with_retry():
     """Helper to fetch column H (transparency URLs) from sheet"""
