@@ -11,12 +11,6 @@ import uuid
 SHEET_CACHE = None
 SHEET_CACHE_TIME = None
 SHEET_CACHE_TTL = 60  # seconds
-def clear_sheet_cache():
-    global SHEET_CACHE, SHEET_CACHE_TIME
-    SHEET_CACHE = None
-    SHEET_CACHE_TIME = None
-    print("✅ Sheet cache cleared")
-
 CLAIM_AGENT_COL = 9       # I
 CLAIM_TIME_COL = 10       # J
 CLAIM_TOKEN_COL = 11      # K
@@ -49,20 +43,17 @@ def col_to_letter(col_num):
 # --------------------------
 def get_sheet():
     global SHEET_CACHE, SHEET_CACHE_TIME
-
     now = time.time()
+    if SHEET_CACHE and SHEET_CACHE_TIME and now - SHEET_CACHE_TIME < SHEET_CACHE_TTL:
+        return SHEET_CACHE
 
-    if SHEET_CACHE is not None and SHEET_CACHE_TIME is not None:
-        if now - SHEET_CACHE_TIME < SHEET_CACHE_TTL:
-            return SHEET_CACHE
-
-    # reconnect only when cache expired or cleared
+    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    creds = ServiceAccountCredentials.from_json_keyfile_name(config.CREDENTIALS_FILE, scope)
     client = gspread.authorize(creds)
-    sheet = client.open_by_key(config.SHEET_ID).sheet1
+    sheet = client.open_by_key(config.SPREADSHEET_ID).worksheet(config.WORKSHEET_NAME)
 
     SHEET_CACHE = sheet
     SHEET_CACHE_TIME = now
-
     return sheet
 
 def get_spreadsheet():
