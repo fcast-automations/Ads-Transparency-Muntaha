@@ -8,6 +8,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import difflib
 import re
+import sys
+import uuid
 
 def get_best_matching_package_for_text_ad(headline, description, package_list, min_score=0.70):
     """Matches package names with headline + description using character-level comparison."""
@@ -645,11 +647,37 @@ def wait_and_extract_install_link(page, max_wait_seconds=35):
 # IMAGE URL EXTRACTION LOGIC
 # =========================
 
-def extract_primary_image_url(page):
+def _normalize_url_from_page(url_value, page_url=""):
+    """Normalizes image/link URLs returned from page/frame JS."""
+    if not url_value:
+        return "N/A"
+
+    url_value = str(url_value).strip()
+
+    if not url_value:
+        return "N/A"
+
+    if url_value.startswith("http"):
+        return url_value
+
+    if url_value.startswith("//"):
+        return "https:" + url_value
+
+    if url_value.startswith("/"):
+        try:
+            base_url = urlparse(page_url).netloc
+            if base_url:
+                return f"https://{base_url}{url_value}"
+        except Exception:
+            pass
+
+    return url_value
+
+
+def _read_primary_image_url_from_target(target, page_url=""):
     """
-    Extracts the primary/main image URL from the ad creative.
-    Looks for large, visible images that aren't icons or logos.
-    Returns the full image URL or "N/A".
+    Reads the best/main visible image from one page/frame only.
+    This avoids taking the same repeated image from the Google shell or stale frames.
     """
     js = r"""
     () => {
@@ -658,8 +686,8 @@ def extract_primary_image_url(page):
             const rect = el.getBoundingClientRect();
             const style = window.getComputedStyle(el);
             return (
-                rect.width >= 100 &&
-                rect.height >= 100 &&
+                rect.width >= 90 &&
+                rect.height >= 70 &&
                 rect.bottom > 0 &&
                 rect.right > 0 &&
                 rect.top < window.innerHeight &&
@@ -670,70 +698,81 @@ def extract_primary_image_url(page):
             );
         };
 
-        const images = Array.from(document.querySelectorAll('img')).map(img => {
-            const src = String(img.getAttribute('src') || img.src || '');
-            const alt = String(img.getAttribute('alt') || '').toLowerCase();
-            const rect = img.getBoundingClientRect();
-            
-            // Skip logos, icons, and Google branding
-            if (src.includes('googlelogo') || alt.includes('google') || 
-                alt.includes('logo') || alt.includes('icon') ||
-                src.includes('logo') || src.includes('icon')) {
-                return null;
-            }
-            
-            // Only include visible images
-            if (!isVisible(img)) {
-                return null;
-            }
-            
-            // Calculate score based on size and position
-            const area = rect.width * rect.height;
-            const score = area + (rect.y < 400 ? 5000 : 0); // Prefer top images
-            
-            return { src, area, score };
-        }).filter(Boolean);
+        const badSrc = (src, alt) => {
+            const s = String(src || '').toLowerCase();
+            const a = String(alt || '').toLowerCase();
+            return (
+                !s ||
+                s.startsWith('data:image/svg') ||
+                s.includes('googlelogo') ||
+                s.includes('/logo') ||
+                s.includes('logo.') ||
+                s.includes('/icon') ||
+                s.includes('icon.') ||
+                a.includes('google') ||
+                a.includes('logo') ||
+                a.includes('icon')
+            );
+        };
 
-        // Sort by score descending and return the best one
-        if (images.length > 0) {
-            images.sort((a, b) => b.score - a.score);
-            return images[0].src;
-        }
+        const imgs = Array.from(document.querySelectorAll('img'))
+            .map(img => {
+                const src = String(img.currentSrc || img.getAttribute('src') || img.src || '');
+                const alt = String(img.getAttribute('alt') || '');
+                if (badSrc(src, alt)) return null;
+                if (!isVisible(img)) return null;
 
-        return null;
+                const rect = img.getBoundingClientRect();
+                const area = rect.width * rect.height;
+
+                // Prefer the main creative visual, not tiny app icons or bottom thumbnails.
+                let score = area;
+                if (rect.top >= 0 && rect.top <= 520) score += 10000;
+                if (rect.width >= 250 && rect.height >= 140) score += 15000;
+                if (rect.width < 140 || rect.height < 90) score -= 10000;
+                if (rect.top > 650) score -= 25000;
+
+                return { src, score, area, top: rect.top, width: rect.width, height: rect.height };
+            })
+            .filter(Boolean)
+            .sort((a, b) => b.score - a.score);
+
+        return imgs.length ? imgs[0].src : null;
     }
     """
+    try:
+        image_url = target.evaluate(js)
+        return _normalize_url_from_page(image_url, page_url)
+    except Exception:
+        return "N/A"
+
+
+def extract_primary_image_url(page):
+    """
+    Extracts the primary/main image URL from the active ad creative.
+    Important fix: it now uses ranked active creative frames first, instead of
+    scanning the main Google shell first. That prevents repeated/same image URLs.
+    """
+    targets = []
 
     try:
-        image_url = page.evaluate(js)
-        if image_url and isinstance(image_url, str) and len(image_url) > 0:
-            # Handle relative URLs
-            if image_url.startswith("http"):
-                return image_url
-            elif image_url.startswith("//"):
-                return "https:" + image_url
-            elif image_url.startswith("/"):
-                try:
-                    base_url = urlparse(page.url).netloc
-                    return f"https://{base_url}{image_url}"
-                except:
-                    return image_url
-            return image_url
+        ranked = get_ranked_non_video_targets(page)
+        targets = [item[1] for item in ranked]
     except Exception:
-        pass
+        targets = []
 
-    # Fallback: check iframes
-    for frame in page.frames:
-        try:
-            image_url = frame.evaluate(js)
-            if image_url and isinstance(image_url, str) and len(image_url) > 0:
-                if image_url.startswith("http"):
-                    return image_url
-                elif image_url.startswith("//"):
-                    return "https:" + image_url
-                return image_url
-        except Exception:
+    if not targets:
+        targets = [frame for frame in page.frames if frame != page.main_frame] + [page]
+
+    seen = set()
+    for target in targets:
+        if id(target) in seen:
             continue
+        seen.add(id(target))
+
+        image_url = _read_primary_image_url_from_target(target, page.url)
+        if image_url != "N/A":
+            return image_url
 
     return "N/A"
 
@@ -1320,7 +1359,7 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
             "shop now", "sign up", "try now", "buy now", "book now", "visit site",
             "apply now", "start now", "order now", "see more", "more", "ad",
             "sponsored", "ads transparency", "report this ad", "why this ad",
-            "google play", "app store"
+            "google play", "app store", "google play:", "google play store"
         ];
 
         const isBadText = (txt, el) => {
@@ -1329,7 +1368,8 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
 
             if (!t || t.length < 2 || t.length > 260) return true;
             if (t.includes("{{") || t.includes("}}")) return true;
-            if (/https?:\/\//i.test(t) || /www\./i.test(t)) return true;
+            if (/https?:\/\//i.test(t) || /www\./i.test(t) || /tpc\.googlesyndication/i.test(t)) return true;
+            if (lower.startsWith("google play") || lower.startsWith("app store")) return true;
 
             // Do not pick install keyword or other CTA-only labels.
             if (/\binstall\b/i.test(t)) return true;
@@ -1634,6 +1674,17 @@ def scrape_single_url(url_row):
             )
         )
 
+        # Make every row a fresh ad-rendering session.
+        # This reduces Google creative caching/cross-row reuse in long agent runs.
+        try:
+            context.set_extra_http_headers({
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+                "Expires": "0",
+            })
+        except Exception:
+            pass
+
         page = context.new_page()
         captured = {"video_id": "N/A"}
 
@@ -1654,9 +1705,15 @@ def scrape_single_url(url_row):
         page.on("response", handle_response)
 
         try:
+            # Normalize URL and add a small cache-buster so top/bottom agents do not
+            # keep seeing a previously rendered creative in the same environment.
             if "region=" not in url:
                 separator = "&" if "?" in url else "?"
                 url = f"{url}{separator}region=anywhere"
+
+            if "_scrape_ts=" not in url:
+                separator = "&" if "?" in url else "?"
+                url = f"{url}{separator}_scrape_ts={int(time.time() * 1000)}"
 
             print(f"🔍 Row {row_num}: opening transparency URL")
 
@@ -1874,17 +1931,103 @@ def scrape_single_url(url_row):
             context.close()
             browser.close()
 
-def run_parallel_combined_scraper(max_workers=2):
-    urls = sheets.get_urls_with_retry()
+def safe_mark_agent_done(row_num, agent_name):
+    """Marks a claimed row DONE in column L, when sheets.py supports it."""
+    try:
+        with SHEET_LOCK:
+            if hasattr(sheets, "mark_agent_done"):
+                sheets.mark_agent_done(row_num, agent_name)
+    except Exception as e:
+        print(f"⚠ Failed to mark row {row_num} DONE: {e}")
 
-    url_rows = [
-        (i + 2, u.strip())
-        for i, u in enumerate(urls)
-        if u and u.strip()
-    ]
+
+def safe_flush_logs():
+    try:
+        with SHEET_LOCK:
+            if hasattr(sheets, "flush_logs"):
+                sheets.flush_logs()
+    except Exception:
+        pass
+
+
+def run_agent_scraper(direction="top", agent_name=None, run_id=None, max_tasks=None):
+    """
+    Claim-based runner for TOP/BOTTOM agents.
+
+    This is the fix for the top-agent issue: do NOT use get_urls_with_retry() + enumerate(),
+    because that loses the real row number and can write results into the wrong rows.
+    Instead, use sheets.get_next_agent_task(), which returns the exact (row_num, url).
+    """
+    direction = (direction or "top").lower().strip()
+    if direction not in ("top", "bottom"):
+        raise ValueError("direction must be 'top' or 'bottom'")
+
+    agent_name = agent_name or f"AGENT_{direction.upper()}"
+    run_id = run_id or datetime.now().strftime("%Y%m%d%H%M%S") + "-" + uuid.uuid4().hex[:6]
+
+    print(f"🚀 {agent_name} started with run_id={run_id}")
+
+    processed = 0
+    while True:
+        if max_tasks is not None and processed >= max_tasks:
+            print(f"✅ {agent_name}: reached max_tasks={max_tasks}")
+            break
+
+        try:
+            if hasattr(sheets, "clear_sheet_cache"):
+                sheets.clear_sheet_cache(flush_pending_logs=False)
+        except Exception:
+            pass
+
+        task = sheets.get_next_agent_task(direction=direction, agent_name=agent_name, run_id=run_id)
+
+        if task is None:
+            print(f"✅ {agent_name}: no unprocessed rows left")
+            break
+
+        if task == "COLLISION_STOP":
+            print(f"🛑 {agent_name}: collision/stop flag reached")
+            break
+
+        row_num, url = task
+        print(f"🟦 {agent_name}: claimed row {row_num}")
+
+        try:
+            scrape_single_url((row_num, url))
+        finally:
+            safe_mark_agent_done(row_num, agent_name)
+            safe_flush_logs()
+
+        processed += 1
+
+    safe_flush_logs()
+    print(f"✅ {agent_name} finished. Processed rows: {processed}")
+
+
+def run_parallel_combined_scraper(max_workers=2):
+    """
+    Legacy bulk mode. It now uses the row numbers from get_agent_rows_snapshot()
+    when available, instead of enumerate(i + 2). This avoids wrong-row writes.
+    """
+    url_rows = []
+
+    if hasattr(sheets, "get_agent_rows_snapshot"):
+        rows = sheets.get_agent_rows_snapshot()
+        url_rows = [
+            (r["row_num"], str(r["url"]).strip())
+            for r in rows
+            if r.get("url") and not r.get("processed")
+        ]
+    else:
+        urls = sheets.get_urls_with_retry()
+        url_rows = [
+            (i + 2, u.strip())
+            for i, u in enumerate(urls)
+            if u and u.strip()
+        ]
 
     if not url_rows:
-        print("No transparency URLs found in column H.")
+        print("No unprocessed transparency URLs found in column H.")
         return
 
     print(f"🚀 Starting combined VIDEO + TEXT scraper for {len(url_rows)} rows")
@@ -1914,9 +2057,20 @@ def run_parallel_combined_scraper(max_workers=2):
                 except Exception:
                     pass
 
+    safe_flush_logs()
     print("✅ Finished combined video + text scraping")
 
 
-
 if __name__ == "__main__":
-    run_parallel_combined_scraper(max_workers=MAX_WORKERS)
+    # Usage:
+    #   python google_ads_transparency_scraper_image_text_fixed_v2.py top
+    #   python google_ads_transparency_scraper_image_text_fixed_v2.py bottom
+    #   python google_ads_transparency_scraper_image_text_fixed_v2.py bulk
+    mode = sys.argv[1].lower().strip() if len(sys.argv) > 1 else "top"
+
+    if mode in ("top", "bottom"):
+        run_agent_scraper(direction=mode)
+    elif mode == "bulk":
+        run_parallel_combined_scraper(max_workers=MAX_WORKERS)
+    else:
+        raise SystemExit("Use one of: top, bottom, bulk")
