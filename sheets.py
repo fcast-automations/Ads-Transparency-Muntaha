@@ -12,14 +12,32 @@ SHEET_CACHE = None
 SHEET_CACHE_TIME = None
 SHEET_CACHE_TTL = 60  # seconds
 
-CLAIM_AGENT_COL = 9
-CLAIM_TIME_COL = 10
-CLAIM_TOKEN_COL = 11
-CLAIM_STATUS_COL = 12
+CLAIM_AGENT_COL = 9       # I
+CLAIM_TIME_COL = 10       # J
+CLAIM_TOKEN_COL = 11      # K
+CLAIM_STATUS_COL = 12     # L
+HEADLINE_COL = 13         # M
+DESCRIPTION_COL = 14      # N
+IMAGE_URL_COL = 15        # O
+STOP_FLAG_COL = 16        # P - optional; moved here so it does not conflict with Headline/Image URL
+
 CLAIM_TTL_MINUTES = 5  # adjust to 370 for production
 
 LOG_BATCH_SIZE = 5  # batch logs to reduce API calls
 LOG_CACHE = []
+
+
+# --------------------------
+# Small helpers
+# --------------------------
+def col_to_letter(col_num):
+    """Convert 1-based column number to Google Sheets column letter."""
+    result = ""
+    while col_num:
+        col_num, remainder = divmod(col_num - 1, 26)
+        result = chr(65 + remainder) + result
+    return result
+
 
 # --------------------------
 # Sheet auth
@@ -46,6 +64,7 @@ def get_spreadsheet():
     client = gspread.authorize(creds)
     return client.open_by_key(config.SPREADSHEET_ID)
 
+
 # --------------------------
 # Logs
 # --------------------------
@@ -62,7 +81,7 @@ def get_or_create_logs_sheet():
 
 
 def flush_logs():
-    """Batch append logs to reduce quota usage"""
+    """Batch append logs to reduce quota usage."""
     global LOG_CACHE
     if not LOG_CACHE:
         return
@@ -88,13 +107,25 @@ def add_log(row_number="", status="", log_type="", url="", video_id="", app_link
 def ensure_agent_headers():
     sheet = get_sheet()
     headers = sheet.row_values(1)
-    required = {9: "Agent", 10: "Claim Time", 11: "Claim Token", 12: "Claim Status", 13: "Headline", 14: "Description"}
+
+    required = {
+        CLAIM_AGENT_COL: "Agent",
+        CLAIM_TIME_COL: "Claim Time",
+        CLAIM_TOKEN_COL: "Claim Token",
+        CLAIM_STATUS_COL: "Claim Status",
+        HEADLINE_COL: "Headline",
+        DESCRIPTION_COL: "Description",
+        IMAGE_URL_COL: "Image URL",
+        STOP_FLAG_COL: "Stop Flag",  # optional manual STOP column
+    }
+
     updates = []
     for col, name in required.items():
         current = headers[col - 1] if len(headers) >= col else ""
         if current != name:
-            col_letter = chr(64 + col) if col <= 26 else chr(64 + (col // 26)) + chr(64 + (col % 26))
+            col_letter = col_to_letter(col)
             updates.append({"range": f"{col_letter}1", "values": [[name]]})
+
     if updates:
         sheet.batch_update(updates)
 
@@ -140,14 +171,16 @@ def get_agent_rows_snapshot():
         row_num = idx + 1
         row = values[idx]
 
-        url = row[7].strip() if len(row) >= 8 else ""
-        video_id = row[5].strip() if len(row) >= 6 else ""
-        stop_flag = row[12].strip() if len(row) >= 13 else ""  # optional Stop Flag column
+        url = row[7].strip() if len(row) >= 8 else ""          # H
+        video_id = row[5].strip() if len(row) >= 6 else ""     # F
 
-        claim_agent = row[8].strip() if len(row) >= 9 else ""
-        claim_time = row[9].strip() if len(row) >= 10 else ""
-        claim_token = row[10].strip() if len(row) >= 11 else ""
-        claim_status = row[11].strip() if len(row) >= 12 else ""
+        claim_agent = row[CLAIM_AGENT_COL - 1].strip() if len(row) >= CLAIM_AGENT_COL else ""
+        claim_time = row[CLAIM_TIME_COL - 1].strip() if len(row) >= CLAIM_TIME_COL else ""
+        claim_token = row[CLAIM_TOKEN_COL - 1].strip() if len(row) >= CLAIM_TOKEN_COL else ""
+        claim_status = row[CLAIM_STATUS_COL - 1].strip() if len(row) >= CLAIM_STATUS_COL else ""
+
+        # STOP flag moved to P, because M/N/O are now Headline, Description, Image URL.
+        stop_flag = row[STOP_FLAG_COL - 1].strip() if len(row) >= STOP_FLAG_COL else ""
 
         if not url:
             continue
@@ -196,7 +229,7 @@ def get_next_agent_task(direction, agent_name, run_id):
             pass
         return "COLLISION_STOP"
 
-    candidates = sorted(unprocessed, key=lambda x: x["row_num"], reverse=(direction=="bottom"))
+    candidates = sorted(unprocessed, key=lambda x: x["row_num"], reverse=(direction == "bottom"))
 
     for candidate in candidates:
         row_num = candidate["row_num"]
@@ -212,12 +245,12 @@ def get_next_agent_task(direction, agent_name, run_id):
         token = f"{agent_name}-{run_id}-{uuid.uuid4().hex[:10]}"
         claim_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # Claim row
+        # Claim row in I:L
         sheet.update(f"I{row_num}:L{row_num}", [[agent_name, claim_time, token, "CLAIMED"]])
 
         # Confirm claim
         confirm = sheet.row_values(row_num)
-        confirmed_token = confirm[10].strip() if len(confirm) >= 11 else ""
+        confirmed_token = confirm[CLAIM_TOKEN_COL - 1].strip() if len(confirm) >= CLAIM_TOKEN_COL else ""
 
         if confirmed_token == token:
             return row_num, url
@@ -234,7 +267,7 @@ def mark_agent_done(row_num, agent_name):
 
 
 def update_combined_row(row_index, data):
-    """Writes combined row data to columns A-G"""
+    """Writes combined row data to columns A-G."""
     sheet = get_sheet()
     cell_range = f"A{row_index}:G{row_index}"
     try:
@@ -244,23 +277,31 @@ def update_combined_row(row_index, data):
 
 
 def update_headline_and_description(row_index, headline, description):
-    """Writes Headline and Description directly to columns M-N"""
+    """Writes Headline and Description directly to columns M-N."""
     sheet = get_sheet()
     cell_range = f"M{row_index}:N{row_index}"
     try:
-        sheet.update(cell_range, [[headline, description]])
+        sheet.update(cell_range, [[headline or "N/A", description or "N/A"]])
     except gspread.exceptions.APIError as e:
         print(f"⚠ Failed to update headline/desc for row {row_index}: {e}")
-def update_image_url(row_num, image_url):
-    image_url = image_url or "N/A"
-    sheet.update_cell(row_num, 15, image_url)  # Column O = 15
+
+
+def update_image_url(row_index, image_url):
+    """Writes Image URL directly to column O."""
+    sheet = get_sheet()
+    cell_range = f"O{row_index}"
+    try:
+        sheet.update(cell_range, [[image_url or "N/A"]], value_input_option="USER_ENTERED")
+    except gspread.exceptions.APIError as e:
+        print(f"⚠ Failed to update image URL for row {row_index}: {e}")
+
+
 # Add the get_urls_with_retry helper function which was originally called in SCRAPEER.py
 def get_urls_with_retry():
-    """Helper to fetch column H (transparency URLs) from sheet"""
-    rows = get_agent_rows_snapshot()
-    # Need to return full list matching row positions for combined scraper iteration
+    """Helper to fetch column H (transparency URLs) from sheet."""
+    get_agent_rows_snapshot()  # ensures headers and validates sheet access
     sheet = get_sheet()
-    col_values = sheet.col_values(8) # Assuming H is col 8
+    col_values = sheet.col_values(8)  # H
     # strip headers
     if len(col_values) > 1:
         return col_values[1:]
