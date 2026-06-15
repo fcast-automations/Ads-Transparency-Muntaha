@@ -1268,40 +1268,215 @@ def get_ranked_non_video_targets(page):
 
 def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
     """
-    Extracts headline and description for non-video ads.
-    - Prefers visible elements from the active creative (main DOM).
-    - Uses specific selectors: <div role="link">, div.HFTpmd-WsjYwc-hgDUwe, div.cS4Vcb-vnv8ic
-    - Falls back to iframe if necessary.
-    - Relaxed visibility check to allow offscreen or special-language creatives (e.g., Arabic).
+    Extracts headline and description from the active non-video/image creative.
+
+    New rule:
+    - Do NOT pick Install / Get / Download / Open / Learn more.
+    - Treat the longest visible ad text as the headline.
+    - Treat the nearest visible text directly under that headline as the description.
+    - Prefer the same ranked creative frame that your image URL logic is already using.
     """
     js = r"""
     () => {
-        const cleanText = (txt) => (txt || "").replace(/\n/g, " ").replace(/\s+/g, " ").trim();
+        const cleanText = (txt) => (txt || "")
+            .replace(/\u00a0/g, " ")
+            .replace(/\n/g, " ")
+            .replace(/\s+/g, " ")
+            .trim();
 
-        // RELAXED visibility: ignore offscreen top/bottom/left/right but still require positive width/height
+        const directTextOnly = (el) => cleanText(
+            Array.from(el.childNodes || [])
+                .filter(n => n.nodeType === Node.TEXT_NODE)
+                .map(n => n.textContent || "")
+                .join(" ")
+        );
+
         const isVisible = (el) => {
             if (!el) return false;
             const rect = el.getBoundingClientRect();
             const style = window.getComputedStyle(el);
-            return rect.width > 0 && rect.height > 0 &&
-                   style.visibility !== 'hidden' &&
-                   style.display !== 'none' &&
-                   style.opacity !== '0';
+            return (
+                rect.width > 0 &&
+                rect.height > 0 &&
+                rect.bottom > 0 &&
+                rect.right > 0 &&
+                rect.top < window.innerHeight &&
+                rect.left < window.innerWidth &&
+                style.visibility !== "hidden" &&
+                style.display !== "none" &&
+                style.opacity !== "0"
+            );
         };
 
-        let headline = "N/A";
-        let description = "N/A";
+        const isBadText = (txt) => {
+            const lower = cleanText(txt).toLowerCase();
 
-        // 1️⃣ Main visible creative first
-        const headlineEl = document.querySelector('div[role="link"] span, div.HFTpmd-WsjYwc-hgDUwe, div.cS4Vcb-vnv8ic');
-        if (headlineEl && isVisible(headlineEl)) {
-            headline = cleanText(headlineEl.innerText || headlineEl.textContent);
+            if (!lower) return true;
+
+            // CTA/button text: never use as headline/description.
+            const exactBad = new Set([
+                "install", "get", "download", "open", "learn more",
+                "play", "close", "menu", "search", "sign in", "log in",
+                "privacy", "terms", "help", "ad", "ads"
+            ]);
+
+            if (exactBad.has(lower)) return true;
+
+            // Google page chrome / Transparency Center text.
+            const badContains = [
+                "ads transparency center",
+                "ads transparency centre",
+                "report this ad",
+                "see more ads",
+                "last shown",
+                "shown in",
+                "about this ad",
+                "my ad center",
+                "google",
+                "why this ad",
+                "ad choices",
+                "advertiser verified",
+                "this advertiser",
+                "more details"
+            ];
+
+            if (badContains.some(b => lower.includes(b))) return true;
+
+            // Ignore URLs, package names, and very technical strings.
+            if (/^https?:\/\//i.test(lower)) return true;
+            if (/^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*){2,}$/i.test(lower)) return true;
+            if (lower.includes("play.google.com/store/apps/details")) return true;
+
+            return false;
+        };
+
+        const candidates = [];
+
+        for (const el of Array.from(document.querySelectorAll("body *"))) {
+            if (!isVisible(el)) continue;
+
+            const rawText = cleanText(el.innerText || el.textContent || "");
+            if (rawText.length < 3 || rawText.length > 220) continue;
+            if (rawText.includes("{{") || rawText.includes("}}")) continue;
+            if (isBadText(rawText)) continue;
+
+            const cls = String(el.className || "").toLowerCase();
+            const aria = String(el.getAttribute("aria-label") || "").toLowerCase();
+            const role = String(el.getAttribute("role") || "").toLowerCase();
+
+            const looksLikeTextNode =
+                cls.includes("headline") ||
+                cls.includes("description") ||
+                cls.includes("long-description") ||
+                cls.includes("-e-15") ||
+                cls.includes("-e-67") ||
+                aria.includes("headline") ||
+                aria.includes("description") ||
+                role === "heading";
+
+            // Avoid wrapper containers that combine headline + desc + install into one text.
+            const directText = directTextOnly(el);
+            if (el.children.length > 0 && !looksLikeTextNode && directText.length < 3) {
+                continue;
+            }
+
+            const rect = el.getBoundingClientRect();
+            if (rect.width < 20 || rect.height < 8) continue;
+
+            const style = window.getComputedStyle(el);
+            const fontSize = parseFloat(style.fontSize || "0") || 0;
+            const weightRaw = String(style.fontWeight || "400");
+            const fontWeight = weightRaw === "bold" ? 700 : (parseInt(weightRaw, 10) || 400);
+
+            candidates.push({
+                text: rawText,
+                top: rect.top,
+                bottom: rect.bottom,
+                left: rect.left,
+                right: rect.right,
+                width: rect.width,
+                height: rect.height,
+                fontSize,
+                fontWeight,
+                isHeadlineClass: cls.includes("headline") || cls.includes("-e-15") || aria.includes("headline"),
+                isDescriptionClass: cls.includes("description") || cls.includes("long-description") || cls.includes("-e-67") || aria.includes("description")
+            });
         }
 
-        const descriptionEl = document.querySelector('div.HFTpmd-WsjYwc-hgDUwe, div.cS4Vcb-vnv8ic');
-        if (descriptionEl && isVisible(descriptionEl)) {
-            description = cleanText(descriptionEl.innerText || descriptionEl.textContent);
+        if (!candidates.length) {
+            return { headline: "N/A", description: "N/A" };
         }
+
+        // Deduplicate repeated DOM text.
+        const unique = [];
+        const seen = new Set();
+
+        for (const c of candidates) {
+            const key = `${c.text.toLowerCase()}|${Math.round(c.top)}|${Math.round(c.left)}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            unique.push(c);
+        }
+
+        // Headline rule: the longer visible text is the headline.
+        // Extra weight for headline-like class and bold/large text.
+        const headlineCandidates = unique.map(c => {
+            let score = c.text.length * 10;
+            score += c.fontSize * 4;
+            if (c.fontWeight >= 600) score += 20;
+            if (c.isHeadlineClass) score += 120;
+            if (c.isDescriptionClass) score -= 40;
+
+            // Prefer visible creative area, not lower page chrome.
+            if (c.top < -20 || c.top > 720) score -= 100;
+
+            return { ...c, headlineScore: score };
+        }).sort((a, b) => b.headlineScore - a.headlineScore);
+
+        const headlineObj = headlineCandidates[0];
+        const headline = headlineObj ? headlineObj.text : "N/A";
+
+        let descriptionObj = null;
+
+        if (headlineObj) {
+            const below = unique
+                .filter(c => c.text !== headlineObj.text)
+                .filter(c => c.top >= headlineObj.bottom - 6)
+                .filter(c => c.top <= headlineObj.bottom + 260)
+                .filter(c => {
+                    // Description should visually overlap/aligned with headline area.
+                    const horizontalOverlap = Math.max(
+                        0,
+                        Math.min(c.right, headlineObj.right) - Math.max(c.left, headlineObj.left)
+                    );
+                    return horizontalOverlap >= Math.min(c.width, headlineObj.width) * 0.20;
+                })
+                .map(c => {
+                    const distance = Math.max(0, c.top - headlineObj.bottom);
+                    let score = 500 - Math.min(distance, 500);
+                    score += Math.min(c.text.length, 160);
+                    if (c.isDescriptionClass) score += 120;
+                    if (c.fontSize <= headlineObj.fontSize + 3) score += 30;
+                    if (c.fontSize > headlineObj.fontSize + 5) score -= 60;
+                    score -= Math.min(Math.abs(c.left - headlineObj.left), 100) / 2;
+                    return { ...c, descScore: score };
+                })
+                .sort((a, b) => b.descScore - a.descScore);
+
+            descriptionObj = below.length ? below[0] : null;
+        }
+
+        // Fallback: if nothing is directly below, use the next visible text block by position.
+        if (!descriptionObj && headlineObj) {
+            const nextByPosition = unique
+                .filter(c => c.text !== headlineObj.text)
+                .filter(c => c.top > headlineObj.top)
+                .sort((a, b) => a.top - b.top);
+
+            descriptionObj = nextByPosition.length ? nextByPosition[0] : null;
+        }
+
+        const description = descriptionObj ? descriptionObj.text : "N/A";
 
         return { headline, description };
     }
@@ -1310,24 +1485,52 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
     def read_target(target):
         try:
             data = target.evaluate(js)
-            if data and (data.get("headline") != "N/A" or data.get("description") != "N/A"):
-                return data
+            if not data:
+                return None
+
+            headline = clean_text(data.get("headline"))
+            description = clean_text(data.get("description"))
+
+            if headline != "N/A" or description != "N/A":
+                return {
+                    "headline": headline,
+                    "description": description
+                }
         except Exception:
             return None
+
         return None
 
     start_time = time.time()
 
     while time.time() - start_time < max_wait_seconds:
-        # 1) Check main page DOM first (active visible creative)
+        seen_targets = set()
+
+        # Prefer the active creative frame/page, same idea as your image extraction flow.
+        try:
+            ranked_targets = get_ranked_non_video_targets(page)
+        except Exception:
+            ranked_targets = []
+
+        for _, target, _, _ in ranked_targets:
+            if id(target) in seen_targets:
+                continue
+
+            seen_targets.add(id(target))
+            data = read_target(target)
+
+            if data:
+                return data
+
+        # Fallback: main page, then all frames.
         data = read_target(page)
         if data:
             return data
 
-        # 2) Fallback: check iframes only if main DOM didn't yield headline/description
         for frame in page.frames:
-            if frame == page.main_frame:
+            if frame == page.main_frame or id(frame) in seen_targets:
                 continue
+
             data = read_target(frame)
             if data:
                 return data
@@ -1335,6 +1538,7 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
         page.wait_for_timeout(1000)
 
     return {"headline": "N/A", "description": "N/A"}
+
 # =========================
 # MAIN COMBINED SCRAPER: VIDEO ADS + TEXT ADS
 # =========================
@@ -1479,8 +1683,16 @@ def scrape_single_url(url_row):
                 app_link = wait_and_extract_install_link(page, max_wait_seconds=35)
                 app_link_time = get_exact_time()
 
-                headline, description = wait_and_extract_headline_description(page, max_wait_seconds=15)
-                
+                # Use the same visual text-block rule for video ads too:
+                # longest visible text = headline, nearest text under it = description.
+                video_text_data = wait_and_extract_text_ad_details(page, max_wait_seconds=15)
+                headline = clean_text(video_text_data.get("headline"))
+                description = clean_text(video_text_data.get("description"))
+
+                # Fallback to old class-based video text logic if visual text is not found.
+                if headline == "N/A" and description == "N/A":
+                    headline, description = wait_and_extract_headline_description(page, max_wait_seconds=15)
+
                 # Extract image URL for video ads too
                 image_url = extract_primary_image_url(page)
 
