@@ -3,7 +3,7 @@
 # Non-video ads use text/image extraction + package matching from the uploaded non-video files.
 
 from playwright.sync_api import sync_playwright
-from urllib.parse import urlparse, parse_qs, unquote, urljoin
+from urllib.parse import urlparse, parse_qs, unquote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import difflib
@@ -74,16 +74,10 @@ def safe_update_headline_desc(row_num, headline, description):
 
 def safe_update_image_url(row_num, image_url):
     """
-    Thread-safe Google Sheet update for Image URL in column O.
-    Add update_image_url(row_num, image_url) in sheets.py.
+    Thread-safe Google Sheet row update for Image URL in column O.
     """
-    image_url = clean_text(image_url)
     with SHEET_LOCK:
-        if hasattr(sheets, "update_image_url"):
-            sheets.update_image_url(row_num, image_url)
-        else:
-            # Keeps scraper running if sheets.py has not been updated yet.
-            print("⚠️ sheets.update_image_url() missing. Add it to sheets.py to write column O.")
+        sheets.update_image_url(row_num, image_url)
 
 
 def safe_add_log(row_number, status, log_type, url="", video_id="", app_link="", message=""):
@@ -648,6 +642,103 @@ def wait_and_extract_install_link(page, max_wait_seconds=35):
 
 
 # =========================
+# IMAGE URL EXTRACTION LOGIC
+# =========================
+
+def extract_primary_image_url(page):
+    """
+    Extracts the primary/main image URL from the ad creative.
+    Looks for large, visible images that aren't icons or logos.
+    Returns the full image URL or "N/A".
+    """
+    js = r"""
+    () => {
+        const isVisible = (el) => {
+            if (!el) return false;
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return (
+                rect.width >= 100 &&
+                rect.height >= 100 &&
+                rect.bottom > 0 &&
+                rect.right > 0 &&
+                rect.top < window.innerHeight &&
+                rect.left < window.innerWidth &&
+                style.visibility !== 'hidden' &&
+                style.display !== 'none' &&
+                style.opacity !== '0'
+            );
+        };
+
+        const images = Array.from(document.querySelectorAll('img')).map(img => {
+            const src = String(img.getAttribute('src') || img.src || '');
+            const alt = String(img.getAttribute('alt') || '').toLowerCase();
+            const rect = img.getBoundingClientRect();
+            
+            // Skip logos, icons, and Google branding
+            if (src.includes('googlelogo') || alt.includes('google') || 
+                alt.includes('logo') || alt.includes('icon') ||
+                src.includes('logo') || src.includes('icon')) {
+                return null;
+            }
+            
+            // Only include visible images
+            if (!isVisible(img)) {
+                return null;
+            }
+            
+            // Calculate score based on size and position
+            const area = rect.width * rect.height;
+            const score = area + (rect.y < 400 ? 5000 : 0); // Prefer top images
+            
+            return { src, area, score };
+        }).filter(Boolean);
+
+        // Sort by score descending and return the best one
+        if (images.length > 0) {
+            images.sort((a, b) => b.score - a.score);
+            return images[0].src;
+        }
+
+        return null;
+    }
+    """
+
+    try:
+        image_url = page.evaluate(js)
+        if image_url and isinstance(image_url, str) and len(image_url) > 0:
+            # Handle relative URLs
+            if image_url.startswith("http"):
+                return image_url
+            elif image_url.startswith("//"):
+                return "https:" + image_url
+            elif image_url.startswith("/"):
+                try:
+                    base_url = urlparse(page.url).netloc
+                    return f"https://{base_url}{image_url}"
+                except:
+                    return image_url
+            return image_url
+    except Exception:
+        pass
+
+    # Fallback: check iframes
+    for frame in page.frames:
+        try:
+            image_url = frame.evaluate(js)
+            if image_url and isinstance(image_url, str) and len(image_url) > 0:
+                if image_url.startswith("http"):
+                    return image_url
+                elif image_url.startswith("//"):
+                    return "https:" + image_url
+                return image_url
+        except Exception:
+            continue
+
+    return "N/A"
+
+
+# =========================
 # HEADLINE AND DESCRIPTION LOGIC
 # =========================
 
@@ -1177,18 +1268,17 @@ def get_ranked_non_video_targets(page):
 
 def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
     """
-    Extract headline and description from the active non-video creative.
-    Rule used for image/text ads:
-    - the biggest visible text is treated as headline
-    - the visible text directly below it is treated as description
+    Extracts headline and description for non-video ads.
+    - Prefers visible elements from the active creative (main DOM).
+    - Uses specific selectors: <div role="link">, div.HFTpmd-WsjYwc-hgDUwe, div.cS4Vcb-vnv8ic
+    - Falls back to iframe if necessary.
+    - Relaxed visibility check to allow offscreen or special-language creatives (e.g., Arabic).
     """
     js = r"""
     () => {
-        const cleanText = (txt) => (txt || "")
-            .replace(/\n/g, " ")
-            .replace(/\s+/g, " ")
-            .trim();
+        const cleanText = (txt) => (txt || "").replace(/\n/g, " ").replace(/\s+/g, " ").trim();
 
+        // RELAXED visibility: ignore offscreen top/bottom/left/right but still require positive width/height
         const isVisible = (el) => {
             if (!el) return false;
             const rect = el.getBoundingClientRect();
@@ -1199,134 +1289,20 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
                    style.opacity !== '0';
         };
 
-        const isBadUiText = (txt) => {
-            const lower = cleanText(txt).toLowerCase();
-            if (!lower) return true;
-            const exactBad = new Set([
-                'install', 'get', 'download', 'open', 'learn more',
-                'ads transparency center', 'ads transparency centre',
-                'sign in', 'menu', 'search', 'privacy', 'terms'
-            ]);
-            if (exactBad.has(lower)) return true;
-            return lower.includes('report this ad') ||
-                   lower.includes('see more ads') ||
-                   lower.includes('last shown') ||
-                   lower.includes('shown in');
-        };
+        let headline = "N/A";
+        let description = "N/A";
 
-        const candidates = [];
-
-        for (const el of Array.from(document.querySelectorAll('body *'))) {
-            if (!isVisible(el)) continue;
-
-            const text = cleanText(el.innerText || el.textContent || '');
-            if (text.length < 2 || text.length > 260) continue;
-            if (text.includes('{{') || text.includes('}}')) continue;
-            if (isBadUiText(text)) continue;
-
-            const cls = String(el.className || '').toLowerCase();
-            const aria = String(el.getAttribute('aria-label') || '').toLowerCase();
-            const role = String(el.getAttribute('role') || '').toLowerCase();
-            const isSpecificTextNode =
-                cls.includes('headline') || cls.includes('-e-15') ||
-                cls.includes('description') || cls.includes('long-description') || cls.includes('-e-67') ||
-                aria.includes('headline') || aria.includes('description') || role === 'link';
-
-            // Avoid large wrapper containers that only repeat child text.
-            const directText = cleanText(Array.from(el.childNodes)
-                .filter(n => n.nodeType === Node.TEXT_NODE)
-                .map(n => n.textContent || '')
-                .join(' '));
-            if (el.children.length > 0 && !isSpecificTextNode && directText.length < 2) continue;
-
-            const rect = el.getBoundingClientRect();
-            if (rect.width < 20 || rect.height < 8) continue;
-
-            const style = window.getComputedStyle(el);
-            const fontSize = parseFloat(style.fontSize || '0') || 0;
-            const fontWeightRaw = String(style.fontWeight || '400');
-            const fontWeight = fontWeightRaw === 'bold' ? 700 : (parseInt(fontWeightRaw, 10) || 400);
-
-            candidates.push({
-                text,
-                top: rect.top,
-                bottom: rect.bottom,
-                left: rect.left,
-                width: rect.width,
-                height: rect.height,
-                fontSize,
-                fontWeight,
-                cls,
-                aria,
-                role,
-                isHeadlineClass: cls.includes('headline') || cls.includes('-e-15') || aria.includes('headline'),
-                isDescriptionClass: cls.includes('description') || cls.includes('long-description') || cls.includes('-e-67') || aria.includes('description')
-            });
+        // 1️⃣ Main visible creative first
+        const headlineEl = document.querySelector('div[role="link"] span, div.HFTpmd-WsjYwc-hgDUwe, div.cS4Vcb-vnv8ic');
+        if (headlineEl && isVisible(headlineEl)) {
+            headline = cleanText(headlineEl.innerText || headlineEl.textContent);
         }
 
-        if (!candidates.length) {
-            return { headline: 'N/A', description: 'N/A' };
+        const descriptionEl = document.querySelector('div.HFTpmd-WsjYwc-hgDUwe, div.cS4Vcb-vnv8ic');
+        if (descriptionEl && isVisible(descriptionEl)) {
+            description = cleanText(descriptionEl.innerText || descriptionEl.textContent);
         }
 
-        const unique = [];
-        const seen = new Set();
-        for (const c of candidates) {
-            const key = `${c.text}|${Math.round(c.top)}|${Math.round(c.left)}`;
-            if (!seen.has(key)) {
-                seen.add(key);
-                unique.push(c);
-            }
-        }
-
-        const headlineCandidates = unique.map(c => {
-            const words = c.text.split(/\s+/).filter(Boolean).length;
-            let score = c.fontSize * 100;
-            score += Math.min(c.width * c.height / 20, 180);
-            if (c.fontWeight >= 600) score += 80;
-            if (c.isHeadlineClass) score += 500;
-            if (c.role === 'link') score += 40;
-            if (c.text.length > 95) score -= 80;
-            if (words > 14) score -= 80;
-            // Prefer creative area, not page chrome far away.
-            if (c.top < -20 || c.top > 720) score -= 200;
-            return { ...c, headlineScore: score };
-        }).sort((a, b) => b.headlineScore - a.headlineScore);
-
-        const headlineObj = headlineCandidates[0];
-        const headline = headlineObj ? headlineObj.text : 'N/A';
-
-        let descriptionObj = null;
-        if (headlineObj) {
-            const below = unique
-                .filter(c => c.text !== headlineObj.text)
-                .filter(c => c.top >= headlineObj.bottom - 4)
-                .filter(c => c.top <= headlineObj.bottom + 260)
-                .filter(c => c.text.length >= 5)
-                .map(c => {
-                    const distance = Math.max(0, c.top - headlineObj.bottom);
-                    let score = 300 - Math.min(distance, 300);
-                    score += Math.min(c.text.length, 180) / 2;
-                    if (c.isDescriptionClass) score += 500;
-                    if (c.fontSize <= headlineObj.fontSize + 2) score += 50;
-                    if (c.fontSize > headlineObj.fontSize + 4) score -= 100;
-                    score -= Math.min(Math.abs(c.left - headlineObj.left) / 4, 80);
-                    return { ...c, descScore: score };
-                })
-                .sort((a, b) => b.descScore - a.descScore);
-
-            descriptionObj = below.length ? below[0] : null;
-        }
-
-        // Fallback: explicit description class anywhere in the same creative.
-        if (!descriptionObj) {
-            const explicitDesc = unique
-                .filter(c => c.text !== headline)
-                .filter(c => c.isDescriptionClass && c.text.length >= 5)
-                .sort((a, b) => b.text.length - a.text.length);
-            descriptionObj = explicitDesc.length ? explicitDesc[0] : null;
-        }
-
-        const description = descriptionObj ? descriptionObj.text : 'N/A';
         return { headline, description };
     }
     """
@@ -1334,12 +1310,8 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
     def read_target(target):
         try:
             data = target.evaluate(js)
-            if not data:
-                return None
-            headline = clean_text(data.get("headline"))
-            description = clean_text(data.get("description"))
-            if headline != "N/A" or description != "N/A":
-                return {"headline": headline, "description": description}
+            if data and (data.get("headline") != "N/A" or data.get("description") != "N/A"):
+                return data
         except Exception:
             return None
         return None
@@ -1347,29 +1319,14 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
     start_time = time.time()
 
     while time.time() - start_time < max_wait_seconds:
-        seen_targets = set()
-
-        # Prefer the active creative frame/page using your existing ranking helper.
-        try:
-            ranked_targets = get_ranked_non_video_targets(page)
-        except Exception:
-            ranked_targets = []
-
-        for _, target, _, _ in ranked_targets:
-            if id(target) in seen_targets:
-                continue
-            seen_targets.add(id(target))
-            data = read_target(target)
-            if data:
-                return data
-
-        # Fallback: main page, then every iframe.
+        # 1) Check main page DOM first (active visible creative)
         data = read_target(page)
         if data:
             return data
 
+        # 2) Fallback: check iframes only if main DOM didn't yield headline/description
         for frame in page.frames:
-            if frame == page.main_frame or id(frame) in seen_targets:
+            if frame == page.main_frame:
                 continue
             data = read_target(frame)
             if data:
@@ -1378,209 +1335,6 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
         page.wait_for_timeout(1000)
 
     return {"headline": "N/A", "description": "N/A"}
-
-
-def clean_image_url(raw_url, base_url=""):
-    """Normalize image URLs found in src/srcset/background-image."""
-    if not raw_url:
-        return "N/A"
-
-    raw_url = str(raw_url).strip().strip('"\'')
-    if not raw_url or raw_url.lower() in {"none", "null", "undefined"}:
-        return "N/A"
-
-    # Avoid writing huge base64 images into the sheet.
-    if raw_url.lower().startswith("data:image"):
-        return "N/A"
-
-    if raw_url.startswith("//"):
-        raw_url = "https:" + raw_url
-
-    if base_url and not raw_url.lower().startswith(("http://", "https://", "blob:")):
-        try:
-            raw_url = urljoin(base_url, raw_url)
-        except Exception:
-            pass
-
-    return raw_url or "N/A"
-
-
-def extract_image_url_from_target(target):
-    """
-    Extracts the actual visible image URL from the same DOM attributes you see in Inspect Element:
-    img.currentSrc/src/srcset, picture source srcset, SVG image href, and CSS background-image URL.
-    """
-    js = r"""
-    () => {
-        const absUrl = (raw) => {
-            if (!raw) return '';
-            raw = String(raw).trim().replace(/^['"]|['"]$/g, '');
-            if (!raw || raw === 'none') return '';
-            if (raw.startsWith('data:image')) return '';
-            try { return new URL(raw, location.href).href; } catch (e) { return raw; }
-        };
-
-        const pickBestFromSrcset = (srcset) => {
-            if (!srcset) return '';
-            let bestUrl = '';
-            let bestScore = -1;
-            for (const rawPart of String(srcset).split(',')) {
-                const part = rawPart.trim();
-                if (!part) continue;
-                const pieces = part.split(/\s+/).filter(Boolean);
-                const url = pieces[0] || '';
-                const descriptor = pieces[1] || '';
-                let score = 1;
-                if (descriptor.endsWith('w')) score = parseFloat(descriptor) || 1;
-                if (descriptor.endsWith('x')) score = (parseFloat(descriptor) || 1) * 1000;
-                if (score >= bestScore) {
-                    bestScore = score;
-                    bestUrl = url;
-                }
-            }
-            return bestUrl;
-        };
-
-        const isVisibleBox = (el, minW = 80, minH = 50) => {
-            if (!el) return null;
-            const rect = el.getBoundingClientRect();
-            const style = window.getComputedStyle(el);
-            if (rect.width < minW || rect.height < minH) return null;
-            if (rect.bottom <= 0 || rect.right <= 0 || rect.top >= window.innerHeight || rect.left >= window.innerWidth) return null;
-            if (style.visibility === 'hidden' || style.display === 'none' || style.opacity === '0') return null;
-            return rect;
-        };
-
-        const badImage = (url, el) => {
-            const lower = String(url || '').toLowerCase();
-            const alt = String(el?.getAttribute?.('alt') || '').toLowerCase();
-            if (!lower) return true;
-            if (lower.startsWith('data:image')) return true;
-            if (lower.includes('googlelogo') || alt.includes('google logo')) return true;
-            if (lower.includes('/branding/') && lower.includes('google')) return true;
-            if (lower.includes('favicon') || lower.endsWith('/favicon.ico')) return true;
-            if (lower.includes('doubleclick') && lower.includes('adchoices')) return true;
-            return false;
-        };
-
-        const candidates = [];
-
-        const addCandidate = (rawUrl, el, kind, bonus = 0) => {
-            const url = absUrl(rawUrl);
-            if (!url || badImage(url, el)) return;
-            const rect = isVisibleBox(el);
-            if (!rect) return;
-
-            let score = rect.width * rect.height;
-            score += bonus;
-            if (kind.includes('currentSrc')) score += 5000;
-            if (kind.includes('srcset')) score += 3000;
-            if (kind.includes('background')) score += 2000;
-            if (url.startsWith('blob:')) score -= 50000;
-
-            candidates.push({
-                url,
-                kind,
-                score,
-                width: rect.width,
-                height: rect.height,
-                top: rect.top,
-                left: rect.left
-            });
-        };
-
-        for (const img of Array.from(document.querySelectorAll('img'))) {
-            addCandidate(img.currentSrc, img, 'img-currentSrc', 5000);
-            addCandidate(img.getAttribute('src'), img, 'img-src', 4000);
-            addCandidate(pickBestFromSrcset(img.getAttribute('srcset')), img, 'img-srcset', 4500);
-
-            for (const attr of ['data-src', 'data-lazy-src', 'data-original', 'data-image', 'data-image-url', 'data-thumbnail-url', 'data-iurl']) {
-                addCandidate(img.getAttribute(attr), img, `img-${attr}`, 2000);
-            }
-        }
-
-        for (const source of Array.from(document.querySelectorAll('picture source[srcset], source[srcset]'))) {
-            const picture = source.closest('picture');
-            const visualEl = picture?.querySelector('img') || picture || source;
-            addCandidate(pickBestFromSrcset(source.getAttribute('srcset')), visualEl, 'source-srcset', 3500);
-        }
-
-        for (const svgImage of Array.from(document.querySelectorAll('image'))) {
-            addCandidate(svgImage.getAttribute('href') || svgImage.getAttribute('xlink:href'), svgImage, 'svg-image', 2500);
-        }
-
-        // Background-image creatives often show the URL in Inspect Element under computed CSS.
-        for (const el of Array.from(document.querySelectorAll('body *'))) {
-            const rect = isVisibleBox(el, 120, 80);
-            if (!rect) continue;
-            const bg = window.getComputedStyle(el).backgroundImage || '';
-            if (!bg || bg === 'none' || !bg.includes('url(')) continue;
-
-            const matches = Array.from(bg.matchAll(/url\((['"]?)(.*?)\1\)/g));
-            for (const match of matches) {
-                addCandidate(match[2], el, 'background-image', 2500);
-            }
-        }
-
-        if (!candidates.length) return null;
-
-        const deduped = [];
-        const seen = new Set();
-        for (const c of candidates) {
-            if (seen.has(c.url)) continue;
-            seen.add(c.url);
-            deduped.push(c);
-        }
-
-        deduped.sort((a, b) => b.score - a.score);
-        return deduped[0].url || null;
-    }
-    """
-    try:
-        base_url = getattr(target, "url", "") or ""
-        return clean_image_url(target.evaluate(js), base_url=base_url)
-    except Exception:
-        return "N/A"
-
-
-def wait_and_extract_image_url(page, max_wait_seconds=15):
-    """
-    Waits for the active image creative and returns the visible image URL for column O.
-    """
-    start_time = time.time()
-
-    while time.time() - start_time < max_wait_seconds:
-        seen_targets = set()
-
-        try:
-            ranked_targets = get_ranked_non_video_targets(page)
-        except Exception:
-            ranked_targets = []
-
-        for _, target, _, _ in ranked_targets:
-            if id(target) in seen_targets:
-                continue
-            seen_targets.add(id(target))
-            image_url = extract_image_url_from_target(target)
-            if image_url != "N/A":
-                return image_url
-
-        image_url = extract_image_url_from_target(page)
-        if image_url != "N/A":
-            return image_url
-
-        for frame in page.frames:
-            if frame == page.main_frame or id(frame) in seen_targets:
-                continue
-            image_url = extract_image_url_from_target(frame)
-            if image_url != "N/A":
-                return image_url
-
-        page.wait_for_timeout(1000)
-
-    return "N/A"
-
-
 # =========================
 # MAIN COMBINED SCRAPER: VIDEO ADS + TEXT ADS
 # =========================
@@ -1726,6 +1480,9 @@ def scrape_single_url(url_row):
                 app_link_time = get_exact_time()
 
                 headline, description = wait_and_extract_headline_description(page, max_wait_seconds=15)
+                
+                # Extract image URL for video ads too
+                image_url = extract_primary_image_url(page)
 
                 if app_link == "N/A":
                     status = "VIDEO_FOUND_APP_LINK_NOT_FOUND"
@@ -1748,7 +1505,7 @@ def scrape_single_url(url_row):
 
                 safe_update_combined_row(row_num, data)
                 safe_update_headline_desc(row_num, headline, description)
-                safe_update_image_url(row_num, "N/A")
+                safe_update_image_url(row_num, image_url)
 
                 safe_add_log(
                     row_number=row_num,
@@ -1760,7 +1517,7 @@ def scrape_single_url(url_row):
                     message=message
                 )
 
-                print(f"✅ Row {row_num}: saved VIDEO ad advertiser + package + video ID + text")
+                print(f"✅ Row {row_num}: saved VIDEO ad advertiser + package + video ID + text + image")
                 return
 
             # =========================
@@ -1774,17 +1531,15 @@ def scrape_single_url(url_row):
             process_time = get_exact_time()
             has_text = is_valid_text_ad(headline, description)
 
-            # Extract the visible creative image URL for column O.
-            image_url = wait_and_extract_image_url(page, max_wait_seconds=12)
-            if image_url != "N/A":
-                print(f"🖼 Row {row_num}: image URL found -> {image_url[:120]}")
+            # Extract image URL
+            image_url = extract_primary_image_url(page)
 
             # First try visible install/app link from the active creative.
             visible_app_link = wait_and_extract_install_link(page, max_wait_seconds=8)
             visible_package = extract_package_name(visible_app_link)
 
-            is_image_like = image_url != "N/A" or has_visible_image_creative(page)
-            ad_type = "image" if (is_image_like or (not has_text and visible_package != "N/A")) else "text" if has_text else "N/A"
+            is_image_like = has_visible_image_creative(page)
+            ad_type = "text" if has_text else "image" if (is_image_like or visible_package != "N/A") else "N/A"
 
             if not has_text and visible_package == "N/A" and not is_image_like:
                 data = [
@@ -1873,7 +1628,7 @@ def scrape_single_url(url_row):
                 message=message
             )
 
-            print(f"✅ Row {row_num}: saved NON-VIDEO {ad_type} ad advertiser + package + headline + description + image URL")
+            print(f"✅ Row {row_num}: saved NON-VIDEO {ad_type} ad advertiser + package + headline + description + image")
 
         except Exception as e:
             error_time = get_exact_time()
