@@ -12,10 +12,10 @@ SHEET_CACHE = None
 SHEET_CACHE_TIME = None
 SHEET_CACHE_TTL = 60  # seconds
 def clear_sheet_cache():
-global SHEET_CACHE, SHEET_CACHE_TIME
-SHEET_CACHE = None
-SHEET_CACHE_TIME = None
-print("✅ Sheet cache cleared")
+    global SHEET_CACHE, SHEET_CACHE_TIME
+    SHEET_CACHE = None
+    SHEET_CACHE_TIME = None
+    print("✅ Sheet cache cleared")
 
 CLAIM_AGENT_COL = 9       # I
 CLAIM_TIME_COL = 10       # J
