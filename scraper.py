@@ -1169,7 +1169,140 @@ def extract_package_from_page(page):
         pass
 
     combined = '\n'.join(collected_texts)
+
     return extract_packages_from_text(combined)
+
+
+def extract_addata_appid_from_text(raw_text):
+    """
+    Direct package fallback for Google Transparency creatives.
+    Looks specifically for script/HTML values like var adData = {... appId: "com.example.app" ...}.
+    This is used when headline/description are missing or not reliable.
+    """
+    if not raw_text:
+        return "N/A"
+
+    text = decode_all(str(raw_text))
+
+    patterns = [
+        # Highest-confidence: appId appears near adData/ad_data in a script block.
+        r"(?is)\b(?:var|let|const)?\s*(?:adData|ad_data|AD_DATA)\b[\s\S]{0,30000}?['\"]appId['\"]\s*[:=]\s*['\"]([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*){2,})['\"]",
+        r"(?is)\b(?:var|let|const)?\s*(?:adData|ad_data|AD_DATA)\b[\s\S]{0,30000}?['\"]app_id['\"]\s*[:=]\s*['\"]([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*){2,})['\"]",
+        r"(?is)\b(?:var|let|const)?\s*(?:adData|ad_data|AD_DATA)\b[\s\S]{0,30000}?['\"]appid['\"]\s*[:=]\s*['\"]([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*){2,})['\"]",
+
+        # Sometimes the object is encoded/serialized and only appId remains searchable.
+        r"(?is)['\"]appId['\"]\s*[:=]\s*['\"]([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*){2,})['\"]",
+        r"(?is)['\"]app_id['\"]\s*[:=]\s*['\"]([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*){2,})['\"]",
+        r"(?is)['\"]appid['\"]\s*[:=]\s*['\"]([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*){2,})['\"]",
+    ]
+
+    for pat in patterns:
+        for m in re.finditer(pat, text, re.IGNORECASE):
+            pkg = m.group(1).strip().rstrip(".,;'\"\\ ")
+            if _is_valid_pkg(pkg):
+                return pkg
+
+    return "N/A"
+
+
+def extract_addata_appid_from_target(target):
+    """Read script tags + outerHTML from one page/frame and extract adData.appId."""
+    js = r"""
+    () => {
+        const chunks = [];
+        try {
+            for (const s of Array.from(document.querySelectorAll('script'))) {
+                if (s.textContent) chunks.push(s.textContent);
+            }
+        } catch (e) {}
+        try {
+            if (document.documentElement && document.documentElement.outerHTML) {
+                chunks.push(document.documentElement.outerHTML);
+            }
+        } catch (e) {}
+        return chunks.join('\n');
+    }
+    """
+    try:
+        raw = target.evaluate(js)
+        return extract_addata_appid_from_text(raw)
+    except Exception:
+        return "N/A"
+
+
+def extract_addata_appid_from_page(page, preferred_target=None):
+    """
+    adData.appId target search order only:
+    1) Same target/frame that produced the correct image URL.
+    2) Ranked creative frames.
+    3) Main page.
+    4) All remaining frames.
+    """
+    checked = set()
+
+    def try_target(target):
+        if not target or id(target) in checked:
+            return "N/A"
+        checked.add(id(target))
+        return extract_addata_appid_from_target(target)
+
+    pkg = try_target(preferred_target)
+    if pkg != "N/A":
+        return pkg
+
+    try:
+        for _, target, _, _ in get_ranked_non_video_targets(page):
+            pkg = try_target(target)
+            if pkg != "N/A":
+                return pkg
+    except Exception:
+        pass
+
+    pkg = try_target(page)
+    if pkg != "N/A":
+        return pkg
+
+    for frame in page.frames:
+        if frame == page.main_frame:
+            continue
+        pkg = try_target(frame)
+        if pkg != "N/A":
+            return pkg
+
+    return "N/A"
+
+
+def is_reliable_headline_description(headline, description):
+    """
+    Avoid using headline/description matching when text extraction looks weak/wrong.
+    In those cases, adData.appId fallback is safer.
+    """
+    h = clean_text(headline)
+    d = clean_text(description)
+
+    if h == "N/A" or d == "N/A":
+        return False
+    if h.lower() == d.lower():
+        return False
+    if len(h) < 4 or len(d) < 4:
+        return False
+
+    bad_exact = {
+        "install", "get", "download", "open", "learn more", "play now",
+        "ads transparency center", "ads transparency centre", "privacy", "terms"
+    }
+    h_low = h.lower().strip()
+    d_low = d.lower().strip()
+
+    if h_low in bad_exact or d_low in bad_exact:
+        return False
+    if h_low.startswith(("install ", "get ", "download ")):
+        return False
+    if d_low.startswith(("install ", "get ", "download ")):
+        return False
+
+    return True
+
 
 def extract_advertiser_from_page(page):
     try:
@@ -1980,35 +2113,60 @@ def scrape_single_url(url_row):
             else:
                 print(f"🖼 Row {row_num}: likely image ad, headline/description not found")
 
-            print(f"📦 Row {row_num}: resolving package from visible install link first")
+            print(f"📦 Row {row_num}: resolving package by priority: reliable text → adData.appId → visible install link")
 
-            if visible_package != "N/A":
-                package_name = visible_package
-                app_link = visible_app_link
-                match_score = 1.0
-                status = "SUCCESS"
-                message = f"Non-video {ad_type} ad package extracted from visible install link"
-                print(f"✅ Row {row_num}: package from visible install link -> {package_name}")
-            else:
-                package_name = None
-                match_score = 0.0
+            package_name = None
+            app_link = "N/A"
+            match_score = 0.0
+            status = "NON_VIDEO_PACKAGE_NOT_FOUND"
+            message = "Package not resolved yet"
 
-                if has_text:
-                    print(f"📦 Row {row_num}: visible install link not found, strict matching with headline + description")
-                    all_found_packages = extract_package_from_page(page)
-                    package_name, match_score = get_best_matching_package(headline, description, all_found_packages)
+            # PRIORITY 1: Use headline + description matching only when the text looks reliable.
+            reliable_text = is_reliable_headline_description(headline, description)
+            if has_text and reliable_text:
+                print(f"📦 Row {row_num}: Priority 1 - strict matching with reliable headline + description")
+                all_found_packages = extract_package_from_page(page)
+                package_name, match_score = get_best_matching_package(headline, description, all_found_packages)
 
                 if package_name:
                     app_link = f"https://play.google.com/store/apps/details?id={package_name}"
                     status = "SUCCESS"
-                    message = f"Non-video {ad_type} ad package strictly matched with score {match_score}"
-                    print(f"✅ Row {row_num}: strict matched package -> {package_name} | score={match_score}")
+                    message = f"Non-video {ad_type} ad package strictly matched from reliable headline + description. Score={match_score}"
+                    print(f"✅ Row {row_num}: package from headline + description -> {package_name} | score={match_score}")
                 else:
-                    package_name = "N/A"
-                    app_link = "N/A"
-                    status = "NON_VIDEO_PACKAGE_NOT_FOUND"
-                    message = f"Non-video {ad_type} ad found, but package score below 0.76. Best score={match_score}"
-                    print(f"⚠️ Row {row_num}: package score below 0.76, writing N/A | best score={match_score}")
+                    print(f"⚠️ Row {row_num}: text was reliable, but package match failed. Best score={match_score}")
+            elif has_text:
+                print(f"⚠️ Row {row_num}: headline/description not reliable, skipping text-based package match")
+
+            # PRIORITY 2: Use inspect-element script var adData.appId.
+            if not package_name:
+                print(f"📦 Row {row_num}: Priority 2 - checking script adData.appId")
+                addata_package = extract_addata_appid_from_page(page, preferred_target=image_target)
+                if addata_package != "N/A":
+                    package_name = addata_package
+                    app_link = f"https://play.google.com/store/apps/details?id={package_name}"
+                    match_score = 1.0
+                    status = "SUCCESS"
+                    message = "Non-video ad package extracted from script adData.appId fallback"
+                    print(f"✅ Row {row_num}: package from adData.appId -> {package_name}")
+
+            # PRIORITY 3: Use visible install/app link package as last fallback.
+            if not package_name:
+                print(f"📦 Row {row_num}: Priority 3 - checking visible install/app link")
+                if visible_package != "N/A":
+                    package_name = visible_package
+                    app_link = visible_app_link
+                    match_score = 1.0
+                    status = "SUCCESS"
+                    message = f"Non-video {ad_type} ad package extracted from visible install link fallback"
+                    print(f"✅ Row {row_num}: package from visible install link -> {package_name}")
+
+            if not package_name:
+                package_name = "N/A"
+                app_link = "N/A"
+                status = "NON_VIDEO_PACKAGE_NOT_FOUND"
+                message = f"Non-video {ad_type} ad found, but reliable text/adData.appId/visible link all failed. Best score={match_score}"
+                print(f"⚠️ Row {row_num}: package not found, writing N/A | best score={match_score}")
 
             data = [
                 advertiser,
