@@ -8,8 +8,7 @@ on:
 
 
 jobs:
-
-  bottom-agent:
+  top-agent:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:
@@ -33,9 +32,11 @@ jobs:
           pip install -r requirements.txt
           playwright install chromium
 
-      - name: Run bottom agent
+      - name: Run top agent
         run: |
-          python agent_runner.py bottom
+          python agent_runner.py top
+
+  
 
   check-and-retrigger:
     runs-on: ubuntu-latest
