@@ -1268,42 +1268,244 @@ def get_ranked_non_video_targets(page):
 
 def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
     """
-    Extracts headline and description for non-video ads.
-    - Prefers visible elements from the active creative (main DOM).
-    - Uses specific selectors: <div role="link">, div.HFTpmd-WsjYwc-hgDUwe, div.cS4Vcb-vnv8ic
-    - Falls back to iframe if necessary.
-    - Relaxed visibility check to allow offscreen or special-language creatives (e.g., Arabic).
+    Extracts headline and description for non-video ads, including image ads where
+    the headline/description are placed BELOW the main image.
+
+    Important:
+    - It filters CTA/button text such as Install, Get, Download, Learn more, etc.
+    - It prefers text spatially below the largest visible image in the active creative.
+    - It uses ranked frames so stale/hidden repeated ad iframes are less likely to win.
     """
     js = r"""
     () => {
-        const cleanText = (txt) => (txt || "").replace(/\n/g, " ").replace(/\s+/g, " ").trim();
+        const cleanText = (txt) => (txt || "")
+            .replace(/\u00a0/g, " ")
+            .replace(/\n/g, " ")
+            .replace(/\s+/g, " ")
+            .trim();
 
-        // RELAXED visibility: ignore offscreen top/bottom/left/right but still require positive width/height
         const isVisible = (el) => {
             if (!el) return false;
             const rect = el.getBoundingClientRect();
             const style = window.getComputedStyle(el);
-            return rect.width > 0 && rect.height > 0 &&
-                   style.visibility !== 'hidden' &&
-                   style.display !== 'none' &&
-                   style.opacity !== '0';
+            return (
+                rect.width > 0 &&
+                rect.height > 0 &&
+                style.visibility !== "hidden" &&
+                style.display !== "none" &&
+                style.opacity !== "0"
+            );
         };
+
+        const rectObj = (el) => {
+            const r = el.getBoundingClientRect();
+            return {
+                left: r.left,
+                top: r.top,
+                right: r.right,
+                bottom: r.bottom,
+                width: r.width,
+                height: r.height,
+                area: r.width * r.height
+            };
+        };
+
+        const horizontalOverlapRatio = (a, b) => {
+            const overlap = Math.max(0, Math.min(a.right, b.right) - Math.max(a.left, b.left));
+            return overlap / Math.max(1, Math.min(a.width, b.width));
+        };
+
+        const badPhrases = [
+            "install", "get", "download", "open", "play now", "learn more",
+            "shop now", "sign up", "try now", "buy now", "book now", "visit site",
+            "apply now", "start now", "order now", "see more", "more", "ad",
+            "sponsored", "ads transparency", "report this ad", "why this ad",
+            "google play", "app store"
+        ];
+
+        const isBadText = (txt, el) => {
+            const t = cleanText(txt);
+            const lower = t.toLowerCase();
+
+            if (!t || t.length < 2 || t.length > 260) return true;
+            if (t.includes("{{") || t.includes("}}")) return true;
+            if (/https?:\/\//i.test(t) || /www\./i.test(t)) return true;
+
+            // Do not pick install keyword or other CTA-only labels.
+            if (/\binstall\b/i.test(t)) return true;
+
+            if (badPhrases.includes(lower)) return true;
+            if (/^(get|download|open|learn more|shop now|sign up|try now|buy now|book now|visit site|apply now|start now|order now)$/i.test(t)) return true;
+
+            const clickable = el.closest('a, button, [role="button"]');
+            if (clickable) {
+                const cls = String(clickable.className || "").toLowerCase();
+                const aria = String(clickable.getAttribute("aria-label") || "").toLowerCase();
+
+                // Do not reject normal ad copy just because the whole card is clickable.
+                // Reject only when this exact element/label looks like a CTA.
+                const looksLikeCta =
+                    /^(install|get|download|open|learn more|shop now|sign up|try now|buy now|book now|visit site|apply now|start now|order now)$/i.test(t) ||
+                    /\b(install|get|download)\b/i.test(aria) ||
+                    cls.includes("install-button");
+
+                if (looksLikeCta && t.length <= 40) return true;
+            }
+
+            return false;
+        };
+
+        const uniquePush = (arr, item) => {
+            const key = item.text.toLowerCase();
+            if (!arr.some(x => x.text.toLowerCase() === key)) arr.push(item);
+        };
+
+        // 1) Find the main image/display area first.
+        const visualCandidates = Array.from(document.querySelectorAll('img, picture, canvas, svg, [style*="background-image"]'))
+            .map(el => {
+                if (!isVisible(el)) return null;
+                const r = rectObj(el);
+                const src = String(el.getAttribute("src") || "").toLowerCase();
+                const alt = String(el.getAttribute("alt") || "").toLowerCase();
+                const style = window.getComputedStyle(el);
+                const bg = String(style.backgroundImage || "").toLowerCase();
+
+                if (src.includes("googlelogo") || alt.includes("google") || alt.includes("logo") ||
+                    src.includes("logo") || src.includes("icon") || bg.includes("googlelogo")) {
+                    return null;
+                }
+
+                if (r.width < 80 || r.height < 50) return null;
+
+                // Prefer larger visuals near the top/middle of the creative.
+                const score = r.area + (r.top < 450 ? 8000 : 0) - Math.max(0, r.top - 600) * 20;
+                return { el, rect: r, score };
+            })
+            .filter(Boolean)
+            .sort((a, b) => b.score - a.score);
+
+        const mainImage = visualCandidates.length ? visualCandidates[0] : null;
+
+        // 2) Read text nodes under the image, not CTA buttons.
+        let belowImageTexts = [];
+
+        if (mainImage) {
+            const imgRect = mainImage.rect;
+
+            const textNodes = Array.from(document.querySelectorAll('span, div, p, h1, h2, h3, h4, a, button, [role="heading"], [role="link"]'));
+
+            for (const el of textNodes) {
+                if (!isVisible(el)) continue;
+
+                // Prefer leaf nodes. This avoids grabbing a whole card that contains image + CTA + text.
+                if (el.childElementCount > 0) {
+                    const ownText = cleanText(el.innerText || el.textContent || "");
+                    let childText = "";
+                    for (const child of Array.from(el.children)) {
+                        childText += " " + cleanText(child.innerText || child.textContent || "");
+                    }
+                    childText = cleanText(childText);
+                    if (childText && ownText === childText) continue;
+                }
+
+                const txt = cleanText(el.innerText || el.textContent || "");
+                if (isBadText(txt, el)) continue;
+
+                const r = rectObj(el);
+                const verticalGap = r.top - imgRect.bottom;
+                const overlap = horizontalOverlapRatio(r, imgRect);
+
+                // This is the important part for image ads: only text below the visual.
+                if (verticalGap < -8 || verticalGap > 360) continue;
+                if (overlap < 0.12) continue;
+
+                const style = window.getComputedStyle(el);
+                const fontSize = parseFloat(style.fontSize || "0");
+                const fontWeight = parseInt(style.fontWeight || "400", 10) || 400;
+
+                uniquePush(belowImageTexts, {
+                    text: txt,
+                    top: r.top,
+                    left: r.left,
+                    height: r.height,
+                    width: r.width,
+                    fontSize,
+                    fontWeight,
+                    score: (fontSize * 2) + (fontWeight >= 600 ? 20 : 0) - Math.max(0, verticalGap) / 20
+                });
+            }
+
+            belowImageTexts.sort((a, b) => {
+                if (Math.abs(a.top - b.top) > 6) return a.top - b.top;
+                return a.left - b.left;
+            });
+        }
 
         let headline = "N/A";
         let description = "N/A";
 
-        // 1️⃣ Main visible creative first
-        const headlineEl = document.querySelector('div[role="link"] span, div.HFTpmd-WsjYwc-hgDUwe, div.cS4Vcb-vnv8ic');
-        if (headlineEl && isVisible(headlineEl)) {
-            headline = cleanText(headlineEl.innerText || headlineEl.textContent);
+        if (belowImageTexts.length > 0) {
+            // The first valid line below the image is normally the headline.
+            const firstShort = belowImageTexts.find(x => x.text.length >= 3 && x.text.length <= 120);
+            if (firstShort) headline = firstShort.text;
+
+            // Description is the next different, longer visible line under the same image.
+            const desc = belowImageTexts.find(x =>
+                x.text !== headline &&
+                x.text.length >= 8 &&
+                x.text.length <= 220
+            );
+            if (desc) description = desc.text;
+
+            // If the only below-image text is long, treat it as description instead of headline.
+            if (headline === "N/A") {
+                const longLine = belowImageTexts.find(x => x.text.length >= 8 && x.text.length <= 220);
+                if (longLine) description = longLine.text;
+            }
+
+            if (headline !== "N/A" || description !== "N/A") {
+                return { headline, description, method: "below_image" };
+            }
         }
 
-        const descriptionEl = document.querySelector('div.HFTpmd-WsjYwc-hgDUwe, div.cS4Vcb-vnv8ic');
-        if (descriptionEl && isVisible(descriptionEl)) {
-            description = cleanText(descriptionEl.innerText || descriptionEl.textContent);
-        }
+        // 3) Fallback for normal text ads / layouts with known Google creative classes.
+        const headlineSelectors = [
+            '[class*="-e-15"]',
+            '[class*="headline"]',
+            '[aria-label*="Headline"]',
+            '[aria-label*="headline"]',
+            'div[role="link"] span',
+            'div.HFTpmd-WsjYwc-hgDUwe',
+            'div.cS4Vcb-vnv8ic'
+        ];
 
-        return { headline, description };
+        const descSelectors = [
+            '[class*="-e-67"]',
+            '[class*="long-description"]',
+            '[class*="description"]',
+            '[aria-label*="Description"]',
+            '[aria-label*="description"]',
+            'div.HFTpmd-WsjYwc-hgDUwe',
+            'div.cS4Vcb-vnv8ic'
+        ];
+
+        const pickFromSelectors = (selectors, minLen, maxLen, notEqual) => {
+            for (const selector of selectors) {
+                for (const el of Array.from(document.querySelectorAll(selector))) {
+                    if (!isVisible(el)) continue;
+                    const txt = cleanText(el.innerText || el.textContent || "");
+                    if (isBadText(txt, el)) continue;
+                    if (notEqual && txt === notEqual) continue;
+                    if (txt.length >= minLen && txt.length <= maxLen) return txt;
+                }
+            }
+            return "N/A";
+        };
+
+        headline = pickFromSelectors(headlineSelectors, 3, 120, null);
+        description = pickFromSelectors(descSelectors, 8, 220, headline);
+
+        return { headline, description, method: "selector_fallback" };
     }
     """
 
@@ -1319,16 +1521,21 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
     start_time = time.time()
 
     while time.time() - start_time < max_wait_seconds:
-        # 1) Check main page DOM first (active visible creative)
-        data = read_target(page)
-        if data:
-            return data
+        targets = []
 
-        # 2) Fallback: check iframes only if main DOM didn't yield headline/description
-        for frame in page.frames:
-            if frame == page.main_frame:
-                continue
-            data = read_target(frame)
+        # Prefer the ranked active creative iframe/page. This avoids stale repeated ad iframes.
+        try:
+            ranked = get_ranked_non_video_targets(page)
+            targets = [item[1] for item in ranked]
+        except Exception:
+            targets = []
+
+        # Safety fallback if ranking returns nothing.
+        if not targets:
+            targets = [page] + [frame for frame in page.frames if frame != page.main_frame]
+
+        for target in targets:
+            data = read_target(target)
             if data:
                 return data
 
@@ -1539,7 +1746,7 @@ def scrape_single_url(url_row):
             visible_package = extract_package_name(visible_app_link)
 
             is_image_like = has_visible_image_creative(page)
-            ad_type = "text" if has_text else "image" if (is_image_like or visible_package != "N/A") else "N/A"
+            ad_type = "image" if is_image_like else "text" if has_text else "image" if visible_package != "N/A" else "N/A"
 
             if not has_text and visible_package == "N/A" and not is_image_like:
                 data = [
@@ -1615,7 +1822,7 @@ def scrape_single_url(url_row):
             ]
 
             safe_update_combined_row(row_num, data)
-            safe_update_headline_desc(row_num, headline if has_text else "N/A", description if has_text else "N/A")
+            safe_update_headline_desc(row_num, headline, description)
             safe_update_image_url(row_num, image_url)
 
             safe_add_log(
