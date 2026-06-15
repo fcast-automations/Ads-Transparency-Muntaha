@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import difflib
 import re
+import html
 
 def get_best_matching_package_for_text_ad(headline, description, package_list, min_score=0.70):
     """Matches package names with headline + description using character-level comparison."""
@@ -949,22 +950,28 @@ def get_best_matching_package(headline, description, package_list, min_score=MIN
     return None, best_score
 
 def decode_all(text):
-    """Decode every encoding variant so no package name is missed."""
-    text = re.sub(r'\\x3[Dd]', '=', text)
-    text = re.sub(r'\\x26',    '&', text)
-    text = re.sub(r'\\x3[Ff]', '?', text)
-    text = re.sub(r'\\x2[Ff]', '/', text)
-    text = re.sub(r'\\u003[Dd]', '=', text)
-    text = re.sub(r'\\u0026',    '&', text)
-    text = re.sub(r'\\u003[Ff]', '?', text)
-    text = re.sub(r'%3[Dd]', '=', text, flags=re.I)
-    text = re.sub(r'%26',    '&', text, flags=re.I)
-    text = re.sub(r'%3[Ff]', '?', text, flags=re.I)
-    text = re.sub(r'%2[Ff]', '/', text, flags=re.I)
-    text = re.sub(r'%3[Aa]', ':', text, flags=re.I)
-    text = (text.replace('&amp;', '&').replace('&quot;', '"')
-                .replace('&#38;', '&').replace('&#61;', '=')
-                .replace('&#x3D;', '=').replace('&#x26;', '&'))
+    """Decode JS, URL, and HTML encoding variants so package names inside adData are not missed."""
+    if text is None:
+        return ""
+
+    text = str(text)
+
+    def decode_js_escapes(value):
+        # Google creatives often encode URLs as \x3d, \x26, \x2f, \u003d, etc.
+        value = re.sub(r'\\x([0-9A-Fa-f]{2})', lambda m: chr(int(m.group(1), 16)), value)
+        value = re.sub(r'\\u00([0-9A-Fa-f]{2})', lambda m: chr(int(m.group(1), 16)), value)
+        value = re.sub(r'\\u([0-9A-Fa-f]{4})', lambda m: chr(int(m.group(1), 16)), value)
+        return value
+
+    for _ in range(4):
+        before = text
+        text = html.unescape(text)
+        text = unquote(text)
+        text = decode_js_escapes(text)
+        text = text.replace('\\"', '"').replace("\\'", "'").replace('\\/', '/')
+        if text == before:
+            break
+
     return text
 
 
@@ -987,23 +994,118 @@ def _is_valid_pkg(pkg):
             return False
     return True
 
+
+_APP_ID_KEY_RE = r"(?:appId|appid|app_id|applicationId|application_id|packageName|package_name|androidPackageName|android_package_name)"
+_PACKAGE_RE = r"[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*){2,}"
+
+
+def _clean_package_candidate(pkg):
+    """Normalize a possible Android package/app id and reject non-package values."""
+    if not pkg:
+        return None
+
+    pkg = str(pkg).strip()
+    pkg = pkg.rstrip(".,;:'\"\\)}]")
+    pkg = pkg.lstrip("'\"({[")
+    pkg = pkg.replace('\\/', '/').strip()
+
+    if _is_valid_pkg(pkg):
+        return pkg
+    return None
+
+
+def _add_unique_package(candidates, pkg):
+    pkg = _clean_package_candidate(pkg)
+    if pkg and pkg not in candidates:
+        candidates.append(pkg)
+
+
+def extract_ad_data_appids_from_text(raw_text):
+    """
+    Extract exact Android package names from Google creative JS such as:
+        var adData = { appId: "com.example.app" }
+        var addata = { appid: "com.example.app" }
+        {"adData":{"appId":"com.example.app"}}
+
+    This is prioritized over fuzzy headline/package matching because appId is the
+    package name supplied by the creative itself.
+    """
+    if not raw_text:
+        return []
+
+    text = decode_all(str(raw_text))
+    candidates = []
+
+    # Highest priority: appId/appid found close to a var/object named adData/addata.
+    focused_patterns = [
+        rf"""(?is)\b(?:var|let|const)\s+(?:adData|addata|AD_DATA|ad_data)\s*=\s*[\s\S]{{0,12000}}?\b{_APP_ID_KEY_RE}\b\s*[:=]\s*[\"']?({_PACKAGE_RE})[\"']?""",
+        rf"""(?is)[\"']?(?:adData|addata|AD_DATA|ad_data)[\"']?\s*[:=]\s*[\s\S]{{0,12000}}?\b{_APP_ID_KEY_RE}\b\s*[:=]\s*[\"']?({_PACKAGE_RE})[\"']?""",
+        rf"""(?is)\b(?:adData|addata|AD_DATA|ad_data)\b[\s\S]{{0,12000}}?\b{_APP_ID_KEY_RE}\b\s*[:=]\s*[\"']?({_PACKAGE_RE})[\"']?""",
+    ]
+
+    for pat in focused_patterns:
+        for m in re.finditer(pat, text, re.IGNORECASE):
+            _add_unique_package(candidates, m.group(1))
+
+    # Some creatives do not expose appId as a key, but put the Play Store URL
+    # inside var adData.google_click_url / click_url / adurl.
+    addata_blocks = []
+    for block_match in re.finditer(r"(?is)\b(?:var|let|const)\s+(?:adData|addata|AD_DATA|ad_data)\s*=\s*[\s\S]{0,20000}", text):
+        addata_blocks.append(block_match.group(0))
+    for block_match in re.finditer(r"(?is)[\"']?(?:adData|addata|AD_DATA|ad_data)[\"']?\s*[:=]\s*[\s\S]{0,20000}", text):
+        addata_blocks.append(block_match.group(0))
+
+    url_patterns = [
+        rf"""(?is)play\.google\.com/store/apps/details[^\s'\"<>]*[?&]id=({_PACKAGE_RE})""",
+        rf"""(?is)[?&](?:id|package|appId|appid|app_id)=({_PACKAGE_RE})""",
+    ]
+
+    for block in addata_blocks:
+        block = decode_all(block)
+        for pat in url_patterns:
+            for m in re.finditer(pat, block, re.IGNORECASE):
+                _add_unique_package(candidates, m.group(1))
+
+    # General exact keys. This catches unquoted JS keys and normal quoted JSON keys.
+    general_patterns = [
+        rf"""(?is)\b{_APP_ID_KEY_RE}\b\s*[:=]\s*[\"']?({_PACKAGE_RE})[\"']?""",
+        rf"""(?is)[\"']{_APP_ID_KEY_RE}[\"']\s*:\s*[\"']({_PACKAGE_RE})[\"']""",
+        rf"""(?is)\\?[\"']{_APP_ID_KEY_RE}\\?[\"']\s*:\s*\\?[\"']({_PACKAGE_RE})\\?[\"']""",
+    ]
+
+    for pat in general_patterns:
+        for m in re.finditer(pat, text, re.IGNORECASE):
+            _add_unique_package(candidates, m.group(1))
+
+    return candidates
+
+
+def extract_ad_data_appid_from_text(raw_text):
+    packages = extract_ad_data_appids_from_text(raw_text)
+    return packages[0] if packages else "N/A"
+
 def extract_packages_from_text(raw_text):
     """Returns a SET of all unique, valid package names found in the text."""
     text = decode_all(raw_text)
-    candidates = set()   
+    candidates = set()
+
+    # Exact package name from var adData/appId should be captured directly.
+    for pkg in extract_ad_data_appids_from_text(text):
+        if _is_valid_pkg(pkg):
+            candidates.add(pkg)
 
     patterns = [
         r"""['"]appId['"]\s*:\s*['"]([A-Za-z][\w.]+)['"]""",
+        r"""\b(?:appId|appid|app_id|applicationId|application_id|packageName|package_name)\b\s*[:=]\s*['"]?([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*){2,})['"]?""",
         r"""play\.google\.com/store/apps/details[^\s'"<>]*[?&]id=([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*){2,})""",
         r"""market://[^\s'"]*[?&]id=([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*){2,})""",
-        r"""(?:destination_url|final_url|click_url|destUrl|clickUrl|landingUrl)['"\s]*:['"\s]*['"][^'"]*[?&]id=([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*){2,})""",
-        r"""[?&]id=([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*){2,})""",
-        r"""[?&]package=([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*){2,})"""
+        r"""(?:destination_url|final_url|click_url|destUrl|clickUrl|landingUrl|google_click_url)['"\s]*[:=]['"\s]*['"]?[^'"]*[?&]id=([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*){2,})""",
+        r"""[?&](?:id|package|appId|appid|app_id)=([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*){2,})"""
     ]
 
     for pat in patterns:
         for m in re.finditer(pat, text, re.IGNORECASE):
-            pkg = m.group(1).rstrip('.,;\'"\\ ')
+            pkg = m.group(1).rstrip('.,;\'"\\ )]}')
             if _is_valid_pkg(pkg):
                 candidates.add(pkg)
 
@@ -1056,6 +1158,155 @@ def extract_package_from_page(page):
 
     combined = '\n'.join(collected_texts)
     return extract_packages_from_text(combined)
+
+
+def extract_ad_data_appid_from_target(target):
+    """
+    Reads var adData/addata/appId from one Playwright page/frame.
+    Uses both live JS objects and script/HTML text, then validates with Python.
+    """
+    js = r"""
+    () => {
+        const pkgRe = /^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*){2,}$/;
+        const badPrefixRe = /^(com\.google\.android\.(gms|vending|inputmethod|tts|webview)|com\.android\.|android\.|androidx\.|kotlin\.|kotlinx\.|com\.squareup\.|io\.reactivex\.|okhttp3\.|javax\.|java\.|org\.json\.|org\.apache\.)/i;
+        const keyRe = /^(appId|appid|app_id|applicationId|application_id|packageName|package_name|androidPackageName|android_package_name)$/i;
+
+        const isValidPkg = (value) => {
+            if (typeof value !== 'string') return false;
+            const v = value.trim();
+            return pkgRe.test(v) && !badPrefixRe.test(v);
+        };
+
+        const seen = new WeakSet();
+        const walk = (obj, depth = 0) => {
+            if (obj === null || obj === undefined || depth > 6) return null;
+
+            if (typeof obj === 'string') {
+                if (isValidPkg(obj)) return obj.trim();
+                return null;
+            }
+
+            if (typeof obj !== 'object') return null;
+            if (seen.has(obj)) return null;
+            seen.add(obj);
+
+            // First pass: exact appId/package keys.
+            for (const k of Object.keys(obj)) {
+                try {
+                    if (keyRe.test(String(k))) {
+                        const v = obj[k];
+                        if (isValidPkg(v)) return String(v).trim();
+                        if (typeof v === 'object') {
+                            const found = walk(v, depth + 1);
+                            if (found) return found;
+                        }
+                    }
+                } catch (e) {}
+            }
+
+            // Second pass: recurse into likely adData/creative children only.
+            for (const k of Object.keys(obj)) {
+                try {
+                    const lower = String(k).toLowerCase();
+                    if (lower.includes('addata') || lower.includes('ad_data') || lower.includes('creative') || lower.includes('asset')) {
+                        const found = walk(obj[k], depth + 1);
+                        if (found) return found;
+                    }
+                } catch (e) {}
+            }
+
+            return null;
+        };
+
+        const roots = ['adData', 'addata', 'AD_DATA', 'ad_data', 'googleAdData', 'GoogleAdData'];
+        for (const name of roots) {
+            try {
+                if (Object.prototype.hasOwnProperty.call(window, name)) {
+                    const found = walk(window[name], 0);
+                    if (found) return found;
+                }
+            } catch (e) {}
+        }
+
+        return null;
+    }
+    """
+
+    try:
+        pkg = target.evaluate(js)
+        pkg = _clean_package_candidate(pkg)
+        if pkg:
+            return pkg
+    except Exception:
+        pass
+
+    # Fallback: scan scripts + HTML for "var adData = ... appId ...".
+    try:
+        raw = target.evaluate("""
+            () => {
+                const scripts = Array.from(document.scripts || []).map(s => s.textContent || '').join('\n');
+                const html = document.documentElement ? document.documentElement.outerHTML : '';
+                return scripts + '\n' + html;
+            }
+        """)
+        pkg = extract_ad_data_appid_from_text(raw)
+        if pkg != "N/A":
+            return pkg
+    except Exception:
+        pass
+
+    return "N/A"
+
+
+def extract_ad_data_appid_from_page(page):
+    """Extracts package name from var adData/addata appId, prioritizing the active creative frame."""
+    targets = []
+    seen = set()
+
+    def add_target(target):
+        key = id(target)
+        if key not in seen:
+            targets.append(target)
+            seen.add(key)
+
+    # Prefer the same ranked creative frames used for headline/description/image extraction.
+    try:
+        for item in get_ranked_non_video_targets(page):
+            if len(item) >= 2:
+                add_target(item[1])
+    except Exception:
+        pass
+
+    # Then scan every frame and finally the main page as fallback.
+    for frame in page.frames:
+        try:
+            add_target(frame)
+        except Exception:
+            continue
+
+    add_target(page)
+
+    for target in targets:
+        try:
+            pkg = extract_ad_data_appid_from_target(target)
+            if pkg != "N/A":
+                return pkg
+        except Exception:
+            continue
+
+    return "N/A"
+
+
+def wait_and_extract_ad_data_appid(page, max_wait_seconds=8):
+    """Polls briefly because the creative iframe/adData object may load after DOMContentLoaded."""
+    start = time.time()
+    while time.time() - start < max_wait_seconds:
+        pkg = extract_ad_data_appid_from_page(page)
+        if pkg != "N/A":
+            return pkg
+        page.wait_for_timeout(1000)
+    return "N/A"
+
 
 def extract_advertiser_from_page(page):
     try:
@@ -1491,7 +1742,18 @@ def scrape_single_url(url_row):
                     status = "SUCCESS"
                     message = "Video ID and app link saved"
 
-                package_name = extract_package_name(app_link)
+                ad_data_package = wait_and_extract_ad_data_appid(page, max_wait_seconds=6)
+                package_from_app_link = extract_package_name(app_link)
+
+                if ad_data_package != "N/A":
+                    package_name = ad_data_package
+                    if package_from_app_link == "N/A" or package_from_app_link != package_name:
+                        app_link = f"https://play.google.com/store/apps/details?id={package_name}"
+                    status = "SUCCESS"
+                    message = "Video ID saved; package extracted from var adData/appId"
+                    print(f"📦 Row {row_num}: package from var adData.appId -> {package_name}")
+                else:
+                    package_name = package_from_app_link
 
                 data = [
                     advertiser,
@@ -1538,10 +1800,13 @@ def scrape_single_url(url_row):
             visible_app_link = wait_and_extract_install_link(page, max_wait_seconds=8)
             visible_package = extract_package_name(visible_app_link)
 
-            is_image_like = has_visible_image_creative(page)
-            ad_type = "text" if has_text else "image" if (is_image_like or visible_package != "N/A") else "N/A"
+            # Exact package from the creative JS: var adData/addata -> appId/appid.
+            ad_data_package = wait_and_extract_ad_data_appid(page, max_wait_seconds=6)
 
-            if not has_text and visible_package == "N/A" and not is_image_like:
+            is_image_like = has_visible_image_creative(page)
+            ad_type = "text" if has_text else "image" if (is_image_like or visible_package != "N/A" or ad_data_package != "N/A" or image_url != "N/A") else "N/A"
+
+            if not has_text and visible_package == "N/A" and ad_data_package == "N/A" and image_url == "N/A" and not is_image_like:
                 data = [
                     advertiser,
                     "N/A",
@@ -1574,9 +1839,16 @@ def scrape_single_url(url_row):
             else:
                 print(f"🖼 Row {row_num}: likely image ad, headline/description not found")
 
-            print(f"📦 Row {row_num}: resolving package from visible install link first")
+            print(f"📦 Row {row_num}: resolving package from var adData.appId first")
 
-            if visible_package != "N/A":
+            if ad_data_package != "N/A":
+                package_name = ad_data_package
+                app_link = f"https://play.google.com/store/apps/details?id={package_name}"
+                match_score = 1.0
+                status = "SUCCESS"
+                message = f"Non-video {ad_type} ad package extracted from var adData/appId"
+                print(f"✅ Row {row_num}: package from var adData.appId -> {package_name}")
+            elif visible_package != "N/A":
                 package_name = visible_package
                 app_link = visible_app_link
                 match_score = 1.0
@@ -1588,7 +1860,7 @@ def scrape_single_url(url_row):
                 match_score = 0.0
 
                 if has_text:
-                    print(f"📦 Row {row_num}: visible install link not found, strict matching with headline + description")
+                    print(f"📦 Row {row_num}: var adData.appId and visible install link not found, strict matching with headline + description")
                     all_found_packages = extract_package_from_page(page)
                     package_name, match_score = get_best_matching_package(headline, description, all_found_packages)
 
@@ -1601,8 +1873,8 @@ def scrape_single_url(url_row):
                     package_name = "N/A"
                     app_link = "N/A"
                     status = "NON_VIDEO_PACKAGE_NOT_FOUND"
-                    message = f"Non-video {ad_type} ad found, but package score below 0.76. Best score={match_score}"
-                    print(f"⚠️ Row {row_num}: package score below 0.76, writing N/A | best score={match_score}")
+                    message = f"Non-video {ad_type} ad found, but no var adData.appId, visible install link, or strict text package match. Best score={match_score}"
+                    print(f"⚠️ Row {row_num}: no var adData.appId / visible install link / strict package match, writing N/A | best score={match_score}")
 
             data = [
                 advertiser,
