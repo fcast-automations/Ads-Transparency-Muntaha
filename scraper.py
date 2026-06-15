@@ -44,10 +44,6 @@ import sheets
 MAX_WORKERS = 2
 SHEET_LOCK = threading.Lock()
 
-# Clear Playwright browser cache/storage before and after each row.
-# This helps avoid stale creative data carrying over between Transparency URLs.
-CLEAR_BROWSER_CACHE_EACH_ROW = True
-
 VIDEO_EXTENSIONS = (".mp4", ".webm", ".mov", ".m4v", ".m3u8")
 
 INSTALL_SELECTORS = [
@@ -129,150 +125,6 @@ def safe_add_log(row_number, status, log_type, url="", video_id="", app_link="",
         except Exception as e:
             print(f"⚠️ Failed to add log for row {row_number}: {e}")
             return False
-
-
-
-def clear_cache(context=None, page=None, row_num=None, reason=""):
-    """
-    Clears Playwright browser cache/cookies/storage safely.
-
-    This is intentionally non-fatal: cache clearing should never turn a good scrape into ERROR.
-    It clears:
-    - Chromium HTTP browser cache via CDP
-    - Chromium cookies via CDP + BrowserContext.clear_cookies()
-    - localStorage/sessionStorage
-    - CacheStorage caches
-    - registered service workers
-    - IndexedDB/WebSQL/FileSystem/etc. for the current origin when available
-    """
-    if not CLEAR_BROWSER_CACHE_EACH_ROW:
-        return False
-
-    label = f"Row {row_num}: " if row_num else ""
-    did_clear = False
-
-    # BrowserContext-level cookies/permissions.
-    try:
-        if context is not None:
-            try:
-                context.clear_cookies()
-                did_clear = True
-            except Exception:
-                pass
-            try:
-                context.clear_permissions()
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    if page is None:
-        return did_clear
-
-    # CDP cache/cookie/storage clearing for Chromium.
-    cdp = None
-    try:
-        if context is not None and not page.is_closed():
-            cdp = context.new_cdp_session(page)
-            try:
-                cdp.send("Network.enable")
-            except Exception:
-                pass
-            try:
-                cdp.send("Network.setCacheDisabled", {"cacheDisabled": True})
-            except Exception:
-                pass
-            try:
-                cdp.send("Network.clearBrowserCache")
-                did_clear = True
-            except Exception:
-                pass
-            try:
-                cdp.send("Network.clearBrowserCookies")
-                did_clear = True
-            except Exception:
-                pass
-
-            try:
-                origin = page.evaluate("() => location.origin")
-                if origin and origin not in ("null", "about:blank"):
-                    cdp.send("Storage.clearDataForOrigin", {
-                        "origin": origin,
-                        "storageTypes": "all"
-                    })
-                    did_clear = True
-            except Exception:
-                pass
-    except Exception as e:
-        print(f"⚠️ {label}cache clear CDP ignored: {e}")
-    finally:
-        try:
-            if cdp is not None:
-                cdp.detach()
-        except Exception:
-            pass
-
-    # DOM storage / CacheStorage / service workers. Run in page + frames where allowed.
-    clear_js = r"""
-    async () => {
-        try { localStorage.clear(); } catch (e) {}
-        try { sessionStorage.clear(); } catch (e) {}
-        try {
-            if ('caches' in window) {
-                const keys = await caches.keys();
-                await Promise.all(keys.map(k => caches.delete(k)));
-            }
-        } catch (e) {}
-        try {
-            if (navigator.serviceWorker && navigator.serviceWorker.getRegistrations) {
-                const regs = await navigator.serviceWorker.getRegistrations();
-                await Promise.all(regs.map(r => r.unregister()));
-            }
-        } catch (e) {}
-        try { performance.clearResourceTimings(); } catch (e) {}
-        return true;
-    }
-    """
-
-    targets = []
-    try:
-        if not page.is_closed():
-            targets.append(page)
-            targets.extend([f for f in page.frames if f != page.main_frame])
-    except Exception:
-        targets = []
-
-    for target in targets:
-        try:
-            target.evaluate(clear_js)
-            did_clear = True
-        except Exception:
-            continue
-
-    if did_clear and reason:
-        print(f"🧹 {label}cache cleared ({reason})")
-    return did_clear
-
-
-def safe_clear_sheet_cache(flush_pending_logs=True):
-    """
-    Optional helper for the cached gspread worksheet in sheets.py.
-    Only works if the updated sheets.py has clear_sheet_cache().
-    """
-    with SHEET_LOCK:
-        try:
-            if hasattr(sheets, "clear_sheet_cache"):
-                sheets.clear_sheet_cache(flush_pending_logs=flush_pending_logs)
-                return True
-        except TypeError:
-            try:
-                sheets.clear_sheet_cache()
-                return True
-            except Exception:
-                pass
-        except Exception as e:
-            print(f"⚠️ Failed to clear sheet cache: {e}")
-    return False
 
 def get_exact_time():
     return datetime.now().strftime("%I:%M:%S %p")
@@ -1132,212 +984,6 @@ def extract_package_from_page(page):
     combined = '\n'.join(collected_texts)
     return extract_packages_from_text(combined)
 
-
-
-# =========================
-# var adData / appId PACKAGE EXTRACTION
-# =========================
-
-_PACKAGE_RE = r"[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*){2,}"
-_APP_ID_KEY_RE = r"(?:appId|appid|app_id|applicationId|androidPackageName|packageName)"
-
-
-def decode_ad_data_text(raw_text):
-    """Decode JS / URL / HTML escaped adData so appId can be read from script text."""
-    text = str(raw_text or "")
-    for _ in range(4):
-        before = text
-        try:
-            text = html.unescape(text)
-        except Exception:
-            pass
-        try:
-            text = decode_all(text)
-        except Exception:
-            pass
-        try:
-            text = unquote(text)
-        except Exception:
-            pass
-
-        # Decode common JavaScript escaping seen in inspect element: \x22, \x3d, \u003d, \/ etc.
-        text = text.replace(r"\/", "/")
-        try:
-            text = re.sub(r"\\x([0-9A-Fa-f]{2})", lambda m: chr(int(m.group(1), 16)), text)
-            text = re.sub(r"\\u([0-9A-Fa-f]{4})", lambda m: chr(int(m.group(1), 16)), text)
-        except Exception:
-            pass
-
-        if text == before:
-            break
-    return text
-
-
-def extract_package_from_ad_data_text(raw_text):
-    """
-    Returns the first valid Android package found specifically around var adData/appId.
-    This is higher priority than visible Install link and fuzzy text matching.
-    """
-    text = decode_ad_data_text(raw_text)
-    if not text:
-        return "N/A"
-
-    candidates = []
-
-    # Prefer a package close to an adData/addata object name.
-    addata_block_patterns = [
-        r"(?is)\b(?:var|let|const|window\.)?\s*(?:adData|addata|AD_DATA|ad_data|googleAdData|GoogleAdData)\b[\s\S]{0,25000}",
-        r"(?is)[\"']?(?:adData|addata|AD_DATA|ad_data|googleAdData|GoogleAdData)[\"']?\s*[:=][\s\S]{0,25000}",
-    ]
-
-    blocks = []
-    for pat in addata_block_patterns:
-        for m in re.finditer(pat, text):
-            blocks.append(m.group(0))
-
-    # If the entire string is clearly an adData/script chunk, keep it as a fallback block too.
-    if re.search(r"(?i)adData|addata|appId|appid|applicationId|play\.google\.com|market://", text):
-        blocks.append(text[:250000])
-
-    for block in blocks:
-        block = decode_ad_data_text(block)
-
-        direct_patterns = [
-            rf"(?is)\b{_APP_ID_KEY_RE}\b\s*[:=]\s*[\"']?({_PACKAGE_RE})[\"']?",
-            rf"(?is)[\"']{_APP_ID_KEY_RE}[\"']\s*[:=]\s*[\"']({_PACKAGE_RE})[\"']",
-        ]
-        for pat in direct_patterns:
-            for m in re.finditer(pat, block):
-                pkg = m.group(1).rstrip(".,;'\\\" ")
-                if _is_valid_pkg(pkg):
-                    candidates.append(pkg)
-
-        link_patterns = [
-            rf"(?is)play\.google\.com/store/apps/details[^\s'\"<>]*[?&]id=({_PACKAGE_RE})",
-            rf"(?is)market://[^\s'\"<>]*[?&]id=({_PACKAGE_RE})",
-            rf"(?is)(?:adurl|url|q|u|destination|destination_url|final_url|click_url|landingUrl)[^\n\r'\"<>]{{0,5000}}[?&]id=({_PACKAGE_RE})",
-        ]
-        for pat in link_patterns:
-            for m in re.finditer(pat, block):
-                pkg = m.group(1).rstrip(".,;'\\\" ")
-                if _is_valid_pkg(pkg):
-                    candidates.append(pkg)
-
-    if candidates:
-        # Preserve first high-confidence hit but remove duplicates.
-        return list(dict.fromkeys(candidates))[0]
-
-    return "N/A"
-
-
-def extract_ad_data_text_from_target(target):
-    """Collects adData/appId-related text from one Playwright page/frame."""
-    js = r"""
-    () => {
-        const chunks = [];
-        const add = (value) => {
-            try {
-                if (value === undefined || value === null) return;
-                let text = '';
-                if (typeof value === 'string') text = value;
-                else text = JSON.stringify(value);
-                if (text && text.length > 0) chunks.push(text.slice(0, 250000));
-            } catch (e) {}
-        };
-
-        // Direct global variables, e.g. var adData = {...} / window.adData.
-        for (const name of ['adData','addata','AD_DATA','ad_data','googleAdData','GoogleAdData']) {
-            try { add(window[name]); } catch (e) {}
-        }
-
-        // Some creatives attach ad data under a longer global key.
-        try {
-            for (const key of Object.keys(window)) {
-                if (/adData|addata|googleAdData/i.test(key)) {
-                    try { add(window[key]); } catch (e) {}
-                }
-            }
-        } catch (e) {}
-
-        // Script text is what you see in Inspect Element: <script> var adData = {...} </script>
-        try {
-            for (const script of Array.from(document.scripts || [])) {
-                const text = script.textContent || '';
-                if (/adData|addata|appId|appid|applicationId|androidPackageName|packageName|play\.google\.com|market:\/\//i.test(text)) {
-                    chunks.push(text.slice(0, 250000));
-                }
-            }
-        } catch (e) {}
-
-        try {
-            const html = document.documentElement ? document.documentElement.outerHTML : '';
-            if (/adData|addata|appId|appid|applicationId|androidPackageName|packageName|play\.google\.com|market:\/\//i.test(html)) {
-                chunks.push(html.slice(0, 250000));
-            }
-        } catch (e) {}
-
-        return chunks.join('\n---AD-DATA-CHUNK---\n');
-    }
-    """
-    try:
-        return target.evaluate(js) or ""
-    except Exception:
-        return ""
-
-
-def extract_ad_data_appid_from_page(page):
-    """Extracts package name from var adData/addata appId, prioritizing active creative frames."""
-    targets = []
-    seen = set()
-
-    try:
-        for _score, target, _label, _info in get_ranked_non_video_targets(page):
-            if id(target) not in seen:
-                targets.append(target)
-                seen.add(id(target))
-    except Exception:
-        pass
-
-    try:
-        for frame in page.frames:
-            if frame == page.main_frame:
-                continue
-            if id(frame) not in seen:
-                targets.append(frame)
-                seen.add(id(frame))
-    except Exception:
-        pass
-
-    if id(page) not in seen:
-        targets.append(page)
-
-    combined_chunks = []
-    for target in targets:
-        raw = extract_ad_data_text_from_target(target)
-        if not raw:
-            continue
-        pkg = extract_package_from_ad_data_text(raw)
-        if pkg != "N/A":
-            return pkg
-        combined_chunks.append(raw)
-
-    # Final combined fallback across all targets.
-    if combined_chunks:
-        return extract_package_from_ad_data_text("\n".join(combined_chunks))
-
-    return "N/A"
-
-
-def wait_and_extract_ad_data_appid(page, max_wait_seconds=8):
-    """Poll briefly because the creative iframe/adData object may load after DOMContentLoaded."""
-    start = time.time()
-    while time.time() - start < max_wait_seconds:
-        pkg = extract_ad_data_appid_from_page(page)
-        if pkg != "N/A":
-            return pkg
-        page.wait_for_timeout(1000)
-    return "N/A"
-
 def extract_advertiser_from_page(page):
     try:
         loc = page.locator('.advertiser-title, [data-test-id="advertiser-name"]').first
@@ -1551,16 +1197,12 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
     """
     Extract headline and description from the active creative.
 
-    Important fix for image ads/card ads:
-    - First looks for the largest visible ad image/media box.
-    - Then reads the visible text directly BELOW that image.
-    - This matches the layout shown in your screenshot:
-          image
-          Headline
-          Description
-          CTA / Ad label
-    - Text printed inside the image itself is ignored.
-    - Install/Get/Ad labels, menu dots, feedback text, and Google UI text are ignored.
+    Improvements over the older version:
+    - Reads real text-node bounding boxes, not large wrapper div text.
+    - Gives priority to headline/description classes when they are present.
+    - Ignores Google Transparency UI, CTA buttons, URLs, dates, and metadata.
+    - Uses the active creative iframe ranking, and only uses the main page when it scores strongly.
+    - Chooses description from the text directly below/near the headline.
     """
     js = r"""
     () => {
@@ -1576,11 +1218,10 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
             'ads transparency center', 'ads transparency centre', 'see more ads',
             'report this ad', 'about this ad', 'why this ad', 'ad details',
             'last shown', 'shown in', 'app store', 'google play', 'itunes',
-            'visit site', 'shop now', 'watch now', 'details',
+            'visit site', 'shop now', 'watch now',
             'close', 'dismiss', 'hide', 'x', '×', 'ok', 'cancel', 'done', 'back', 'next',
             'feedback', 'send feedback', 'ad choices', 'adchoices', 'not interested',
-            'stop seeing this ad', 'always positive', 'always negative',
-            'main in price', 'main in prize', 'more options'
+            'stop seeing this ad', 'always positive', 'always negative'
         ]);
 
         const badContains = [
@@ -1596,19 +1237,15 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
         const isBadUiText = (txt) => {
             const text = cleanText(txt);
             if (!text) return true;
-            const lower = text.toLowerCase().replace(/^[\s.:-|•·]+|[\s.:-|•·]+$/g, '');
+            const lower = text.toLowerCase().replace(/^[\s.:-|•]+|[\s.:-|•]+$/g, '');
             if (!lower) return true;
             if (badExact.has(lower)) return true;
-            if (/^ad\s*[·•:.,\-]/i.test(lower)) return true;          // Ad · MAIN IN PRICE
-            if (/^[·•⋮︙.\-–—]+$/u.test(lower)) return true;          // menu dots / decorative symbols
-            if (/^always\s+(positive|negative|on|off|allow|deny)$/i.test(lower)) return true;
+            if (/^always\s+(positive|negative|on|off|allow|deny)$/.test(lower)) return true;
             if (badContains.some(b => lower.includes(b))) return true;
             if (/^[\d\W_]+$/u.test(lower)) return true;
             if (text.length > 260) return true;
             return false;
         };
-
-        const norm = (txt) => cleanText(txt).toLowerCase().replace(/[\W_]+/gu, '');
 
         const metaFor = (el) => {
             const cls = String(el?.className || '').toLowerCase();
@@ -1622,272 +1259,22 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
                 tag,
                 isHeadlineClass: cls.includes('headline') || cls.includes('-e-15') || aria.includes('headline') || role === 'heading',
                 isDescriptionClass: cls.includes('description') || cls.includes('long-description') || cls.includes('-e-67') || aria.includes('description'),
-                isButtonLike: tag === 'button' || role === 'button' || cls.includes('button') || cls.includes('install')
+                isButtonLike: tag === 'button' || role === 'button' || cls.includes('button')
             };
         };
 
-        const visibleRect = (el, rect = null, viewportStrict = true) => {
+        const visibleRect = (el, rect = null) => {
             if (!el) return null;
             const r = rect || el.getBoundingClientRect();
             const style = window.getComputedStyle(el);
             if (r.width <= 1 || r.height <= 1) return null;
-            if (viewportStrict) {
-                if (r.bottom <= 0 || r.right <= 0 || r.top >= window.innerHeight || r.left >= window.innerWidth) return null;
-            }
+            if (r.bottom <= 0 || r.right <= 0 || r.top >= window.innerHeight || r.left >= window.innerWidth) return null;
             if (style.visibility === 'hidden' || style.display === 'none' || style.opacity === '0') return null;
             return r;
         };
 
-        const badImage = (el) => {
-            const src = String(el?.currentSrc || el?.src || el?.getAttribute?.('src') || '').toLowerCase();
-            const alt = String(el?.getAttribute?.('alt') || '').toLowerCase();
-            const cls = String(el?.className || '').toLowerCase();
-            if (src.includes('googlelogo') || alt.includes('google logo')) return true;
-            if (src.includes('/branding/') && src.includes('google')) return true;
-            if (src.includes('favicon') || src.endsWith('/favicon.ico')) return true;
-            if (src.includes('adchoices') || cls.includes('adchoices')) return true;
-            return false;
-        };
-
-        const getMediaBoxes = () => {
-            const boxes = [];
-            const addBox = (el, kind, bonus = 0) => {
-                const r = visibleRect(el);
-                if (!r) return;
-                if (r.width < 110 || r.height < 70) return;
-                if (badImage(el)) return;
-
-                let score = r.width * r.height + bonus;
-                const ratio = r.width / Math.max(r.height, 1);
-                if (ratio >= 1.1 && ratio <= 3.5) score += 25000;      // common landscape ad image/card media
-                if (r.top >= -10 && r.top <= 520) score += 10000;       // ad image is normally above text
-                if (kind === 'background') score += 6000;
-                if (kind === 'img') score += 7000;
-                if (kind === 'canvas' || kind === 'svg') score += 3500;
-
-                boxes.push({
-                    el, kind, score,
-                    top: r.top, bottom: r.bottom, left: r.left, right: r.right,
-                    width: r.width, height: r.height,
-                    centerX: r.left + r.width / 2,
-                    centerY: r.top + r.height / 2
-                });
-            };
-
-            for (const img of Array.from(document.querySelectorAll('img'))) {
-                addBox(img, 'img', 7000);
-            }
-            for (const el of Array.from(document.querySelectorAll('picture, canvas, svg'))) {
-                addBox(el, String(el.tagName || '').toLowerCase(), 3500);
-            }
-            for (const el of Array.from(document.querySelectorAll('body *'))) {
-                const r = visibleRect(el);
-                if (!r || r.width < 120 || r.height < 80) continue;
-                const bg = window.getComputedStyle(el).backgroundImage || '';
-                if (bg && bg !== 'none' && bg.includes('url(')) {
-                    addBox(el, 'background', 6000);
-                }
-            }
-
-            // Deduplicate nested boxes. Keep the bigger/more specific one.
-            boxes.sort((a, b) => b.score - a.score);
-            const kept = [];
-            for (const b of boxes) {
-                const duplicate = kept.some(k =>
-                    Math.abs(k.left - b.left) <= 4 &&
-                    Math.abs(k.top - b.top) <= 4 &&
-                    Math.abs(k.width - b.width) <= 8 &&
-                    Math.abs(k.height - b.height) <= 8
-                );
-                if (!duplicate) kept.push(b);
-            }
-            return kept.slice(0, 8);
-        };
-
-        const collectTextLines = () => {
-            const textItems = [];
-            if (!document.body) return [];
-
-            const walker = document.createTreeWalker(
-                document.body,
-                NodeFilter.SHOW_TEXT,
-                {
-                    acceptNode: (node) => {
-                        const text = cleanText(node.nodeValue || '');
-                        if (text.length < 2 || isBadUiText(text)) return NodeFilter.FILTER_REJECT;
-                        const el = node.parentElement;
-                        if (!el) return NodeFilter.FILTER_REJECT;
-                        const tag = String(el.tagName || '').toLowerCase();
-                        if (['script', 'style', 'noscript', 'template'].includes(tag)) return NodeFilter.FILTER_REJECT;
-                        const meta = metaFor(el);
-                        if (meta.isButtonLike && isBadUiText(text)) return NodeFilter.FILTER_REJECT;
-                        return NodeFilter.FILTER_ACCEPT;
-                    }
-                }
-            );
-
-            while (walker.nextNode()) {
-                const node = walker.currentNode;
-                const el = node.parentElement;
-                try {
-                    const range = document.createRange();
-                    range.selectNodeContents(node);
-                    const rects = Array.from(range.getClientRects());
-                    const style = window.getComputedStyle(el);
-                    const fontSize = parseFloat(style.fontSize || '0') || 0;
-                    const rawWeight = String(style.fontWeight || '400');
-                    const fontWeight = rawWeight === 'bold' ? 700 : (parseInt(rawWeight, 10) || 400);
-                    const meta = metaFor(el);
-                    const text = cleanText(node.nodeValue || '');
-
-                    for (const rect of rects) {
-                        const r = visibleRect(el, rect);
-                        if (!r || r.width < 3 || r.height < 3) continue;
-                        textItems.push({
-                            text,
-                            el,
-                            top: r.top, bottom: r.bottom, left: r.left, right: r.right,
-                            width: r.width, height: r.height,
-                            centerX: r.left + r.width / 2,
-                            centerY: r.top + r.height / 2,
-                            fontSize, fontWeight,
-                            ...meta
-                        });
-                    }
-                } catch (e) {}
-            }
-
-            textItems.sort((a, b) => (a.top - b.top) || (a.left - b.left));
-            const groups = [];
-            for (const item of textItems) {
-                let g = groups.find(group => Math.abs(group.centerY - item.centerY) <= 6);
-                if (!g) {
-                    g = { items: [], centerY: item.centerY };
-                    groups.push(g);
-                }
-                g.items.push(item);
-                g.centerY = (g.centerY * (g.items.length - 1) + item.centerY) / g.items.length;
-            }
-
-            const lines = [];
-            for (const g of groups) {
-                const items = g.items.slice().sort((a, b) => a.left - b.left);
-                const rawText = cleanText(items.map(x => x.text).join(' '));
-                if (!rawText || isBadUiText(rawText)) continue;
-                const words = rawText.split(/\s+/).filter(Boolean);
-                if (words.length > 26) continue;
-
-                const left = Math.min(...items.map(x => x.left));
-                const right = Math.max(...items.map(x => x.right));
-                const top = Math.min(...items.map(x => x.top));
-                const bottom = Math.max(...items.map(x => x.bottom));
-                const fontSize = Math.max(...items.map(x => x.fontSize || 0));
-                const fontWeight = Math.max(...items.map(x => x.fontWeight || 400));
-                const meta = items.reduce((acc, x) => ({
-                    isHeadlineClass: acc.isHeadlineClass || x.isHeadlineClass,
-                    isDescriptionClass: acc.isDescriptionClass || x.isDescriptionClass,
-                    isButtonLike: acc.isButtonLike || x.isButtonLike,
-                    role: acc.role || x.role,
-                    tag: acc.tag || x.tag
-                }), {isHeadlineClass:false, isDescriptionClass:false, isButtonLike:false, role:'', tag:''});
-
-                lines.push({
-                    text: rawText,
-                    top, bottom, left, right,
-                    width: right - left,
-                    height: bottom - top,
-                    centerX: left + (right - left) / 2,
-                    centerY: top + (bottom - top) / 2,
-                    fontSize, fontWeight,
-                    el: items[0].el,
-                    ...meta
-                });
-            }
-
-            // Deduplicate exact normalized text/position.
-            const deduped = [];
-            const seen = new Set();
-            for (const line of lines.sort((a, b) => (a.top - b.top) || (a.left - b.left))) {
-                const key = `${norm(line.text)}:${Math.round(line.top / 4)}:${Math.round(line.left / 8)}`;
-                if (!norm(line.text) || seen.has(key)) continue;
-                seen.add(key);
-                deduped.push(line);
-            }
-            return deduped;
-        };
-
-        const pickBelowMediaText = () => {
-            const mediaBoxes = getMediaBoxes();
-            const lines = collectTextLines();
-            if (!mediaBoxes.length || !lines.length) return null;
-
-            for (const media of mediaBoxes) {
-                const nearby = lines
-                    .filter(line => {
-                        if (line.text.length > 180) return false;
-                        if (line.isButtonLike && isBadUiText(line.text)) return false;
-
-                        const gap = line.top - media.bottom;
-                        if (gap < -3 || gap > 270) return false;       // must be below image, not printed inside image
-
-                        const overlap = Math.min(line.right, media.right) - Math.max(line.left, media.left);
-                        const centerAligned = line.centerX >= media.left - 65 && line.centerX <= media.right + 65;
-                        const enoughOverlap = overlap >= Math.min(line.width, media.width) * 0.18;
-                        if (!centerAligned && !enoughOverlap) return false;
-
-                        // Avoid tiny labels/icons near the bottom row.
-                        if (line.height < 5 || line.width < 12) return false;
-                        return true;
-                    })
-                    .sort((a, b) => (a.top - b.top) || (a.left - b.left));
-
-                const valid = [];
-                const seenText = new Set();
-                for (const line of nearby) {
-                    const key = norm(line.text);
-                    if (!key || seenText.has(key)) continue;
-                    seenText.add(key);
-                    valid.push(line);
-                }
-
-                if (!valid.length) continue;
-
-                // The first real line below the image is the headline. In the screenshot this is:
-                // "Calculator Lock - Hide Photos".
-                const headlineLine = valid.find(line => {
-                    if (line.text.length < 3 || line.text.length > 120) return false;
-                    if (isBadUiText(line.text)) return false;
-                    return true;
-                });
-                if (!headlineLine) continue;
-
-                const descriptionLine = valid.find(line => {
-                    if (line === headlineLine) return false;
-                    if (line.top < headlineLine.bottom - 2) return false;
-                    if (line.top - headlineLine.bottom > 95) return false;
-                    if (line.text.length < 3 || line.text.length > 180) return false;
-                    if (isBadUiText(line.text)) return false;
-                    if (norm(line.text) === norm(headlineLine.text)) return false;
-                    if (norm(line.text) && norm(headlineLine.text).includes(norm(line.text))) return false;
-                    return true;
-                });
-
-                return {
-                    headline: headlineLine.text,
-                    description: descriptionLine ? descriptionLine.text : 'N/A',
-                    method: 'below-media'
-                };
-            }
-            return null;
-        };
-
-        const belowMedia = pickBelowMediaText();
-        if (belowMedia && belowMedia.headline && belowMedia.headline !== 'N/A') {
-            return belowMedia;
-        }
-
-        // Fallback for text-only creatives and layouts without a separate image/media box.
         const candidates = [];
+
         const addCandidate = (rawText, el, rect, source, boost = 0) => {
             const text = cleanText(rawText);
             if (isBadUiText(text)) return;
@@ -1920,6 +1307,7 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
             });
         };
 
+        // 1) Explicit headline/description selectors first.
         const explicitSelectors = [
             '[class*="-e-15"]', '[class*="headline"]', '[aria-label*="Headline"]', '[aria-label*="headline"]',
             '[role="heading"]', 'h1', 'h2', 'h3', 'h4',
@@ -1936,23 +1324,80 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
             addCandidate(text, el, el.getBoundingClientRect(), 'explicit', boost);
         }
 
-        const textLines = collectTextLines();
-        for (const line of textLines) {
-            const metaBoost = line.isHeadlineClass ? 320 : (line.isDescriptionClass ? 240 : 0);
-            addCandidate(line.text, line.el, line, 'text-line', 60 + metaBoost);
+        // 2) Text nodes: avoids picking wrapper divs that contain headline + desc + CTA together.
+        const textNodes = [];
+        if (document.body) {
+            const walker = document.createTreeWalker(
+                document.body,
+                NodeFilter.SHOW_TEXT,
+                {
+                    acceptNode: (node) => {
+                        const text = cleanText(node.nodeValue || '');
+                        if (text.length < 2 || isBadUiText(text)) return NodeFilter.FILTER_REJECT;
+                        const el = node.parentElement;
+                        if (!el) return NodeFilter.FILTER_REJECT;
+                        const tag = String(el.tagName || '').toLowerCase();
+                        if (['script', 'style', 'noscript', 'template'].includes(tag)) return NodeFilter.FILTER_REJECT;
+                        return NodeFilter.FILTER_ACCEPT;
+                    }
+                }
+            );
+
+            while (walker.nextNode()) {
+                const node = walker.currentNode;
+                const el = node.parentElement;
+                try {
+                    const range = document.createRange();
+                    range.selectNodeContents(node);
+                    const rect = range.getBoundingClientRect();
+                    const text = cleanText(node.nodeValue || '');
+                    if (!visibleRect(el, rect)) continue;
+                    const item = { text, el, rect };
+                    textNodes.push(item);
+                    addCandidate(text, el, rect, 'text-node', 35);
+                } catch (e) {}
+            }
+        }
+
+        // 3) Group text nodes on the same visual line. Some ads split a headline into many spans.
+        const sortedNodes = textNodes.slice().sort((a, b) => (a.rect.top - b.rect.top) || (a.rect.left - b.rect.left));
+        const lineGroups = [];
+        for (const n of sortedNodes) {
+            let group = lineGroups.find(g => Math.abs(g.top - n.rect.top) <= 5 && Math.abs(g.bottom - n.rect.bottom) <= 7);
+            if (!group) {
+                group = { top: n.rect.top, bottom: n.rect.bottom, nodes: [] };
+                lineGroups.push(group);
+            }
+            group.nodes.push(n);
+            group.top = (group.top + n.rect.top) / 2;
+            group.bottom = (group.bottom + n.rect.bottom) / 2;
+        }
+
+        for (const g of lineGroups) {
+            if (g.nodes.length < 2) continue;
+            const nodes = g.nodes.slice().sort((a, b) => a.rect.left - b.rect.left);
+            const text = cleanText(nodes.map(n => n.text).join(' '));
+            if (!text || isBadUiText(text)) continue;
+            const left = Math.min(...nodes.map(n => n.rect.left));
+            const right = Math.max(...nodes.map(n => n.rect.right));
+            const top = Math.min(...nodes.map(n => n.rect.top));
+            const bottom = Math.max(...nodes.map(n => n.rect.bottom));
+            addCandidate(text, nodes[0].el, { left, right, top, bottom, width: right - left, height: bottom - top }, 'line-group', 80);
         }
 
         if (!candidates.length) {
-            return { headline: 'N/A', description: 'N/A', method: 'none' };
+            return { headline: 'N/A', description: 'N/A' };
         }
 
+        // Deduplicate by normalized text. Keep the strongest visual/explicit occurrence.
+        const norm = (txt) => cleanText(txt).toLowerCase().replace(/[\W_]+/gu, '');
         const uniqueByText = new Map();
         for (const c of candidates) {
             const key = norm(c.text);
             if (!key) continue;
             let preScore = c.boost + c.fontSize * 100 + Math.min((c.width * c.height) / 25, 220);
             if (c.fontWeight >= 600) preScore += 70;
-            if (c.source === 'text-line') preScore += 50;
+            if (c.source === 'line-group') preScore += 50;
             if (c.isButtonLike) preScore -= 500;
             const prev = uniqueByText.get(key);
             if (!prev || preScore > prev.preScore) {
@@ -1969,7 +1414,8 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
             if (c.fontWeight >= 600) score += 80;
             if (c.isHeadlineClass) score += 700;
             if (c.role === 'link') score += 80;
-            if (c.source === 'text-line') score += 70;
+            if (c.source === 'line-group') score += 70;
+            if (c.source === 'text-node') score += 30;
             if (c.isDescriptionClass) score -= 180;
             if (c.isButtonLike) score -= 600;
             if (c.text.length > 105) score -= 100;
@@ -2009,6 +1455,8 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
         }
 
         let descriptionObj = descCandidates.length ? descCandidates[0] : null;
+
+        // Fallback: explicit description class anywhere in the same creative.
         if (!descriptionObj) {
             const explicitDesc = unique
                 .filter(c => norm(c.text) !== norm(headline))
@@ -2018,16 +1466,14 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
         }
 
         const description = descriptionObj ? descriptionObj.text : 'N/A';
-        return { headline, description, method: 'visual-candidate' };
+        return { headline, description };
     }
     """
 
-    def read_target(target, required_method=None):
+    def read_target(target):
         try:
             data = target.evaluate(js)
             if not data:
-                return None
-            if required_method and data.get("method") != required_method:
                 return None
 
             headline = clean_extracted_ad_copy(data.get("headline"))
@@ -2041,7 +1487,7 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
                     description = "N/A"
 
             if headline != "N/A" or description != "N/A":
-                return {"headline": headline, "description": description, "method": data.get("method", "unknown")}
+                return {"headline": headline, "description": description}
         except Exception:
             return None
         return None
@@ -2056,30 +1502,7 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
         except Exception:
             ranked_targets = []
 
-        # 1) Very reliable pass: find text directly below the ad image/media.
-        # This is the layout from the screenshot and prevents picking text inside the image or Google UI.
-        for score, target, label, _ in ranked_targets:
-            if id(target) in seen_targets:
-                continue
-            seen_targets.add(id(target))
-            data = read_target(target, required_method="below-media")
-            if data:
-                return data
-
-        for frame in page.frames:
-            if frame == page.main_frame or id(frame) in seen_targets:
-                continue
-            seen_targets.add(id(frame))
-            data = read_target(frame, required_method="below-media")
-            if data:
-                return data
-
-        data = read_target(page, required_method="below-media")
-        if data:
-            return data
-
-        # 2) Fallback pass for pure text ads or creatives without a separate image/media box.
-        seen_targets.clear()
+        # Prefer the active creative frame. Main page is used only if its score is strong.
         for score, target, label, _ in ranked_targets:
             if id(target) in seen_targets:
                 continue
@@ -2090,6 +1513,7 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
             if data:
                 return data
 
+        # Fallback: iframes only. This avoids grabbing Google Transparency page chrome as ad copy.
         for frame in page.frames:
             if frame == page.main_frame or id(frame) in seen_targets:
                 continue
@@ -2097,6 +1521,7 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
             if data:
                 return data
 
+        # Final fallback: main page only if there are no useful iframes.
         if not ranked_targets:
             data = read_target(page)
             if data:
@@ -2104,7 +1529,7 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
 
         page.wait_for_timeout(1000)
 
-    return {"headline": "N/A", "description": "N/A", "method": "timeout"}
+    return {"headline": "N/A", "description": "N/A"}
 
 def clean_image_url(raw_url, base_url=""):
     """Normalize image URLs found in src/srcset/background-image."""
@@ -2408,13 +1833,6 @@ def scrape_single_url(url_row):
         )
 
         page = context.new_page()
-        try:
-            page.set_extra_http_headers({"Cache-Control": "no-cache", "Pragma": "no-cache"})
-        except Exception:
-            pass
-
-        clear_cache(context=context, page=page, row_num=row_num, reason="before navigation")
-
         captured = {"video_id": "N/A"}
 
         # ORIGINAL VIDEO RESPONSE HANDLER - kept unchanged.
@@ -2478,19 +1896,7 @@ def scrape_single_url(url_row):
                     status = "SUCCESS"
                     message = "Video ID and app link saved"
 
-                # Package source requested: prefer var adData / addata appId inside script.
-                ad_data_package = wait_and_extract_ad_data_appid(page, max_wait_seconds=6)
-                package_from_app_link = extract_package_name(app_link)
-
-                if ad_data_package != "N/A":
-                    package_name = ad_data_package
-                    if package_from_app_link == "N/A" or package_from_app_link != package_name:
-                        app_link = f"https://play.google.com/store/apps/details?id={package_name}"
-                    status = "SUCCESS"
-                    message = "Video ID saved; package extracted from var adData appId"
-                    print(f"✅ Row {row_num}: package from var adData appId -> {package_name}")
-                else:
-                    package_name = package_from_app_link
+                package_name = extract_package_name(app_link)
 
                 data = [
                     advertiser,
@@ -2546,13 +1952,10 @@ def scrape_single_url(url_row):
             visible_app_link = wait_and_extract_install_link(page, max_wait_seconds=8)
             visible_package = extract_package_name(visible_app_link)
 
-            # Highest priority package source: var adData / addata appId inside script.
-            ad_data_package = wait_and_extract_ad_data_appid(page, max_wait_seconds=6)
-
             is_image_like = image_url != "N/A" or has_visible_image_creative(page)
-            ad_type = "image" if (is_image_like or (not has_text and (visible_package != "N/A" or ad_data_package != "N/A"))) else "text" if has_text else "N/A"
+            ad_type = "image" if (is_image_like or (not has_text and visible_package != "N/A")) else "text" if has_text else "N/A"
 
-            if not has_text and visible_package == "N/A" and ad_data_package == "N/A" and not is_image_like:
+            if not has_text and visible_package == "N/A" and not is_image_like:
                 data = [
                     advertiser,
                     "N/A",
@@ -2585,16 +1988,9 @@ def scrape_single_url(url_row):
             else:
                 print(f"🖼 Row {row_num}: likely image ad, headline/description not found")
 
-            print(f"📦 Row {row_num}: resolving package from var adData appId first")
+            print(f"📦 Row {row_num}: resolving package from visible install link first")
 
-            if ad_data_package != "N/A":
-                package_name = ad_data_package
-                app_link = f"https://play.google.com/store/apps/details?id={package_name}"
-                match_score = 1.0
-                status = "SUCCESS"
-                message = f"Non-video {ad_type} ad package extracted from var adData appId"
-                print(f"✅ Row {row_num}: package from var adData appId -> {package_name}")
-            elif visible_package != "N/A":
+            if visible_package != "N/A":
                 package_name = visible_package
                 app_link = visible_app_link
                 match_score = 1.0
@@ -2606,7 +2002,7 @@ def scrape_single_url(url_row):
                 match_score = 0.0
 
                 if has_text:
-                    print(f"📦 Row {row_num}: var adData appId and visible install link not found, strict matching with headline + description")
+                    print(f"📦 Row {row_num}: visible install link not found, strict matching with headline + description")
                     all_found_packages = extract_package_from_page(page)
                     package_name, match_score = get_best_matching_package(headline, description, all_found_packages)
 
@@ -2619,8 +2015,8 @@ def scrape_single_url(url_row):
                     package_name = "N/A"
                     app_link = "N/A"
                     status = "NON_VIDEO_PACKAGE_NOT_FOUND"
-                    message = f"Non-video {ad_type} ad found, but no var adData appId, visible install link, or strict package match. Best score={match_score}"
-                    print(f"⚠️ Row {row_num}: no var adData appId / visible install link / strict package match, writing N/A | best score={match_score}")
+                    message = f"Non-video {ad_type} ad found, but package score below 0.76. Best score={match_score}"
+                    print(f"⚠️ Row {row_num}: package score below 0.76, writing N/A | best score={match_score}")
 
             data = [
                 advertiser,
@@ -2690,12 +2086,6 @@ def scrape_single_url(url_row):
                 )
 
         finally:
-            # Clear browser cache/storage before closing the context, so the next row starts fresh.
-            try:
-                clear_cache(context=context, page=page, row_num=row_num, reason="after row")
-            except Exception as cache_error:
-                print(f"⚠️ Row {row_num}: ignored clear_cache() error: {cache_error}")
-
             # Closing Playwright objects can sometimes raise after a successful scrape.
             # Never let close errors affect the saved row.
             for close_name, close_func in [
