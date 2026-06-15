@@ -11,6 +11,7 @@ import uuid
 SHEET_CACHE = None
 SHEET_CACHE_TIME = None
 SHEET_CACHE_TTL = 60  # seconds
+
 CLAIM_AGENT_COL = 9       # I
 CLAIM_TIME_COL = 10       # J
 CLAIM_TOKEN_COL = 11      # K
@@ -55,6 +56,7 @@ def get_sheet():
     SHEET_CACHE = sheet
     SHEET_CACHE_TIME = now
     return sheet
+
 
 def get_spreadsheet():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
