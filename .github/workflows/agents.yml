@@ -1,50 +1,13 @@
 name: Run Two Scraper Agents
+
 on:
+  
   workflow_dispatch:
   schedule:
     - cron: '0 */6 * * *'
 
+
 jobs:
-  top-agent:
-    runs-on: ubuntu-latest
-    timeout-minutes: 350
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-      
-      - name: Create creds.json safely from secret (top)
-        shell: bash
-        run: |
-          cat <<'EOF' > creds_top.json
-          ${{ secrets.CREDS_JSON }}
-          EOF
-          chmod 600 creds_top.json
-      
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      
-      - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-          playwright install chromium
-      
-      - name: Run top agent
-        run: |
-          python agent_runner.py top --creds-file creds_top.json
-        env:
-          CREDS_FILE: creds_top.json
-      
-      - name: Upload logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: top-agent-logs
-          path: |
-            logs/
-            *.log
-          retention-days: 7
 
   bottom-agent:
     runs-on: ubuntu-latest
@@ -52,77 +15,52 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
-      
-      - name: Create creds.json safely from secret (bottom)
-        shell: bash
-        run: |
-          cat <<'EOF' > creds_bottom.json
-          ${{ secrets.CREDS_JSON }}
-          EOF
-          chmod 600 creds_bottom.json
-      
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      
-      - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-          playwright install chromium
-      
-      - name: Run bottom agent
-        run: |
-          python agent_runner.py bottom --creds-file creds_bottom.json
-        env:
-          CREDS_FILE: creds_bottom.json
-      
-      - name: Upload logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: bottom-agent-logs
-          path: |
-            logs/
-            *.log
-          retention-days: 7
 
-  check-and-retrigger:
-    runs-on: ubuntu-latest
-    needs: [top-agent, bottom-agent]
-    if: always()
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-      
       - name: Create creds.json safely from secret
         shell: bash
         run: |
           cat <<'EOF' > creds.json
           ${{ secrets.CREDS_JSON }}
           EOF
-          chmod 600 creds.json
-      
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium
+
+      - name: Run bottom agent
+        run: |
+          python agent_runner.py bottom
+
+  check-and-retrigger:
+    runs-on: ubuntu-latest
+    needs: [top-agent, bottom-agent]
+    if: always()
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      # Create creds.json from secret
+      - name: Create creds.json safely from secret
+        shell: bash
+        run: |
+          cat <<'EOF' > creds.json
+          ${{ secrets.CREDS_JSON }}
+          EOF
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
       - name: Install dependencies
         run: pip install -r requirements.txt
-      
-      - name: Check job statuses
-        run: |
-          TOP_STATUS="${{ needs.top-agent.result }}"
-          BOTTOM_STATUS="${{ needs.bottom-agent.result }}"
-          echo "Top Agent: $TOP_STATUS"
-          echo "Bottom Agent: $BOTTOM_STATUS"
-          if [[ "$TOP_STATUS" == "failure" ]]; then
-            echo "⚠️ Top agent failed"
-          fi
-          if [[ "$BOTTOM_STATUS" == "failure" ]]; then
-            echo "⚠️ Bottom agent failed"
-          fi
-      
+
       - name: Check remaining rows
         run: python check_remaining.py
