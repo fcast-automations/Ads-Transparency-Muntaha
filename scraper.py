@@ -1382,14 +1382,14 @@ def get_ranked_non_video_targets(page):
 
 def wait_and_extract_text_ad_details(page, max_wait_seconds=15, preferred_target=None, image_box=None):
     """
-    Extract headline/description from the SAME creative target where the image URL was found.
+    Extract headline/description from the EXACT creative that produced the image URL.
 
-    Updated rule for your current Google ad layout:
-    - Use Install/Get/Download/Open/Learn more only as an ANCHOR, never as headline/description.
-    - First usable visible text BELOW the install anchor = headline.
-    - Next usable visible text BELOW headline = description.
-    - Description is selected by vertical position, not by length.
-    - If no install anchor is found, fallback picks first usable text below/near the image, then the next text below it.
+    Fix for wrong 10% rows:
+    - First re-finds the exact image element/background using image_box["url"].
+    - Builds the smallest visible ad container around that exact image.
+    - Reads only text from that container / tight image area, not from other ads on the page.
+    - Install/Get/Download is only used as an anchor, never saved.
+    - Text under Install = headline; next text under headline = description.
     """
     js = r"""
     (imageBox) => {
@@ -1399,40 +1399,72 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15, preferred_target
             .replace(/\s+/g, " ")
             .trim();
 
-        const directTextOnly = (el) => cleanText(
-            Array.from(el.childNodes || [])
-                .filter(n => n.nodeType === Node.TEXT_NODE)
-                .map(n => n.textContent || "")
-                .join(" ")
-        );
+        const normalizeUrl = (raw) => {
+            if (!raw) return "";
+            raw = String(raw).trim().replace(/^['"]|['"]$/g, "");
+            if (!raw || raw === "none" || raw.startsWith("data:image")) return "";
+            try { raw = new URL(raw, location.href).href; } catch (e) {}
+            return raw;
+        };
+
+        const stripUrl = (u) => normalizeUrl(u)
+            .replace(/^https?:\/\//i, "")
+            .replace(/[?#].*$/, "")
+            .replace(/\/$/, "")
+            .toLowerCase();
+
+        const urlMatches = (candidate, wanted) => {
+            const c = stripUrl(candidate);
+            const w = stripUrl(wanted);
+            if (!c || !w) return false;
+            if (c === w) return true;
+            // Google image URLs sometimes differ only by query params or encoded size params.
+            const cTail = c.split('/').slice(-3).join('/');
+            const wTail = w.split('/').slice(-3).join('/');
+            return cTail === wTail || c.includes(wTail) || w.includes(cTail);
+        };
+
+        const bestFromSrcset = (srcset) => {
+            if (!srcset) return "";
+            let bestUrl = "";
+            let bestScore = -1;
+            for (const partRaw of String(srcset).split(',')) {
+                const part = partRaw.trim();
+                if (!part) continue;
+                const pieces = part.split(/\s+/).filter(Boolean);
+                const url = pieces[0] || "";
+                const descriptor = pieces[1] || "";
+                let score = 1;
+                if (descriptor.endsWith('w')) score = parseFloat(descriptor) || 1;
+                if (descriptor.endsWith('x')) score = (parseFloat(descriptor) || 1) * 1000;
+                if (score >= bestScore) {
+                    bestScore = score;
+                    bestUrl = url;
+                }
+            }
+            return bestUrl;
+        };
 
         const rectObj = (el) => {
-            const rect = el.getBoundingClientRect();
-            return {
-                top: rect.top,
-                bottom: rect.bottom,
-                left: rect.left,
-                right: rect.right,
-                width: rect.width,
-                height: rect.height
-            };
+            const r = el.getBoundingClientRect();
+            return { top: r.top, bottom: r.bottom, left: r.left, right: r.right, width: r.width, height: r.height };
         };
 
         const isVisible = (el) => {
             if (!el) return false;
-            const rect = el.getBoundingClientRect();
-            const style = window.getComputedStyle(el);
-            return (
-                rect.width > 0 &&
-                rect.height > 0 &&
-                rect.bottom > 0 &&
-                rect.right > 0 &&
-                rect.top < window.innerHeight &&
-                rect.left < window.innerWidth &&
-                style.visibility !== "hidden" &&
-                style.display !== "none" &&
-                style.opacity !== "0"
-            );
+            const r = el.getBoundingClientRect();
+            const s = window.getComputedStyle(el);
+            return r.width > 0 && r.height > 0 &&
+                   r.bottom > 0 && r.right > 0 &&
+                   r.top < window.innerHeight && r.left < window.innerWidth &&
+                   s.visibility !== "hidden" && s.display !== "none" && s.opacity !== "0";
+        };
+
+        const centerX = (b) => b.left + b.width / 2;
+        const centerY = (b) => b.top + b.height / 2;
+        const containsCenter = (outer, inner) => {
+            const x = centerX(inner), y = centerY(inner);
+            return x >= outer.left && x <= outer.right && y >= outer.top && y <= outer.bottom;
         };
 
         const horizontalOverlapRatio = (a, b) => {
@@ -1440,15 +1472,11 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15, preferred_target
             return overlap / Math.max(1, Math.min(a.width, b.width));
         };
 
-        const centerX = (b) => b.left + b.width / 2;
-        const img = imageBox && imageBox.url !== "N/A" ? imageBox : null;
-
         const isInstallAnchorText = (txt) => {
             const lower = cleanText(txt).toLowerCase();
             if (!lower) return false;
             if (["install", "get", "download", "open", "learn more", "try now"].includes(lower)) return true;
-            // Button text sometimes includes spaces/newlines or localized extra symbols.
-            if (lower.length <= 25 && /\b(install|get|download|open|learn more|try now)\b/i.test(lower)) return true;
+            if (lower.length <= 30 && /\b(install|get|download|open|learn more|try now)\b/i.test(lower)) return true;
             return false;
         };
 
@@ -1456,139 +1484,267 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15, preferred_target
             const original = cleanText(txt);
             const lower = original.toLowerCase();
             if (!lower) return true;
-
-            // Button labels are anchors only; never save them as headline/description.
             if (isInstallAnchorText(lower)) return true;
 
             const exactBad = new Set([
-                "play", "close", "menu", "search", "sign in", "log in",
-                "privacy", "terms", "help", "ad", "ads", "skip", "next"
+                "play", "close", "menu", "search", "sign in", "log in", "privacy", "terms",
+                "help", "ad", "ads", "skip", "next", "previous"
             ]);
             if (exactBad.has(lower)) return true;
 
             const badContains = [
-                "ads transparency center",
-                "ads transparency centre",
-                "report this ad",
-                "see more ads",
-                "last shown",
-                "shown in",
-                "about this ad",
-                "my ad center",
-                "why this ad",
-                "ad choices",
-                "advertiser verified",
-                "this advertiser",
-                "more details",
-                "play.google.com/store/apps/details"
+                "ads transparency center", "ads transparency centre", "report this ad", "see more ads",
+                "last shown", "shown in", "about this ad", "my ad center", "why this ad",
+                "ad choices", "advertiser verified", "this advertiser", "more details",
+                "play.google.com/store/apps/details", "google syndication"
             ];
             if (badContains.some(b => lower.includes(b))) return true;
 
             if (/^https?:\/\//i.test(lower)) return true;
             if (/^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*){2,}$/i.test(lower)) return true;
-            if (/^[a-z0-9_-]{20,}$/i.test(lower)) return true;
-
+            if (/^[\d\W_]+$/.test(lower)) return true;
             return false;
         };
 
-        const insideOrNearImage = (box) => {
-            if (!img) return true;
-            const imageBoxForOverlap = {
-                top: img.top,
-                bottom: img.bottom,
-                left: img.left,
-                right: img.right,
-                width: img.width,
-                height: img.height
+        const directTextOnly = (el) => cleanText(
+            Array.from(el.childNodes || [])
+                .filter(n => n.nodeType === Node.TEXT_NODE)
+                .map(n => n.textContent || "")
+                .join(" ")
+        );
+
+        const wantedUrl = imageBox && imageBox.url ? String(imageBox.url) : "";
+        let imageEl = null;
+        let imageRect = null;
+        let imageKind = "none";
+
+        // 1) Exact image element match by URL.
+        if (wantedUrl) {
+            for (const img of Array.from(document.querySelectorAll('img'))) {
+                const urls = [
+                    img.currentSrc,
+                    img.src,
+                    img.getAttribute('src'),
+                    bestFromSrcset(img.getAttribute('srcset')),
+                    img.getAttribute('data-src'),
+                    img.getAttribute('data-lazy-src'),
+                    img.getAttribute('data-original'),
+                    img.getAttribute('data-image'),
+                    img.getAttribute('data-image-url')
+                ].filter(Boolean);
+                if (isVisible(img) && urls.some(u => urlMatches(u, wantedUrl))) {
+                    imageEl = img;
+                    imageRect = rectObj(img);
+                    imageKind = "img_url_match";
+                    break;
+                }
+            }
+
+            if (!imageEl) {
+                for (const source of Array.from(document.querySelectorAll('picture source[srcset], source[srcset]'))) {
+                    const src = bestFromSrcset(source.getAttribute('srcset'));
+                    if (!urlMatches(src, wantedUrl)) continue;
+                    const picture = source.closest('picture');
+                    const visualEl = picture?.querySelector('img') || picture || source;
+                    if (isVisible(visualEl)) {
+                        imageEl = visualEl;
+                        imageRect = rectObj(visualEl);
+                        imageKind = "source_url_match";
+                        break;
+                    }
+                }
+            }
+
+            if (!imageEl) {
+                for (const el of Array.from(document.querySelectorAll('body *'))) {
+                    if (!isVisible(el)) continue;
+                    const bg = window.getComputedStyle(el).backgroundImage || '';
+                    if (!bg || bg === 'none' || !bg.includes('url(')) continue;
+                    const matches = Array.from(bg.matchAll(/url\((['"]?)(.*?)\1\)/g));
+                    if (matches.some(m => urlMatches(m[2], wantedUrl))) {
+                        imageEl = el;
+                        imageRect = rectObj(el);
+                        imageKind = "background_url_match";
+                        break;
+                    }
+                }
+            }
+        }
+
+        // 2) Fallback to image box coordinates from the working image extractor.
+        if (!imageRect && imageBox && typeof imageBox.top === "number") {
+            imageRect = {
+                top: imageBox.top,
+                bottom: imageBox.top + imageBox.height,
+                left: imageBox.left,
+                right: imageBox.left + imageBox.width,
+                width: imageBox.width,
+                height: imageBox.height
             };
-            const alignedWithImage = horizontalOverlapRatio(box, imageBoxForOverlap) >= 0.10;
-            const verticalNearImage = box.top >= img.top - 40 && box.top <= img.bottom + 650;
-            const overlayOrInsideImage = box.top >= img.top - 20 && box.bottom <= img.bottom + 120;
-            return alignedWithImage && (verticalNearImage || overlayOrInsideImage);
+            imageKind = "image_box_only";
+        }
+
+        if (!imageRect) {
+            return { headline: "N/A", description: "N/A", mode: "no_exact_image" };
+        }
+
+        const getLeafTextsInside = (root) => {
+            const els = Array.from(root.querySelectorAll('*'));
+            const items = [];
+            for (const el of els) {
+                if (!isVisible(el)) continue;
+                const box = rectObj(el);
+                const rawText = cleanText(el.innerText || el.textContent || '');
+                if (rawText.length < 2 || rawText.length > 260) continue;
+                if (rawText.includes('{{') || rawText.includes('}}')) continue;
+
+                const cls = String(el.className || '').toLowerCase();
+                const aria = String(el.getAttribute('aria-label') || '').toLowerCase();
+                const role = String(el.getAttribute('role') || '').toLowerCase();
+                const looksLikeTextNode =
+                    cls.includes('headline') || cls.includes('description') || cls.includes('long-description') ||
+                    cls.includes('-e-15') || cls.includes('-e-67') || aria.includes('headline') ||
+                    aria.includes('description') || role === 'heading';
+
+                const directText = directTextOnly(el);
+                // Avoid big wrappers that combine install + title + description together.
+                if (el.children.length > 0 && !looksLikeTextNode && directText.length < 2) continue;
+
+                items.push({ el, text: rawText, box, cls, aria, role });
+            }
+            return items;
+        };
+
+        const countGoodTexts = (root) => getLeafTextsInside(root).filter(x => !isBadText(x.text)).length;
+        const countInstallAnchors = (root) => getLeafTextsInside(root).filter(x => isInstallAnchorText(x.text)).length;
+
+        // 3) Choose the SMALLEST container around the exact image that has enough ad text.
+        let roots = [];
+        if (imageEl) {
+            let cur = imageEl;
+            for (let depth = 0; cur && cur !== document.body && depth < 10; depth++, cur = cur.parentElement) {
+                if (!isVisible(cur)) continue;
+                const box = rectObj(cur);
+                const area = box.width * box.height;
+                const imgArea = Math.max(1, imageRect.width * imageRect.height);
+                const textCount = countGoodTexts(cur);
+                const installCount = countInstallAnchors(cur);
+                if (textCount >= 1 || installCount >= 1) {
+                    // Avoid climbing to huge page sections containing multiple ads.
+                    const areaRatio = area / imgArea;
+                    if (areaRatio <= 12 || (box.width <= imageRect.width + 700 && box.height <= imageRect.height + 520)) {
+                        roots.push({ el: cur, box, area, textCount, installCount, depth, score: 0 });
+                    }
+                }
+            }
+        }
+
+        if (!roots.length) {
+            // Coordinate fallback: choose smallest visible element containing image center and some text.
+            for (const el of Array.from(document.querySelectorAll('body *'))) {
+                if (!isVisible(el)) continue;
+                const box = rectObj(el);
+                if (!containsCenter(box, imageRect)) continue;
+                const area = box.width * box.height;
+                const imgArea = Math.max(1, imageRect.width * imageRect.height);
+                if (area / imgArea > 15 && area > 450000) continue;
+                const textCount = countGoodTexts(el);
+                const installCount = countInstallAnchors(el);
+                if (textCount >= 1 || installCount >= 1) {
+                    roots.push({ el, box, area, textCount, installCount, depth: 99, score: 0 });
+                }
+            }
+        }
+
+        let root = null;
+        if (roots.length) {
+            roots = roots.map(r => {
+                let score = 0;
+                score += r.installCount * 100;
+                score += Math.min(r.textCount, 4) * 60;
+                score -= Math.min(r.area / 1000, 600);
+                score -= r.depth * 8;
+                return { ...r, score };
+            }).sort((a, b) => b.score - a.score || a.area - b.area);
+            root = roots[0].el;
+        }
+
+        // 4) Build text candidates only inside root; if root is missing, use tight coordinate window around exact image.
+        let allNodes = [];
+        let modePrefix = "container";
+        if (root) {
+            allNodes = getLeafTextsInside(root);
+        } else {
+            modePrefix = "coordinate_window";
+            allNodes = Array.from(document.querySelectorAll('body *')).map(el => {
+                if (!isVisible(el)) return null;
+                const box = rectObj(el);
+                const rawText = cleanText(el.innerText || el.textContent || '');
+                return { el, text: rawText, box, cls: String(el.className || '').toLowerCase(), aria: String(el.getAttribute('aria-label') || '').toLowerCase(), role: String(el.getAttribute('role') || '').toLowerCase() };
+            }).filter(Boolean);
+        }
+
+        const nearExactImage = (box) => {
+            const yOk = box.top >= imageRect.top - 80 && box.top <= imageRect.bottom + 420;
+            const xOk = horizontalOverlapRatio(box, imageRect) >= 0.20 || Math.abs(centerX(box) - centerX(imageRect)) <= Math.max(360, imageRect.width * 1.2);
+            return yOk && xOk;
         };
 
         const installAnchors = [];
         const textCandidates = [];
 
-        for (const el of Array.from(document.querySelectorAll("body *"))) {
-            if (!isVisible(el)) continue;
-
-            const rawText = cleanText(el.innerText || el.textContent || "");
+        for (const item of allNodes) {
+            const { el, text: rawText, box, cls, aria, role } = item;
             if (!rawText) continue;
 
-            const cls = String(el.className || "").toLowerCase();
-            const aria = String(el.getAttribute("aria-label") || "").toLowerCase();
-            const role = String(el.getAttribute("role") || "").toLowerCase();
-            const href = String(el.getAttribute("href") || el.href || el.getAttribute("data-href") || "").toLowerCase();
-            const box = rectObj(el);
-            if (box.width < 10 || box.height < 6) continue;
+            // Even inside root, keep text spatially close to the exact image so nearby ads do not leak in.
+            if (!nearExactImage(box)) continue;
 
+            const href = String(el.getAttribute('href') || el.getAttribute('data-href') || '').toLowerCase();
+            const tag = el.tagName.toLowerCase();
             const looksInstallByClass =
-                cls.includes("install-button") ||
-                cls.includes("install") ||
-                aria.includes("install") ||
-                href.includes("googleadservices.com/pagead/aclk") ||
-                href.includes("play.google.com/store/apps/details");
+                cls.includes('install-button') || cls.includes('install') || aria.includes('install') ||
+                href.includes('googleadservices.com/pagead/aclk') || href.includes('play.google.com/store/apps/details');
 
-            if ((isInstallAnchorText(rawText) || looksInstallByClass) && insideOrNearImage(box)) {
+            if (isInstallAnchorText(rawText) || looksInstallByClass) {
                 let score = 0;
                 if (isInstallAnchorText(rawText)) score += 200;
-                if (cls.includes("install-button")) score += 160;
-                if (role === "link" || el.tagName.toLowerCase() === "a" || el.tagName.toLowerCase() === "button") score += 60;
-                if (img) {
-                    score -= Math.min(Math.abs(box.top - img.bottom), 500) / 2;
-                    score -= Math.min(Math.abs(centerX(box) - centerX(img)), 500) / 5;
-                }
+                if (cls.includes('install-button')) score += 160;
+                if (tag === 'a' || tag === 'button' || role === 'link') score += 80;
+                score -= Math.min(Math.abs(box.top - imageRect.bottom), 500) / 3;
+                score -= Math.min(Math.abs(centerX(box) - centerX(imageRect)), 500) / 6;
                 installAnchors.push({ text: rawText, ...box, score });
                 continue;
             }
 
             if (rawText.length < 3 || rawText.length > 240) continue;
-            if (rawText.includes("{{") || rawText.includes("}}")) continue;
             if (isBadText(rawText)) continue;
 
-            const looksLikeTextNode =
-                cls.includes("headline") ||
-                cls.includes("description") ||
-                cls.includes("long-description") ||
-                cls.includes("-e-15") ||
-                cls.includes("-e-67") ||
-                aria.includes("headline") ||
-                aria.includes("description") ||
-                role === "heading";
-
-            // Avoid wrapper containers that combine button + headline + description.
-            const directText = directTextOnly(el);
-            if (el.children.length > 0 && !looksLikeTextNode && directText.length < 3) continue;
-            if (!insideOrNearImage(box)) continue;
-
             const style = window.getComputedStyle(el);
-            const fontSize = parseFloat(style.fontSize || "0") || 0;
-            const weightRaw = String(style.fontWeight || "400");
-            const fontWeight = weightRaw === "bold" ? 700 : (parseInt(weightRaw, 10) || 400);
-
+            const fontSize = parseFloat(style.fontSize || '0') || 0;
+            const weightRaw = String(style.fontWeight || '400');
+            const fontWeight = weightRaw === 'bold' ? 700 : (parseInt(weightRaw, 10) || 400);
             textCandidates.push({
                 text: rawText,
                 ...box,
                 fontSize,
                 fontWeight,
-                isHeadlineClass: cls.includes("headline") || cls.includes("-e-15") || aria.includes("headline"),
-                isDescriptionClass: cls.includes("description") || cls.includes("long-description") || cls.includes("-e-67") || aria.includes("description")
+                isHeadlineClass: cls.includes('headline') || cls.includes('-e-15') || aria.includes('headline'),
+                isDescriptionClass: cls.includes('description') || cls.includes('long-description') || cls.includes('-e-67') || aria.includes('description')
             });
         }
 
         const unique = [];
         const seen = new Set();
         for (const c of textCandidates) {
-            // Keep same text only once; prefer the visually top/left smaller element, not wrapper duplicates.
-            const key = c.text.toLowerCase();
+            const key = `${c.text.toLowerCase()}|${Math.round(c.top)}|${Math.round(c.left)}`;
             if (seen.has(key)) continue;
             seen.add(key);
             unique.push(c);
         }
 
         if (!unique.length) {
-            return { headline: "N/A", description: "N/A", mode: "no_text" };
+            return { headline: "N/A", description: "N/A", mode: `${modePrefix}_${imageKind}_no_text` };
         }
 
         unique.sort((a, b) => {
@@ -1598,28 +1754,27 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15, preferred_target
 
         let headlineObj = null;
         let descriptionObj = null;
-        let mode = "fallback_image_order";
+        let mode = `${modePrefix}_${imageKind}_image_order`;
 
         if (installAnchors.length) {
             installAnchors.sort((a, b) => b.score - a.score);
             const anchor = installAnchors[0];
-            mode = "install_anchor";
+            mode = `${modePrefix}_${imageKind}_install_anchor`;
 
             const belowInstall = unique
-                .filter(c => c.top >= anchor.bottom - 12)
+                .filter(c => c.top >= anchor.bottom - 14)
                 .filter(c => c.top <= anchor.bottom + 360)
                 .filter(c => Math.abs(centerX(c) - centerX(anchor)) <= Math.max(420, anchor.width * 3))
                 .map(c => {
                     const distance = Math.max(0, c.top - anchor.bottom);
                     let score = 1000 - Math.min(distance, 1000);
                     if (c.isHeadlineClass) score += 180;
-                    if (c.isDescriptionClass) score -= 90;
-                    if (c.fontWeight >= 600) score += 50;
-                    if (img) score -= Math.min(Math.abs(centerX(c) - centerX(img)), 500) / 8;
+                    if (c.isDescriptionClass) score -= 80;
+                    if (c.fontWeight >= 600) score += 45;
+                    score -= Math.min(Math.abs(centerX(c) - centerX(imageRect)), 500) / 8;
                     return { ...c, score };
                 })
                 .sort((a, b) => {
-                    // Main rule: first usable visible text below install.
                     if (Math.abs(a.top - b.top) > 8) return a.top - b.top;
                     return b.score - a.score;
                 });
@@ -1627,48 +1782,43 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15, preferred_target
             headlineObj = belowInstall.length ? belowInstall[0] : null;
         }
 
-        // Fallback when install anchor is not available: first usable text below/near the image.
         if (!headlineObj) {
-            let pool = unique;
-            if (img) {
-                pool = unique.filter(c => c.top >= img.bottom - 30 || (c.top >= img.top - 20 && c.bottom <= img.bottom + 120));
-            }
-
-            pool = pool.map(c => {
-                let score = 0;
-                if (img) score -= Math.min(Math.max(0, c.top - img.bottom), 600);
-                if (c.isHeadlineClass) score += 150;
-                if (c.isDescriptionClass) score -= 80;
-                if (c.fontWeight >= 600) score += 30;
-                return { ...c, score };
-            }).sort((a, b) => {
-                if (Math.abs(a.top - b.top) > 8) return a.top - b.top;
-                return b.score - a.score;
-            });
-
+            const pool = unique
+                .filter(c => c.top >= imageRect.top - 60)
+                .filter(c => c.top <= imageRect.bottom + 420)
+                .map(c => {
+                    let score = 0;
+                    // Prefer text below/next to exact image, not above far away.
+                    score -= Math.min(Math.abs(c.top - imageRect.bottom), 800);
+                    score -= Math.min(Math.abs(centerX(c) - centerX(imageRect)), 600) / 5;
+                    if (c.isHeadlineClass) score += 160;
+                    if (c.isDescriptionClass) score -= 80;
+                    if (c.fontWeight >= 600) score += 40;
+                    return { ...c, score };
+                })
+                .sort((a, b) => b.score - a.score || a.top - b.top);
             headlineObj = pool.length ? pool[0] : unique[0];
         }
 
         if (headlineObj) {
             const belowHeadline = unique
                 .filter(c => c.text !== headlineObj.text)
-                .filter(c => c.top >= headlineObj.bottom - 10)
-                .filter(c => c.top <= headlineObj.bottom + 320)
-                .filter(c => Math.abs(centerX(c) - centerX(headlineObj)) <= Math.max(420, headlineObj.width * 2.5))
+                .filter(c => c.top >= headlineObj.bottom - 12)
+                .filter(c => c.top <= headlineObj.bottom + 330)
+                .filter(c => Math.abs(centerX(c) - centerX(headlineObj)) <= Math.max(430, headlineObj.width * 2.5))
                 .map(c => {
                     const distance = Math.max(0, c.top - headlineObj.bottom);
                     let score = 1000 - Math.min(distance, 1000);
-                    if (c.isDescriptionClass) score += 180;
+                    if (c.isDescriptionClass) score += 160;
                     if (c.isHeadlineClass) score -= 80;
-                    if (c.fontSize <= headlineObj.fontSize + 4) score += 30;
+                    if (c.fontSize <= headlineObj.fontSize + 4) score += 35;
+                    score -= Math.min(Math.abs(centerX(c) - centerX(imageRect)), 600) / 10;
                     return { ...c, score };
                 })
                 .sort((a, b) => {
-                    // Main rule: next usable visible text below headline.
                     if (Math.abs(a.top - b.top) > 8) return a.top - b.top;
                     return b.score - a.score;
                 });
-
             descriptionObj = belowHeadline.length ? belowHeadline[0] : null;
         }
 
@@ -1700,7 +1850,8 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15, preferred_target
     start_time = time.time()
 
     while time.time() - start_time < max_wait_seconds:
-        # Strong fix: if the image target is known, ONLY read text from that same target.
+        # For image ads, ONLY read from the target that produced the image URL.
+        # Do not scan other frames, because that is what caused headline/description of another ad.
         if preferred_target is not None:
             data = read_target(preferred_target)
             if data:
