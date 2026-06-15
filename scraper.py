@@ -1710,10 +1710,6 @@ def run_parallel_combined_scraper(max_workers=2):
     print("✅ Finished combined video + text scraping")
 
 
-if __name__ == "__main__":
-    try:
-        sheets.clear_sheet_cache()
-    except Exception:
-        pass
 
+if __name__ == "__main__":
     run_parallel_combined_scraper(max_workers=MAX_WORKERS)
