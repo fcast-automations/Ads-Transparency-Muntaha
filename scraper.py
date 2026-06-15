@@ -1,4 +1,4 @@
-# Combined Google Ads Transparency scraper
+# Combined Google Ads Transparency scraper - V2 active creative scoped fix
 # Video-ad detection logic is kept from the original scrapper.txt.
 # Non-video ads use text/image extraction + package matching from the uploaded non-video files.
 
@@ -1608,6 +1608,598 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
         page.wait_for_timeout(1000)
 
     return {"headline": "N/A", "description": "N/A"}
+
+
+# =========================
+# ACTIVE CREATIVE SCOPED EXTRACTION (V2 FIX)
+# =========================
+
+def extract_creative_id_from_transparency_url(url):
+    """
+    Extracts CR... creative ID from Google Ads Transparency URL.
+    Example: /advertiser/AR.../creative/CR...
+    """
+    if not url:
+        return ""
+    try:
+        m = re.search(r"/creative/([A-Za-z0-9_-]+)", str(url))
+        return m.group(1) if m else ""
+    except Exception:
+        return ""
+
+
+def _safe_target_url(target):
+    try:
+        return getattr(target, "url", "") or ""
+    except Exception:
+        return ""
+
+
+def _target_parent_box_score(target):
+    """
+    Scores the iframe element itself. Main page gets neutral score.
+    """
+    try:
+        frame_el = target.frame_element()
+        box = frame_el.bounding_box()
+        if not box:
+            return -100
+
+        width = box.get("width", 0) or 0
+        height = box.get("height", 0) or 0
+        y = box.get("y", 99999) or 99999
+        area = width * height
+
+        score = 0
+        if width >= 120 and height >= 70:
+            score += min(area / 7000, 120)
+        else:
+            score -= 140
+
+        # Active preview is usually visible near the top of the current viewport.
+        if -80 <= y <= 900:
+            score += 120
+        elif 900 < y <= 1500:
+            score += 25
+        else:
+            score -= 120
+
+        return score
+    except Exception:
+        # Page object, not a frame.
+        return 0
+
+
+def _score_active_creative_target(target, creative_id=""):
+    """
+    Scores only this page/frame as a possible active creative container.
+    Does NOT scan every ad globally for extraction.
+    """
+    js = r"""
+    (creativeId) => {
+        const cleanText = (txt) => (txt || '').replace(/\n/g, ' ').replace(/\s+/g, ' ').trim();
+
+        const isVisible = (el) => {
+            if (!el) return false;
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return (
+                rect.width > 0 &&
+                rect.height > 0 &&
+                rect.bottom > 0 &&
+                rect.right > 0 &&
+                rect.top < window.innerHeight &&
+                rect.left < window.innerWidth &&
+                style.visibility !== 'hidden' &&
+                style.display !== 'none' &&
+                style.opacity !== '0'
+            );
+        };
+
+        const bodyText = cleanText(document.body ? document.body.innerText : '');
+        const bodyLower = bodyText.toLowerCase();
+        const html = document.documentElement ? document.documentElement.outerHTML : '';
+
+        const imageNodes = Array.from(document.querySelectorAll('img')).filter(img => {
+            const src = String(img.currentSrc || img.src || img.getAttribute('src') || '').toLowerCase();
+            const alt = String(img.getAttribute('alt') || '').toLowerCase();
+            const rect = img.getBoundingClientRect();
+            if (!isVisible(img)) return false;
+            if (rect.width < 80 || rect.height < 60) return false;
+            if (src.includes('googlelogo') || alt.includes('google')) return false;
+            if (src.includes('logo') || src.includes('icon') || alt.includes('logo') || alt.includes('icon')) return false;
+            return true;
+        });
+
+        const installNodes = Array.from(document.querySelectorAll('a[href], a[data-href], button, [role="button"], [role="link"]')).filter(el => {
+            if (!isVisible(el)) return false;
+            const txt = cleanText(el.innerText || el.textContent || '').toLowerCase();
+            const cls = String(el.className || '').toLowerCase();
+            const aria = String(el.getAttribute('aria-label') || '').toLowerCase();
+            const href = String(el.href || el.getAttribute('href') || el.getAttribute('data-href') || '').toLowerCase();
+            return (
+                cls.includes('install-button-anchor') ||
+                txt.includes('install') ||
+                txt === 'get' ||
+                txt.includes('download') ||
+                aria.includes('install') ||
+                href.includes('googleadservices.com/pagead/aclk') ||
+                href.includes('play.google.com') ||
+                href.includes('apps.apple.com') ||
+                href.includes('itunes.apple.com')
+            );
+        });
+
+        const leafTextNodes = Array.from(document.querySelectorAll('body *')).filter(el => {
+            if (el.childElementCount > 0) return false;
+            if (!isVisible(el)) return false;
+            const txt = cleanText(el.innerText || el.textContent || '');
+            if (txt.length < 3 || txt.length > 220) return false;
+            if (txt.includes('{{') || txt.includes('}}')) return false;
+            const lower = txt.toLowerCase();
+            if (lower === 'install' || lower === 'get' || lower === 'download') return false;
+            return true;
+        });
+
+        let score = 0;
+        score += Math.min(imageNodes.length, 3) * 90;
+        score += Math.min(installNodes.length, 3) * 80;
+        score += Math.min(leafTextNodes.length, 10) * 10;
+
+        // If the current creative ID is present in this target, strongly prefer it.
+        if (creativeId && html.includes(creativeId)) score += 1000;
+
+        // Penalize Google shell/chrome. We want the creative frame/card, not the page list.
+        if (bodyLower.includes('ads transparency center') || bodyLower.includes('ads transparency centre')) score -= 220;
+        if (bodyLower.includes('see more ads') || bodyLower.includes('report this ad')) score -= 120;
+        if (bodyLower.includes('last shown') || bodyLower.includes('shown in')) score -= 60;
+
+        return {
+            score,
+            imageCount: imageNodes.length,
+            installCount: installNodes.length,
+            textCount: leafTextNodes.length,
+            bodyTextLength: bodyText.length,
+            hasCreativeId: Boolean(creativeId && html.includes(creativeId))
+        };
+    }
+    """
+    try:
+        return target.evaluate(js, creative_id or "") or {"score": 0}
+    except Exception:
+        return {"score": 0}
+
+
+def get_active_non_video_target(page, transparency_url=""):
+    """
+    Finds the active creative frame/card for the current transparency URL.
+    This fixes the old bug where extraction scanned the whole advertiser page
+    and repeatedly picked the first/old creative.
+
+    Returns: (target, final_score, target_kind)
+    """
+    creative_id = extract_creative_id_from_transparency_url(transparency_url or page.url)
+    ranked = []
+
+    for frame in page.frames:
+        if frame == page.main_frame:
+            continue
+
+        details = _score_active_creative_target(frame, creative_id)
+        score = float(details.get("score", 0) or 0) + float(_target_parent_box_score(frame) or 0)
+
+        frame_url = _safe_target_url(frame)
+        if creative_id and creative_id in frame_url:
+            score += 1000
+
+        if score > 0:
+            ranked.append((score, frame, "iframe", details))
+
+    # Main page fallback only. It is usually the Google shell, so penalize it.
+    details = _score_active_creative_target(page, creative_id)
+    main_score = float(details.get("score", 0) or 0) - 160
+    if creative_id and creative_id in _safe_target_url(page):
+        main_score += 120
+    if main_score > 0:
+        ranked.append((main_score, page, "main_page", details))
+
+    if not ranked:
+        return page, 0, "main_page_fallback"
+
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    best_score, best_target, best_kind, best_details = ranked[0]
+
+    try:
+        print(
+            f"🎯 Active creative target: {best_kind} | score={round(best_score, 2)} | "
+            f"images={best_details.get('imageCount')} | installs={best_details.get('installCount')} | "
+            f"texts={best_details.get('textCount')} | creative_id={creative_id or 'N/A'}"
+        )
+    except Exception:
+        pass
+
+    return best_target, best_score, best_kind
+
+
+def extract_primary_image_url_from_target(target, page_url=""):
+    """
+    Extracts primary image ONLY from the active creative target.
+    It no longer scans the whole page first, preventing same image for every ad.
+    """
+    js = r"""
+    () => {
+        const isVisible = (el) => {
+            if (!el) return false;
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return (
+                rect.width >= 70 &&
+                rect.height >= 50 &&
+                rect.bottom > 0 &&
+                rect.right > 0 &&
+                rect.top < window.innerHeight &&
+                rect.left < window.innerWidth &&
+                style.visibility !== 'hidden' &&
+                style.display !== 'none' &&
+                style.opacity !== '0'
+            );
+        };
+
+        const images = Array.from(document.querySelectorAll('img')).map(img => {
+            const src = String(img.currentSrc || img.src || img.getAttribute('src') || '');
+            const alt = String(img.getAttribute('alt') || '').toLowerCase();
+            const rect = img.getBoundingClientRect();
+            const lowerSrc = src.toLowerCase();
+
+            if (!src || !isVisible(img)) return null;
+            if (lowerSrc.includes('googlelogo') || alt.includes('google')) return null;
+            if (lowerSrc.includes('logo') || lowerSrc.includes('icon') || alt.includes('logo') || alt.includes('icon')) return null;
+
+            const area = rect.width * rect.height;
+            let score = area;
+
+            // Prefer main creative image area. Do not select tiny app icons.
+            if (rect.width >= 180 && rect.height >= 120) score += 20000;
+            if (rect.top >= -50 && rect.top <= 500) score += 8000;
+
+            return { src, score, area, top: rect.top };
+        }).filter(Boolean);
+
+        if (!images.length) return null;
+        images.sort((a, b) => b.score - a.score);
+        return images[0].src;
+    }
+    """
+    try:
+        image_url = target.evaluate(js)
+        if image_url and isinstance(image_url, str):
+            image_url = image_url.strip()
+            if image_url.startswith("http"):
+                return image_url
+            if image_url.startswith("//"):
+                return "https:" + image_url
+            if image_url.startswith("/"):
+                try:
+                    base_url = urlparse(page_url or _safe_target_url(target)).netloc
+                    return f"https://{base_url}{image_url}" if base_url else image_url
+                except Exception:
+                    return image_url
+            return image_url
+    except Exception:
+        pass
+
+    return "N/A"
+
+
+def wait_and_extract_text_below_primary_image_scoped(page, target, image_url=None, max_wait_seconds=15):
+    """
+    Extracts headline/description only from text BELOW the matched image inside the active target.
+    It avoids scanning other creatives on the advertiser page.
+    """
+    js = r"""
+    (imageUrl) => {
+        const cleanText = (txt) => (txt || '').replace(/\n/g, ' ').replace(/\s+/g, ' ').trim();
+
+        const isVisible = (el) => {
+            if (!el) return false;
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return (
+                rect.width > 0 &&
+                rect.height > 0 &&
+                style.visibility !== 'hidden' &&
+                style.display !== 'none' &&
+                style.opacity !== '0'
+            );
+        };
+
+        const isBadText = (txt, el) => {
+            const t = cleanText(txt).toLowerCase();
+            if (!t) return true;
+            if (t.includes('{{') || t.includes('}}')) return true;
+
+            const exactBad = new Set([
+                'install', 'get', 'download', 'open', 'learn more', 'shop now',
+                'play now', 'try now', 'visit site', 'sign up', 'start now',
+                'see more', 'more', 'continue', 'next', 'ad', 'ads'
+            ]);
+            if (exactBad.has(t)) return true;
+
+            if (t.includes('google play')) return true;
+            if (t.includes('app store')) return true;
+            if (t.includes('ads transparency')) return true;
+            if (t.includes('advertiser verified')) return true;
+            if (t.includes('last shown')) return true;
+            if (t.includes('shown in')) return true;
+            if (t.includes('sponsored')) return true;
+
+            const clickable = el && el.closest ? el.closest('a, button, [role="button"], [role="link"]') : null;
+            if (clickable && t.length <= 45) return true;
+
+            return false;
+        };
+
+        const normalizeUrl = (url) => {
+            if (!url) return '';
+            try { return decodeURIComponent(String(url).trim()); }
+            catch (e) { return String(url).trim(); }
+        };
+
+        const wantedUrl = normalizeUrl(imageUrl);
+
+        const images = Array.from(document.querySelectorAll('img')).map(img => {
+            const rawSrc = img.currentSrc || img.src || img.getAttribute('src') || '';
+            const src = normalizeUrl(rawSrc);
+            const alt = String(img.getAttribute('alt') || '').toLowerCase();
+            const rect = img.getBoundingClientRect();
+            const lowerSrc = src.toLowerCase();
+
+            if (!src || !isVisible(img)) return null;
+            if (rect.width < 70 || rect.height < 50) return null;
+            if (lowerSrc.includes('googlelogo') || alt.includes('google')) return null;
+            if (lowerSrc.includes('logo') || lowerSrc.includes('icon') || alt.includes('logo') || alt.includes('icon')) return null;
+
+            let score = rect.width * rect.height;
+            if (wantedUrl && (src === wantedUrl || src.includes(wantedUrl) || wantedUrl.includes(src))) score += 100000000;
+            if (rect.width >= 180 && rect.height >= 120) score += 20000;
+            if (rect.top >= -50 && rect.top <= 500) score += 8000;
+
+            return { src: rawSrc, rect, score };
+        }).filter(Boolean);
+
+        let imgRect = null;
+        let bestImage = 'N/A';
+
+        if (images.length) {
+            images.sort((a, b) => b.score - a.score);
+            imgRect = images[0].rect;
+            bestImage = images[0].src || 'N/A';
+        }
+
+        const items = [];
+        const candidates = Array.from(document.querySelectorAll('body *'));
+
+        for (const el of candidates) {
+            if (el.childElementCount > 0) continue;
+            if (!isVisible(el)) continue;
+
+            const txt = cleanText(el.innerText || el.textContent || '');
+            if (txt.length < 2 || txt.length > 240) continue;
+            if (isBadText(txt, el)) continue;
+
+            const rect = el.getBoundingClientRect();
+
+            if (imgRect) {
+                // Must be visually below the selected image.
+                if (rect.top < imgRect.bottom - 4) continue;
+                if (rect.top > imgRect.bottom + 380) continue;
+
+                const overlapsHorizontally = rect.right >= imgRect.left - 140 && rect.left <= imgRect.right + 140;
+                if (!overlapsHorizontally) continue;
+            }
+
+            items.push({
+                text: txt,
+                top: rect.top,
+                left: rect.left,
+                fontSize: parseFloat(window.getComputedStyle(el).fontSize || '0')
+            });
+        }
+
+        if (!items.length) return null;
+
+        items.sort((a, b) => {
+            if (Math.abs(a.top - b.top) > 8) return a.top - b.top;
+            return a.left - b.left;
+        });
+
+        const lines = [];
+        for (const item of items) {
+            let line = lines.find(l => Math.abs(l.top - item.top) <= 8);
+            if (!line) {
+                line = { top: item.top, parts: [] };
+                lines.push(line);
+            }
+            line.parts.push(item);
+        }
+
+        const finalLines = [];
+        const seen = new Set();
+
+        for (const line of lines) {
+            line.parts.sort((a, b) => a.left - b.left);
+            const text = cleanText(line.parts.map(p => p.text).join(' '));
+            const key = text.toLowerCase();
+            if (!text || seen.has(key)) continue;
+            if (isBadText(text, document.body)) continue;
+            seen.add(key);
+            finalLines.push(text);
+        }
+
+        if (!finalLines.length) return null;
+
+        return {
+            headline: finalLines[0] || 'N/A',
+            description: finalLines.length > 1 ? finalLines.slice(1, 3).join(' ') : 'N/A',
+            image_url: bestImage
+        };
+    }
+    """
+
+    start_time = time.time()
+    while time.time() - start_time < max_wait_seconds:
+        try:
+            data = target.evaluate(js, image_url or "")
+            if data and (data.get("headline", "N/A") != "N/A" or data.get("description", "N/A") != "N/A"):
+                return data
+        except Exception:
+            pass
+        page.wait_for_timeout(1000)
+
+    return {"headline": "N/A", "description": "N/A", "image_url": image_url or "N/A"}
+
+
+def extract_install_link_by_precise_js_from_target(target):
+    js = r"""
+    () => {
+        const anchors = Array.from(document.querySelectorAll('a[href], a[data-href], button, [role="button"], [role="link"]'));
+        const candidates = anchors.map(a => {
+            const href = a.href || a.getAttribute('href') || a.getAttribute('data-href') || '';
+            const text = (a.innerText || a.textContent || '').trim().toLowerCase();
+            const cls = String(a.className || '').toLowerCase();
+            const aria = String(a.getAttribute('aria-label') || '').toLowerCase();
+            const rect = a.getBoundingClientRect();
+            const style = window.getComputedStyle(a);
+
+            const goodLink =
+                href.includes('googleadservices.com/pagead/aclk') ||
+                href.includes('play.google.com') ||
+                href.includes('apps.apple.com') ||
+                href.includes('itunes.apple.com');
+
+            const looksInstall =
+                cls.includes('install-button-anchor') ||
+                text.includes('install') ||
+                text === 'get' ||
+                text.includes('download') ||
+                aria.includes('install') ||
+                goodLink;
+
+            const visible =
+                rect.width > 10 && rect.height > 8 &&
+                rect.bottom > 0 && rect.right > 0 &&
+                rect.top < window.innerHeight && rect.left < window.innerWidth &&
+                style.visibility !== 'hidden' && style.display !== 'none' && style.opacity !== '0';
+
+            if (!looksInstall || !visible) return null;
+
+            let score = 0;
+            if (goodLink) score += 120;
+            if (cls.includes('install-button-anchor')) score += 100;
+            if (text.includes('install')) score += 80;
+            if (text === 'get' || text.includes('download')) score += 40;
+            return { href, score };
+        }).filter(Boolean);
+
+        candidates.sort((a, b) => b.score - a.score);
+        return candidates.length ? candidates[0].href : null;
+    }
+    """
+    try:
+        href = target.evaluate(js)
+        if href and is_good_app_link(href):
+            return clean_googleadservices_link(href)
+    except Exception:
+        pass
+    return "N/A"
+
+
+def wait_and_extract_install_link_scoped(page, target, max_wait_seconds=8):
+    """
+    Extracts install/app link only from the active creative target.
+    Prevents same app/package from a different visible ad card.
+    """
+    start = time.time()
+    while time.time() - start < max_wait_seconds:
+        try:
+            candidates = get_visible_install_candidates_from_target(target)
+            if candidates:
+                candidates.sort(key=lambda x: x["score"], reverse=True)
+                best = candidates[0]
+                if best["score"] > 0 and is_good_app_link(best["href"]):
+                    return clean_googleadservices_link(best["href"])
+        except Exception:
+            pass
+
+        app_link = extract_install_link_by_precise_js_from_target(target)
+        if app_link != "N/A":
+            return app_link
+
+        page.wait_for_timeout(1000)
+
+    return "N/A"
+
+
+def extract_package_from_target(target):
+    """
+    Extract package names only from the active target, not the full advertiser page.
+    """
+    collected_texts = []
+
+    try:
+        html = target.evaluate("() => document.documentElement ? document.documentElement.outerHTML : ''")
+        if html:
+            collected_texts.append(html)
+
+        hrefs = target.evaluate("""
+            () => Array.from(document.querySelectorAll('a[href]')).map(a => a.href).filter(Boolean)
+        """)
+        if hrefs:
+            collected_texts.append('\n'.join(hrefs))
+
+        visible = target.evaluate("() => document.body ? document.body.innerText : ''")
+        if visible:
+            collected_texts.append(visible)
+    except Exception:
+        pass
+
+    combined = '\n'.join(collected_texts)
+    return extract_packages_from_text(combined)
+
+
+def has_visible_image_creative_scoped(target):
+    js = r"""
+    () => {
+        const isVisible = (el) => {
+            if (!el) return false;
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return (
+                rect.width >= 100 &&
+                rect.height >= 70 &&
+                rect.bottom > 0 &&
+                rect.right > 0 &&
+                rect.top < window.innerHeight &&
+                rect.left < window.innerWidth &&
+                style.visibility !== 'hidden' &&
+                style.display !== 'none' &&
+                style.opacity !== '0'
+            );
+        };
+
+        return Array.from(document.querySelectorAll('img, picture, canvas, svg')).some(el => {
+            const src = String(el.getAttribute('src') || '').toLowerCase();
+            const alt = String(el.getAttribute('alt') || '').toLowerCase();
+            if (src.includes('googlelogo') || alt.includes('google')) return false;
+            return isVisible(el);
+        });
+    }
+    """
+    try:
+        return bool(target.evaluate(js))
+    except Exception:
+        return False
+
 # =========================
 # MAIN COMBINED SCRAPER: VIDEO ADS + TEXT ADS
 # =========================
@@ -1798,13 +2390,18 @@ def scrape_single_url(url_row):
             # =========================
             print(f"📄 Row {row_num}: no video found, checking text/image ad")
 
-            # Extract image URL first. This is already working correctly in your code.
-            image_url = extract_primary_image_url(page)
+            # IMPORTANT FIX:
+            # Google transparency pages can contain multiple visible creatives from the same advertiser.
+            # First lock extraction to the active creative frame/card for THIS URL, then extract image/text/package only from that target.
+            active_target, active_score, active_kind = get_active_non_video_target(page, transparency_url=url)
 
-            # Extract headline/description from the visible text BELOW that matched image.
-            # This prevents CTA text like Install/Get/Download from being written.
-            text_data = wait_and_extract_text_below_primary_image(
+            # Extract image URL only from the active creative target.
+            image_url = extract_primary_image_url_from_target(active_target, page_url=page.url)
+
+            # Extract headline/description only from below that image inside the same active target.
+            text_data = wait_and_extract_text_below_primary_image_scoped(
                 page,
+                target=active_target,
                 image_url=image_url,
                 max_wait_seconds=15
             )
@@ -1812,21 +2409,20 @@ def scrape_single_url(url_row):
             headline = clean_text(text_data.get("headline"))
             description = clean_text(text_data.get("description"))
 
-            # If the below-image extractor found the same/better image inside the active frame, keep it.
             if text_data.get("image_url") and text_data.get("image_url") != "N/A":
                 image_url = text_data.get("image_url")
 
             process_time = get_exact_time()
             has_text = is_valid_text_ad(headline, description)
 
-            # First try visible install/app link from the active creative.
-            visible_app_link = wait_and_extract_install_link(page, max_wait_seconds=8)
+            # Extract install/app link only from the same active creative target.
+            visible_app_link = wait_and_extract_install_link_scoped(page, active_target, max_wait_seconds=8)
             visible_package = extract_package_name(visible_app_link)
 
-            is_image_like = has_visible_image_creative(page)
-            ad_type = "text" if has_text else "image" if (is_image_like or visible_package != "N/A") else "N/A"
+            is_image_like = has_visible_image_creative_scoped(active_target)
+            ad_type = "text" if has_text else "image" if (is_image_like or visible_package != "N/A" or image_url != "N/A") else "N/A"
 
-            if not has_text and visible_package == "N/A" and not is_image_like:
+            if not has_text and visible_package == "N/A" and not is_image_like and image_url == "N/A":
                 data = [
                     advertiser,
                     "N/A",
@@ -1874,8 +2470,14 @@ def scrape_single_url(url_row):
 
                 if has_text:
                     print(f"📦 Row {row_num}: visible install link not found, strict matching with headline + description")
-                    all_found_packages = extract_package_from_page(page)
+                    # Search packages only inside the active target first. Full-page scanning caused repeated/wrong package names.
+                    all_found_packages = extract_package_from_target(active_target)
                     package_name, match_score = get_best_matching_package(headline, description, all_found_packages)
+
+                    # Last fallback only if active target has no package candidates.
+                    if not package_name and not all_found_packages:
+                        all_found_packages = extract_package_from_page(page)
+                        package_name, match_score = get_best_matching_package(headline, description, all_found_packages)
 
                 if package_name:
                     app_link = f"https://play.google.com/store/apps/details?id={package_name}"
