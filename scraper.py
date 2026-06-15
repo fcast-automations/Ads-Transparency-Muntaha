@@ -8,7 +8,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import difflib
 import re
-import html
 
 def get_best_matching_package_for_text_ad(headline, description, package_list, min_score=0.70):
     """Matches package names with headline + description using character-level comparison."""
@@ -59,72 +58,49 @@ INSTALL_SELECTORS = [
 def safe_update_combined_row(row_num, data):
     """
     Thread-safe Google Sheet row update.
-    Returns True/False and never raises, so a small Sheets/log error cannot overwrite good scraped data.
+    Browser scraping runs parallel, but sheet writing is protected.
     """
     with SHEET_LOCK:
-        try:
-            sheets.update_combined_row(row_num, data)
-            return True
-        except Exception as e:
-            print(f"⚠️ Failed to update A-G for row {row_num}: {e}")
-            return False
+        sheets.update_combined_row(row_num, data)
 
 
 def safe_update_headline_desc(row_num, headline, description):
     """
-    Thread-safe Google Sheet update for Headline and Description in cols M and N.
-    Never raises.
+    Thread-safe Google Sheet row update for Headline and Description in cols M and N.
     """
     with SHEET_LOCK:
-        try:
-            sheets.update_headline_and_description(row_num, headline, description)
-            return True
-        except Exception as e:
-            print(f"⚠️ Failed to update headline/description for row {row_num}: {e}")
-            return False
+        sheets.update_headline_and_description(row_num, headline, description)
 
 
 def safe_update_image_url(row_num, image_url):
     """
-    Thread-safe Google Sheet update for Landscape Image URL in column O.
-    Never raises. This prevents a column-O write issue from turning a successful row into ERROR.
+    Thread-safe Google Sheet update for Image URL in column O.
+    Add update_image_url(row_num, image_url) in sheets.py.
     """
     image_url = clean_text(image_url)
     with SHEET_LOCK:
-        try:
-            if hasattr(sheets, "update_image_url"):
-                sheets.update_image_url(row_num, image_url)
-            elif hasattr(sheets, "get_sheet"):
-                # Fallback for older sheets.py files. update_cell is compatible with more gspread versions.
-                sheets.get_sheet().update_cell(row_num, 15, image_url)
-            else:
-                print("⚠️ sheets.update_image_url() missing. Add it to sheets.py to write column O.")
-            return True
-        except Exception as e:
-            print(f"⚠️ Failed to update image URL for row {row_num}; keeping existing scraped data. Error: {e}")
-            return False
+        if hasattr(sheets, "update_image_url"):
+            sheets.update_image_url(row_num, image_url)
+        else:
+            # Keeps scraper running if sheets.py has not been updated yet.
+            print("⚠️ sheets.update_image_url() missing. Add it to sheets.py to write column O.")
 
 
 def safe_add_log(row_number, status, log_type, url="", video_id="", app_link="", message=""):
     """
     Thread-safe log writing.
-    Never raises. Logs should not be able to overwrite a successful scrape with ERROR.
     """
     with SHEET_LOCK:
-        try:
-            sheets.add_log(
-                row_number=row_number,
-                status=status,
-                log_type=log_type,
-                url=url,
-                video_id=video_id,
-                app_link=app_link,
-                message=message
-            )
-            return True
-        except Exception as e:
-            print(f"⚠️ Failed to add log for row {row_number}: {e}")
-            return False
+        sheets.add_log(
+            row_number=row_number,
+            status=status,
+            log_type=log_type,
+            url=url,
+            video_id=video_id,
+            app_link=app_link,
+            message=message
+        )
+
 
 def get_exact_time():
     return datetime.now().strftime("%I:%M:%S %p")
@@ -134,64 +110,6 @@ def clean_text(value):
     if not value:
         return "N/A"
     return re.sub(r"\s+", " ", str(value)).strip() or "N/A"
-
-def _looks_like_bad_ad_copy(value):
-    """Reject Google UI / CTA / metadata text that sometimes appears near the creative."""
-    value = clean_text(value)
-    if value == "N/A":
-        return True
-
-    lower = value.lower().strip(" .:-|•")
-    exact_bad = {
-        "install", "get", "download", "open", "learn more", "play", "skip",
-        "sponsored", "ad", "ads", "menu", "search", "sign in", "privacy", "terms",
-        "ads transparency center", "ads transparency centre", "see more ads", "report this ad",
-        "about this ad", "why this ad", "ad details", "last shown", "shown in",
-        "app store", "google play", "itunes", "visit site", "shop now", "watch now",
-        "close", "dismiss", "hide", "x", "×", "ok", "cancel", "done", "back", "next",
-        "feedback", "send feedback", "ad choices", "adchoices", "not interested",
-        "stop seeing this ad", "always positive", "always negative"
-    }
-    contains_bad = [
-        "ads transparency", "report this ad", "see more ads", "why this ad",
-        "last shown", "shown in", "google llc", "doubleclick", "googleadservices",
-        "play.google.com", "apps.apple.com", "http://", "https://", "www.",
-        "privacy policy", "terms of service", "cookie", "all ads",
-        "always positive", "always negative", "feedback", "ad choices", "adchoices",
-        "stop seeing", "not interested", "close ad", "hide ad", "mute ad", "unmute",
-        "choose a reason", "why am i seeing", "control the ads", "my ad center", "my ad centre"
-    ]
-    if lower in exact_bad:
-        return True
-    if re.fullmatch(r"always\s+(positive|negative|on|off|allow|deny)", lower):
-        return True
-    if any(b in lower for b in contains_bad):
-        return True
-    if re.fullmatch(r"[\d\W_]+", lower):
-        return True
-    if len(value) > 260:
-        return True
-    return False
-
-
-def clean_extracted_ad_copy(value):
-    """Final Python cleanup for headline/description before writing to Sheets."""
-    value = clean_text(html.unescape(str(value or "")))
-    if value == "N/A":
-        return "N/A"
-
-    # Remove repeated whitespace and common trailing CTA-only fragments.
-    value = re.sub(r"\s+", " ", value).strip(" \t\r\n-|•")
-    value = re.sub(r"\s+(Install|Get|Download|Open|Learn More|Learn more)$", "", value).strip()
-
-    if _looks_like_bad_ad_copy(value):
-        return "N/A"
-    return value or "N/A"
-
-
-def normalize_copy_for_compare(value):
-    value = clean_text(value)
-    return re.sub(r"[\W_]+", "", value.lower(), flags=re.UNICODE)
 
 
 def extract_package_name(app_link):
@@ -735,12 +653,76 @@ def wait_and_extract_install_link(page, max_wait_seconds=35):
 
 def wait_and_extract_headline_description(page, max_wait_seconds=15):
     """
-    Video-ad headline/description extraction now uses the same safer visual extractor
-    as non-video ads, instead of relying only on fragile class names.
+    Polls for Headline and Description inside iframes ONLY.
+    Uses structural class patterns (-e-15, -e-67) and visibility checks 
+    to avoid grabbing hidden template text.
     """
-    data = wait_and_extract_text_ad_details(page, max_wait_seconds=max_wait_seconds)
-    return data.get("headline", "N/A"), data.get("description", "N/A")
+    js = r"""
+    () => {
+        let headText = "N/A";
+        let descText = "N/A";
 
+        // Helper to ensure we don't grab hidden/template elements
+        const isVisible = (el) => {
+            if (!el) return false;
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none' && style.opacity !== '0';
+        };
+
+        // SEARCH HEADLINE: Matches any class containing '-e-15' OR 'headline'
+        const headNodes = document.querySelectorAll('[class*="-e-15"], [class*="headline"]');
+        for (let el of headNodes) {
+            if (isVisible(el)) {
+                let text = (el.innerText || el.textContent || "").replace(/\n/g, ' ').trim();
+                // Ensure it's not a template placeholder like {{headline}}
+                if (text.length > 1 && !text.includes('{{')) { 
+                    headText = text; 
+                    break; 
+                }
+            }
+        }
+
+        // SEARCH DESCRIPTION: Matches any class containing '-e-67' OR 'long-description'
+        const descNodes = document.querySelectorAll('[class*="-e-67"], [class*="long-description"]');
+        for (let el of descNodes) {
+            if (isVisible(el)) {
+                let text = (el.innerText || el.textContent || "").replace(/\n/g, ' ').trim();
+                if (text.length > 1 && text !== headText && !text.includes('{{')) { 
+                    descText = text; 
+                    break; 
+                }
+            }
+        }
+
+        // If we found either one, return it
+        if (headText !== "N/A" || descText !== "N/A") {
+            return { headline: headText, description: descText };
+        }
+
+        return null;
+    }
+    """
+
+    start = time.time()
+    
+    # Retry loop: Keeps trying for up to max_wait_seconds (15s)
+    while time.time() - start < max_wait_seconds:
+        
+        # STRICTLY CHECK IFRAMES ONLY.
+        for frame in page.frames:
+            try:
+                result = frame.evaluate(js)
+                if result and (result.get("headline", "N/A") != "N/A" or result.get("description", "N/A") != "N/A"):
+                    return result.get("headline", "N/A"), result.get("description", "N/A")
+            except Exception:
+                continue
+        
+        # Wait 1 second and loop again to let the ad iframe fully load
+        page.wait_for_timeout(1000)
+
+    # If the timer runs out, return N/A
+    return "N/A", "N/A"
 
 # =========================
 # STRICT TEXT-AD PACKAGE MATCHER
@@ -1195,271 +1177,150 @@ def get_ranked_non_video_targets(page):
 
 def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
     """
-    Extract headline and description from the active creative.
-
-    Improvements over the older version:
-    - Reads real text-node bounding boxes, not large wrapper div text.
-    - Gives priority to headline/description classes when they are present.
-    - Ignores Google Transparency UI, CTA buttons, URLs, dates, and metadata.
-    - Uses the active creative iframe ranking, and only uses the main page when it scores strongly.
-    - Chooses description from the text directly below/near the headline.
+    Extract headline and description from the active non-video creative.
+    Rule used for image/text ads:
+    - the biggest visible text is treated as headline
+    - the visible text directly below it is treated as description
     """
     js = r"""
     () => {
         const cleanText = (txt) => (txt || "")
-            .replace(/\u00a0/g, " ")
             .replace(/\n/g, " ")
             .replace(/\s+/g, " ")
             .trim();
 
-        const badExact = new Set([
-            'install', 'get', 'download', 'open', 'learn more', 'play', 'skip',
-            'sponsored', 'ad', 'ads', 'menu', 'search', 'sign in', 'privacy', 'terms',
-            'ads transparency center', 'ads transparency centre', 'see more ads',
-            'report this ad', 'about this ad', 'why this ad', 'ad details',
-            'last shown', 'shown in', 'app store', 'google play', 'itunes',
-            'visit site', 'shop now', 'watch now',
-            'close', 'dismiss', 'hide', 'x', '×', 'ok', 'cancel', 'done', 'back', 'next',
-            'feedback', 'send feedback', 'ad choices', 'adchoices', 'not interested',
-            'stop seeing this ad', 'always positive', 'always negative'
-        ]);
-
-        const badContains = [
-            'ads transparency', 'report this ad', 'see more ads', 'why this ad',
-            'last shown', 'shown in', 'google llc', 'doubleclick', 'googleadservices',
-            'play.google.com', 'apps.apple.com', 'http://', 'https://', 'www.',
-            'privacy policy', 'terms of service', 'cookie', 'all ads',
-            'always positive', 'always negative', 'feedback', 'ad choices', 'adchoices',
-            'stop seeing', 'not interested', 'close ad', 'hide ad', 'mute ad', 'unmute',
-            'choose a reason', 'why am i seeing', 'control the ads', 'my ad center', 'my ad centre'
-        ];
+        const isVisible = (el) => {
+            if (!el) return false;
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return rect.width > 0 && rect.height > 0 &&
+                   style.visibility !== 'hidden' &&
+                   style.display !== 'none' &&
+                   style.opacity !== '0';
+        };
 
         const isBadUiText = (txt) => {
-            const text = cleanText(txt);
-            if (!text) return true;
-            const lower = text.toLowerCase().replace(/^[\s.:-|•]+|[\s.:-|•]+$/g, '');
+            const lower = cleanText(txt).toLowerCase();
             if (!lower) return true;
-            if (badExact.has(lower)) return true;
-            if (/^always\s+(positive|negative|on|off|allow|deny)$/.test(lower)) return true;
-            if (badContains.some(b => lower.includes(b))) return true;
-            if (/^[\d\W_]+$/u.test(lower)) return true;
-            if (text.length > 260) return true;
-            return false;
-        };
-
-        const metaFor = (el) => {
-            const cls = String(el?.className || '').toLowerCase();
-            const aria = String(el?.getAttribute?.('aria-label') || '').toLowerCase();
-            const role = String(el?.getAttribute?.('role') || '').toLowerCase();
-            const tag = String(el?.tagName || '').toLowerCase();
-            return {
-                cls,
-                aria,
-                role,
-                tag,
-                isHeadlineClass: cls.includes('headline') || cls.includes('-e-15') || aria.includes('headline') || role === 'heading',
-                isDescriptionClass: cls.includes('description') || cls.includes('long-description') || cls.includes('-e-67') || aria.includes('description'),
-                isButtonLike: tag === 'button' || role === 'button' || cls.includes('button')
-            };
-        };
-
-        const visibleRect = (el, rect = null) => {
-            if (!el) return null;
-            const r = rect || el.getBoundingClientRect();
-            const style = window.getComputedStyle(el);
-            if (r.width <= 1 || r.height <= 1) return null;
-            if (r.bottom <= 0 || r.right <= 0 || r.top >= window.innerHeight || r.left >= window.innerWidth) return null;
-            if (style.visibility === 'hidden' || style.display === 'none' || style.opacity === '0') return null;
-            return r;
+            const exactBad = new Set([
+                'install', 'get', 'download', 'open', 'learn more',
+                'ads transparency center', 'ads transparency centre',
+                'sign in', 'menu', 'search', 'privacy', 'terms'
+            ]);
+            if (exactBad.has(lower)) return true;
+            return lower.includes('report this ad') ||
+                   lower.includes('see more ads') ||
+                   lower.includes('last shown') ||
+                   lower.includes('shown in');
         };
 
         const candidates = [];
 
-        const addCandidate = (rawText, el, rect, source, boost = 0) => {
-            const text = cleanText(rawText);
-            if (isBadUiText(text)) return;
-            const words = text.split(/\s+/).filter(Boolean);
-            if (words.length > 24) return; // usually a wrapper/container, not an ad line
+        for (const el of Array.from(document.querySelectorAll('body *'))) {
+            if (!isVisible(el)) continue;
 
-            const r = visibleRect(el, rect);
-            if (!r) return;
-            if (r.width < 5 || r.height < 5) return;
+            const text = cleanText(el.innerText || el.textContent || '');
+            if (text.length < 2 || text.length > 260) continue;
+            if (text.includes('{{') || text.includes('}}')) continue;
+            if (isBadUiText(text)) continue;
+
+            const cls = String(el.className || '').toLowerCase();
+            const aria = String(el.getAttribute('aria-label') || '').toLowerCase();
+            const role = String(el.getAttribute('role') || '').toLowerCase();
+            const isSpecificTextNode =
+                cls.includes('headline') || cls.includes('-e-15') ||
+                cls.includes('description') || cls.includes('long-description') || cls.includes('-e-67') ||
+                aria.includes('headline') || aria.includes('description') || role === 'link';
+
+            // Avoid large wrapper containers that only repeat child text.
+            const directText = cleanText(Array.from(el.childNodes)
+                .filter(n => n.nodeType === Node.TEXT_NODE)
+                .map(n => n.textContent || '')
+                .join(' '));
+            if (el.children.length > 0 && !isSpecificTextNode && directText.length < 2) continue;
+
+            const rect = el.getBoundingClientRect();
+            if (rect.width < 20 || rect.height < 8) continue;
 
             const style = window.getComputedStyle(el);
             const fontSize = parseFloat(style.fontSize || '0') || 0;
-            const rawWeight = String(style.fontWeight || '400');
-            const fontWeight = rawWeight === 'bold' ? 700 : (parseInt(rawWeight, 10) || 400);
-            const meta = metaFor(el);
+            const fontWeightRaw = String(style.fontWeight || '400');
+            const fontWeight = fontWeightRaw === 'bold' ? 700 : (parseInt(fontWeightRaw, 10) || 400);
 
             candidates.push({
                 text,
-                top: r.top,
-                bottom: r.bottom,
-                left: r.left,
-                right: r.right,
-                width: r.width,
-                height: r.height,
+                top: rect.top,
+                bottom: rect.bottom,
+                left: rect.left,
+                width: rect.width,
+                height: rect.height,
                 fontSize,
                 fontWeight,
-                source,
-                boost,
-                ...meta
+                cls,
+                aria,
+                role,
+                isHeadlineClass: cls.includes('headline') || cls.includes('-e-15') || aria.includes('headline'),
+                isDescriptionClass: cls.includes('description') || cls.includes('long-description') || cls.includes('-e-67') || aria.includes('description')
             });
-        };
-
-        // 1) Explicit headline/description selectors first.
-        const explicitSelectors = [
-            '[class*="-e-15"]', '[class*="headline"]', '[aria-label*="Headline"]', '[aria-label*="headline"]',
-            '[role="heading"]', 'h1', 'h2', 'h3', 'h4',
-            'div[role="link"] span', 'a[role="link"]',
-            '[class*="-e-67"]', '[class*="long-description"]', '[class*="description"]',
-            '[aria-label*="Description"]', '[aria-label*="description"]'
-        ];
-
-        for (const el of Array.from(document.querySelectorAll(explicitSelectors.join(',')))) {
-            const text = cleanText(el.innerText || el.textContent || '');
-            if (!text) continue;
-            const meta = metaFor(el);
-            const boost = meta.isHeadlineClass ? 600 : (meta.isDescriptionClass ? 420 : 120);
-            addCandidate(text, el, el.getBoundingClientRect(), 'explicit', boost);
-        }
-
-        // 2) Text nodes: avoids picking wrapper divs that contain headline + desc + CTA together.
-        const textNodes = [];
-        if (document.body) {
-            const walker = document.createTreeWalker(
-                document.body,
-                NodeFilter.SHOW_TEXT,
-                {
-                    acceptNode: (node) => {
-                        const text = cleanText(node.nodeValue || '');
-                        if (text.length < 2 || isBadUiText(text)) return NodeFilter.FILTER_REJECT;
-                        const el = node.parentElement;
-                        if (!el) return NodeFilter.FILTER_REJECT;
-                        const tag = String(el.tagName || '').toLowerCase();
-                        if (['script', 'style', 'noscript', 'template'].includes(tag)) return NodeFilter.FILTER_REJECT;
-                        return NodeFilter.FILTER_ACCEPT;
-                    }
-                }
-            );
-
-            while (walker.nextNode()) {
-                const node = walker.currentNode;
-                const el = node.parentElement;
-                try {
-                    const range = document.createRange();
-                    range.selectNodeContents(node);
-                    const rect = range.getBoundingClientRect();
-                    const text = cleanText(node.nodeValue || '');
-                    if (!visibleRect(el, rect)) continue;
-                    const item = { text, el, rect };
-                    textNodes.push(item);
-                    addCandidate(text, el, rect, 'text-node', 35);
-                } catch (e) {}
-            }
-        }
-
-        // 3) Group text nodes on the same visual line. Some ads split a headline into many spans.
-        const sortedNodes = textNodes.slice().sort((a, b) => (a.rect.top - b.rect.top) || (a.rect.left - b.rect.left));
-        const lineGroups = [];
-        for (const n of sortedNodes) {
-            let group = lineGroups.find(g => Math.abs(g.top - n.rect.top) <= 5 && Math.abs(g.bottom - n.rect.bottom) <= 7);
-            if (!group) {
-                group = { top: n.rect.top, bottom: n.rect.bottom, nodes: [] };
-                lineGroups.push(group);
-            }
-            group.nodes.push(n);
-            group.top = (group.top + n.rect.top) / 2;
-            group.bottom = (group.bottom + n.rect.bottom) / 2;
-        }
-
-        for (const g of lineGroups) {
-            if (g.nodes.length < 2) continue;
-            const nodes = g.nodes.slice().sort((a, b) => a.rect.left - b.rect.left);
-            const text = cleanText(nodes.map(n => n.text).join(' '));
-            if (!text || isBadUiText(text)) continue;
-            const left = Math.min(...nodes.map(n => n.rect.left));
-            const right = Math.max(...nodes.map(n => n.rect.right));
-            const top = Math.min(...nodes.map(n => n.rect.top));
-            const bottom = Math.max(...nodes.map(n => n.rect.bottom));
-            addCandidate(text, nodes[0].el, { left, right, top, bottom, width: right - left, height: bottom - top }, 'line-group', 80);
         }
 
         if (!candidates.length) {
             return { headline: 'N/A', description: 'N/A' };
         }
 
-        // Deduplicate by normalized text. Keep the strongest visual/explicit occurrence.
-        const norm = (txt) => cleanText(txt).toLowerCase().replace(/[\W_]+/gu, '');
-        const uniqueByText = new Map();
+        const unique = [];
+        const seen = new Set();
         for (const c of candidates) {
-            const key = norm(c.text);
-            if (!key) continue;
-            let preScore = c.boost + c.fontSize * 100 + Math.min((c.width * c.height) / 25, 220);
-            if (c.fontWeight >= 600) preScore += 70;
-            if (c.source === 'line-group') preScore += 50;
-            if (c.isButtonLike) preScore -= 500;
-            const prev = uniqueByText.get(key);
-            if (!prev || preScore > prev.preScore) {
-                uniqueByText.set(key, { ...c, preScore });
+            const key = `${c.text}|${Math.round(c.top)}|${Math.round(c.left)}`;
+            if (!seen.has(key)) {
+                seen.add(key);
+                unique.push(c);
             }
         }
-        const unique = Array.from(uniqueByText.values());
 
         const headlineCandidates = unique.map(c => {
             const words = c.text.split(/\s+/).filter(Boolean).length;
-            let score = c.boost;
-            score += c.fontSize * 100;
-            score += Math.min((c.width * c.height) / 25, 220);
+            let score = c.fontSize * 100;
+            score += Math.min(c.width * c.height / 20, 180);
             if (c.fontWeight >= 600) score += 80;
-            if (c.isHeadlineClass) score += 700;
-            if (c.role === 'link') score += 80;
-            if (c.source === 'line-group') score += 70;
-            if (c.source === 'text-node') score += 30;
-            if (c.isDescriptionClass) score -= 180;
-            if (c.isButtonLike) score -= 600;
-            if (c.text.length > 105) score -= 100;
-            if (words > 16) score -= 150;
-            if (c.top < -10 || c.top > window.innerHeight - 5) score -= 300;
-            if (c.top > 760) score -= 120;
+            if (c.isHeadlineClass) score += 500;
+            if (c.role === 'link') score += 40;
+            if (c.text.length > 95) score -= 80;
+            if (words > 14) score -= 80;
+            // Prefer creative area, not page chrome far away.
+            if (c.top < -20 || c.top > 720) score -= 200;
             return { ...c, headlineScore: score };
         }).sort((a, b) => b.headlineScore - a.headlineScore);
 
-        const headlineObj = headlineCandidates[0] || null;
+        const headlineObj = headlineCandidates[0];
         const headline = headlineObj ? headlineObj.text : 'N/A';
 
-        let descCandidates = [];
+        let descriptionObj = null;
         if (headlineObj) {
-            descCandidates = unique
-                .filter(c => norm(c.text) !== norm(headlineObj.text))
+            const below = unique
+                .filter(c => c.text !== headlineObj.text)
+                .filter(c => c.top >= headlineObj.bottom - 4)
+                .filter(c => c.top <= headlineObj.bottom + 260)
                 .filter(c => c.text.length >= 5)
                 .map(c => {
-                    const distanceBelow = c.top - headlineObj.bottom;
-                    const absVertical = Math.abs(c.top - headlineObj.bottom);
-                    let score = 0;
-                    if (c.isDescriptionClass) score += 750;
-                    if (distanceBelow >= -6 && distanceBelow <= 260) score += 520 - Math.min(Math.max(distanceBelow, 0), 260);
-                    else if (absVertical <= 90) score += 180 - absVertical;
-                    else score -= Math.min(absVertical, 260);
-                    if (c.fontSize <= headlineObj.fontSize + 2) score += 90;
-                    if (c.fontSize < headlineObj.fontSize) score += 60;
-                    if (c.fontSize > headlineObj.fontSize + 4) score -= 120;
-                    score += Math.min(c.text.length, 190) / 2;
-                    score -= Math.min(Math.abs(c.left - headlineObj.left) / 4, 85);
-                    if (c.isHeadlineClass || c.role === 'link') score -= 80;
-                    if (c.isButtonLike) score -= 600;
-                    if (c.top < -10 || c.top > window.innerHeight - 5) score -= 300;
+                    const distance = Math.max(0, c.top - headlineObj.bottom);
+                    let score = 300 - Math.min(distance, 300);
+                    score += Math.min(c.text.length, 180) / 2;
+                    if (c.isDescriptionClass) score += 500;
+                    if (c.fontSize <= headlineObj.fontSize + 2) score += 50;
+                    if (c.fontSize > headlineObj.fontSize + 4) score -= 100;
+                    score -= Math.min(Math.abs(c.left - headlineObj.left) / 4, 80);
                     return { ...c, descScore: score };
                 })
                 .sort((a, b) => b.descScore - a.descScore);
-        }
 
-        let descriptionObj = descCandidates.length ? descCandidates[0] : null;
+            descriptionObj = below.length ? below[0] : null;
+        }
 
         // Fallback: explicit description class anywhere in the same creative.
         if (!descriptionObj) {
             const explicitDesc = unique
-                .filter(c => norm(c.text) !== norm(headline))
+                .filter(c => c.text !== headline)
                 .filter(c => c.isDescriptionClass && c.text.length >= 5)
                 .sort((a, b) => b.text.length - a.text.length);
             descriptionObj = explicitDesc.length ? explicitDesc[0] : null;
@@ -1475,17 +1336,8 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
             data = target.evaluate(js)
             if not data:
                 return None
-
-            headline = clean_extracted_ad_copy(data.get("headline"))
-            description = clean_extracted_ad_copy(data.get("description"))
-
-            # Avoid writing the same text in both columns.
-            if headline != "N/A" and description != "N/A":
-                if normalize_copy_for_compare(headline) == normalize_copy_for_compare(description):
-                    description = "N/A"
-                elif normalize_copy_for_compare(description) and normalize_copy_for_compare(description) in normalize_copy_for_compare(headline):
-                    description = "N/A"
-
+            headline = clean_text(data.get("headline"))
+            description = clean_text(data.get("description"))
             if headline != "N/A" or description != "N/A":
                 return {"headline": headline, "description": description}
         except Exception:
@@ -1497,23 +1349,25 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
     while time.time() - start_time < max_wait_seconds:
         seen_targets = set()
 
+        # Prefer the active creative frame/page using your existing ranking helper.
         try:
             ranked_targets = get_ranked_non_video_targets(page)
         except Exception:
             ranked_targets = []
 
-        # Prefer the active creative frame. Main page is used only if its score is strong.
-        for score, target, label, _ in ranked_targets:
+        for _, target, _, _ in ranked_targets:
             if id(target) in seen_targets:
-                continue
-            if label == "main_page" and score < 220:
                 continue
             seen_targets.add(id(target))
             data = read_target(target)
             if data:
                 return data
 
-        # Fallback: iframes only. This avoids grabbing Google Transparency page chrome as ad copy.
+        # Fallback: main page, then every iframe.
+        data = read_target(page)
+        if data:
+            return data
+
         for frame in page.frames:
             if frame == page.main_frame or id(frame) in seen_targets:
                 continue
@@ -1521,15 +1375,10 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
             if data:
                 return data
 
-        # Final fallback: main page only if there are no useful iframes.
-        if not ranked_targets:
-            data = read_target(page)
-            if data:
-                return data
-
         page.wait_for_timeout(1000)
 
     return {"headline": "N/A", "description": "N/A"}
+
 
 def clean_image_url(raw_url, base_url=""):
     """Normalize image URLs found in src/srcset/background-image."""
@@ -1737,18 +1586,10 @@ def wait_and_extract_image_url(page, max_wait_seconds=15):
 # =========================
 
 def is_valid_text_ad(headline, description):
-    """
-    Treat it as a text ad only when we have a real headline.
-    Description-only results are too risky because Google UI text such as
-    close/feedback/ad-choice labels can appear inside the same iframe.
-    """
-    headline = clean_extracted_ad_copy(headline)
-    description = clean_extracted_ad_copy(description)
-
-    if headline != "N/A" and len(clean_text(headline)) >= 3:
+    if headline and headline != "N/A" and len(clean_text(headline)) >= 3:
         return True
-
-    # Do not let description-only text turn an image ad into a fake text ad.
+    if description and description != "N/A" and len(clean_text(description)) >= 15:
+        return True
     return False
 
 def has_visible_image_creative(page):
@@ -1851,9 +1692,6 @@ def scrape_single_url(url_row):
 
         page.on("response", handle_response)
 
-        # Once this becomes True, the exception handler will NOT overwrite the row with ERROR.
-        row_written = False
-
         try:
             if "region=" not in url:
                 separator = "&" if "?" in url else "?"
@@ -1908,7 +1746,7 @@ def scrape_single_url(url_row):
                     video_time
                 ]
 
-                row_written = safe_update_combined_row(row_num, data) or row_written
+                safe_update_combined_row(row_num, data)
                 safe_update_headline_desc(row_num, headline, description)
                 safe_update_image_url(row_num, "N/A")
 
@@ -1931,15 +1769,8 @@ def scrape_single_url(url_row):
             print(f"📄 Row {row_num}: no video found, checking text/image ad")
 
             text_data = wait_and_extract_text_ad_details(page, max_wait_seconds=15)
-            headline = clean_extracted_ad_copy(text_data.get("headline"))
-            description = clean_extracted_ad_copy(text_data.get("description"))
-
-            # Rows like 6/10 were caused by UI-only text: headline="close" and
-            # description="Always positive/negative". If the headline is not real,
-            # do not keep a description-only value.
-            if headline == "N/A":
-                description = "N/A"
-
+            headline = clean_text(text_data.get("headline"))
+            description = clean_text(text_data.get("description"))
             process_time = get_exact_time()
             has_text = is_valid_text_ad(headline, description)
 
@@ -1966,7 +1797,7 @@ def scrape_single_url(url_row):
                     process_time
                 ]
 
-                row_written = safe_update_combined_row(row_num, data) or row_written
+                safe_update_combined_row(row_num, data)
                 safe_update_headline_desc(row_num, "N/A", "N/A")
                 safe_update_image_url(row_num, "N/A")
 
@@ -2028,7 +1859,7 @@ def scrape_single_url(url_row):
                 process_time
             ]
 
-            row_written = safe_update_combined_row(row_num, data) or row_written
+            safe_update_combined_row(row_num, data)
             safe_update_headline_desc(row_num, headline if has_text else "N/A", description if has_text else "N/A")
             safe_update_image_url(row_num, image_url)
 
@@ -2048,35 +1879,24 @@ def scrape_single_url(url_row):
             error_time = get_exact_time()
             print(f"❌ Row {row_num} error at {error_time}: {e}")
 
-            # Important fix: if the scraper already saved correct data, do NOT overwrite it with ERROR.
-            # This is what made the row look correct for a second and then change to ERROR.
-            if row_written:
-                print(f"⚠️ Row {row_num}: error happened after data was already saved. Keeping saved row, not writing ERROR.")
-                safe_add_log(
-                    row_number=row_num,
-                    status="POST_SAVE_ERROR_IGNORED",
-                    log_type="COMBINED",
-                    url=url,
-                    message=str(e)
-                )
-            else:
-                try:
-                    data = [
-                        "",
-                        "N/A",
-                        url,
-                        "ERROR",
-                        error_time,
-                        "ERROR",
-                        error_time
-                    ]
+            try:
+                data = [
+                    "",
+                    "N/A",
+                    url,
+                    "ERROR",
+                    error_time,
+                    "ERROR",
+                    error_time
+                ]
 
-                    safe_update_combined_row(row_num, data)
-                    safe_update_headline_desc(row_num, "N/A", "N/A")
-                    safe_update_image_url(row_num, "N/A")
-                except Exception:
-                    pass
+                safe_update_combined_row(row_num, data)
+                safe_update_headline_desc(row_num, "N/A", "N/A")
+                safe_update_image_url(row_num, "N/A")
+            except Exception:
+                pass
 
+            try:
                 safe_add_log(
                     row_number=row_num,
                     status="ERROR",
@@ -2084,66 +1904,28 @@ def scrape_single_url(url_row):
                     url=url,
                     message=str(e)
                 )
+            except Exception:
+                pass
 
         finally:
-            # Closing Playwright objects can sometimes raise after a successful scrape.
-            # Never let close errors affect the saved row.
-            for close_name, close_func in [
-                ("page", page.close),
-                ("context", context.close),
-                ("browser", browser.close),
-            ]:
-                try:
-                    close_func()
-                except Exception as close_error:
-                    print(f"⚠️ Row {row_num}: ignored {close_name}.close() error: {close_error}")
+            page.close()
+            context.close()
+            browser.close()
 
-def run_parallel_combined_scraper(max_workers=2, only_unprocessed=True, row_filter=None):
-    """
-    Runs scraper in parallel.
+def run_parallel_combined_scraper(max_workers=2):
+    urls = sheets.get_urls_with_retry()
 
-    Default behavior is safer now:
-    - uses sheets.get_agent_rows_snapshot() when available
-    - skips rows that already have a value in column F
-    - retries rows where column F is ERROR, if you use the updated sheets.py
-
-    To force a full rescrape, call:
-        run_parallel_combined_scraper(max_workers=MAX_WORKERS, only_unprocessed=False)
-
-    To rerun selected wrong rows only, pass row_filter={5, 8, 12}.
-    """
-    url_rows = []
-
-    try:
-        if hasattr(sheets, "get_agent_rows_snapshot"):
-            rows = sheets.get_agent_rows_snapshot()
-            url_rows = [
-                (r["row_num"], str(r["url"]).strip())
-                for r in rows
-                if r.get("url") and str(r.get("url")).strip()
-                and (row_filter is None or r.get("row_num") in row_filter)
-                and (not only_unprocessed or not r.get("processed"))
-            ]
-        else:
-            raise AttributeError("sheets.get_agent_rows_snapshot is not available")
-    except Exception as e:
-        print(f"⚠️ Could not use agent snapshot, falling back to column H list: {e}")
-        urls = sheets.get_urls_with_retry()
-        url_rows = [
-            (i + 2, u.strip())
-            for i, u in enumerate(urls)
-            if u and u.strip()
-            and (row_filter is None or (i + 2) in row_filter)
-        ]
+    url_rows = [
+        (i + 2, u.strip())
+        for i, u in enumerate(urls)
+        if u and u.strip()
+    ]
 
     if not url_rows:
-        print("No transparency URLs found to process. Existing completed rows were skipped.")
+        print("No transparency URLs found in column H.")
         return
 
-    if row_filter is not None:
-        print(f"🎯 Reprocessing selected rows only: {sorted(row_filter)}")
-
-    print(f"🚀 Starting combined VIDEO + TEXT + IMAGE scraper for {len(url_rows)} rows")
+    print(f"🚀 Starting combined VIDEO + TEXT scraper for {len(url_rows)} rows")
     print(f"⚡ Running parallel with max_workers={max_workers}")
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -2159,53 +1941,19 @@ def run_parallel_combined_scraper(max_workers=2, only_unprocessed=True, row_filt
                 future.result()
             except Exception as e:
                 print(f"❌ Worker failed for row {row_num}: {e}")
-                safe_add_log(
-                    row_number=row_num,
-                    status="WORKER_ERROR",
-                    log_type="COMBINED",
-                    message=str(e)
-                )
 
-    print("✅ Finished combined video + text + image scraping")
+                try:
+                    safe_add_log(
+                        row_number=row_num,
+                        status="WORKER_ERROR",
+                        log_type="COMBINED",
+                        message=str(e)
+                    )
+                except Exception:
+                    pass
 
-
-def parse_row_filter_arg(args):
-    """
-    Supports command line row filters like:
-        --rows=5
-        --rows=5,8,12-15
-    """
-    for arg in args:
-        if not arg.startswith("--rows="):
-            continue
-        raw = arg.split("=", 1)[1].strip()
-        rows = set()
-        for part in raw.split(","):
-            part = part.strip()
-            if not part:
-                continue
-            if "-" in part:
-                start, end = part.split("-", 1)
-                start, end = int(start), int(end)
-                rows.update(range(min(start, end), max(start, end) + 1))
-            else:
-                rows.add(int(part))
-        return rows or None
-    return None
+    print("✅ Finished combined video + text scraping")
 
 
 if __name__ == "__main__":
-    import sys
-
-    selected_rows = parse_row_filter_arg(sys.argv[1:])
-
-    # Default: skip completed rows.
-    # --all: rerun every URL row.
-    # --rows=5,8,12-15: rerun only those rows, even if they are already completed.
-    only_unprocessed = "--all" not in sys.argv[1:] and selected_rows is None
-
-    run_parallel_combined_scraper(
-        max_workers=MAX_WORKERS,
-        only_unprocessed=only_unprocessed,
-        row_filter=selected_rows
-    )
+    run_parallel_combined_scraper(max_workers=MAX_WORKERS)
