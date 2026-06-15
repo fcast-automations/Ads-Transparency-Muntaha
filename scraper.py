@@ -49,11 +49,9 @@ INSTALL_SELECTORS = [
     "a.install-button-anchor.svg-anchor",
     "a.install-button-anchor",
     'a[data-asoch-targets-ad-objective-type]',
+    'a:has-text("Install")',
     'a:has-text("Get")',
     'a:has-text("Download")',
-    'a:has-text("Open")',
-    'a:has-text("View")',
-    'a:has-text("Play")',
 ]
 
 
@@ -138,88 +136,6 @@ def extract_package_name(app_link):
     
     except Exception:
         return "N/A"
-
-
-# =========================
-# EXTRACT PACKAGE FROM SCRIPT VAR DATA APPIID
-# =========================
-
-def extract_package_from_script_var(page):
-    """
-    Extracts package name from script variable data.appId.
-    Looks for patterns like: var data = {google_width: ..., appId: 'com.example.app', ...}
-    """
-    js = r"""
-    () => {
-        let foundPackage = null;
-
-        // Method 1: Direct window variable access
-        if (window.data && window.data.appId) {
-            const appId = String(window.data.appId).trim();
-            if (appId && appId.length > 0 && appId !== 'null' && appId !== 'undefined') {
-                foundPackage = appId;
-            }
-        }
-
-        // Method 2: Scan all script tags for var data = {...appId...}
-        if (!foundPackage) {
-            const scripts = Array.from(document.querySelectorAll('script'));
-            for (let script of scripts) {
-                if (!script.textContent) continue;
-                
-                // Pattern 1: var data = {..., appId: 'com.example.app', ...}
-                const match1 = script.textContent.match(/var\s+data\s*=\s*\{[^}]*appId\s*:\s*['"]([^'"]+)['"]/i);
-                if (match1 && match1[1]) {
-                    const pkg = match1[1].trim();
-                    if (pkg && pkg.includes('.') && !pkg.includes('null') && !pkg.includes('undefined')) {
-                        foundPackage = pkg;
-                        break;
-                    }
-                }
-
-                // Pattern 2: appId: 'com.example.app'
-                const match2 = script.textContent.match(/appId\s*:\s*['"]([^'"]+)['"]/i);
-                if (match2 && match2[1]) {
-                    const pkg = match2[1].trim();
-                    if (pkg && pkg.includes('.') && !pkg.includes('null') && !pkg.includes('undefined')) {
-                        foundPackage = pkg;
-                        break;
-                    }
-                }
-
-                // Pattern 3: destination_url with id parameter
-                const match3 = script.textContent.match(/[?&]id=([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*){2,})/i);
-                if (match3 && match3[1]) {
-                    foundPackage = match3[1];
-                    break;
-                }
-            }
-        }
-
-        return foundPackage;
-    }
-    """
-
-    try:
-        package = page.evaluate(js)
-        if package and isinstance(package, str) and len(package) > 0:
-            # Validate it looks like a package name
-            if package.count('.') >= 2 and not package.lower().includes('null'):
-                return package
-    except Exception:
-        pass
-
-    # Also check iframes
-    for frame in page.frames:
-        try:
-            package = frame.evaluate(js)
-            if package and isinstance(package, str) and len(package) > 0:
-                if package.count('.') >= 2:
-                    return package
-        except Exception:
-            continue
-
-    return "N/A"
 
 
 # =========================
@@ -557,8 +473,10 @@ def get_visible_install_candidates_from_target(target):
                     except Exception:
                         pass
 
-                    if "get" in text or "download" in text or "open" in text or "view" in text or "play" in text:
+                    if "install" in text:
                         score += 80
+                    elif "get" in text or "download" in text:
+                        score += 40
 
                     center_x = box["x"] + box["width"] / 2
                     center_y = box["y"] + box["height"] / 2
@@ -622,7 +540,7 @@ def extract_visible_install_link(page):
 def extract_install_link_by_precise_js(page):
     """
     Strict JS fallback:
-    only Get/Download/Open/View/Play text links,
+    only install-button-anchor / Install text links,
     not every googleadservices link.
     """
     js = r"""
@@ -643,13 +561,10 @@ def extract_install_link_by_precise_js(page):
 
             const looksInstall =
                 cls.includes('install-button-anchor') ||
+                text.includes('install') ||
                 text.includes('get') ||
                 text.includes('download') ||
-                text.includes('open') ||
-                text.includes('view') ||
-                text.includes('play') ||
-                aria.includes('get') ||
-                aria.includes('download');
+                aria.includes('install');
 
             const visible =
                 rect.width > 20 &&
@@ -665,8 +580,8 @@ def extract_install_link_by_precise_js(page):
 
             let score = 0;
             if (cls.includes('install-button-anchor')) score += 100;
-            if (text.includes('get') || text.includes('download') || text.includes('open')) score += 80;
-            if (text.includes('view') || text.includes('play')) score += 40;
+            if (text.includes('install')) score += 80;
+            if (text.includes('get') || text.includes('download')) score += 40;
             const cx = rect.left + rect.width / 2;
             const cy = rect.top + rect.height / 2;
             if (cx >= 350 && cx <= 850) score += 40;
@@ -829,130 +744,76 @@ def extract_primary_image_url(page):
 
 def wait_and_extract_headline_description(page, max_wait_seconds=15):
     """
-    Extracts Headline and Description that appear BELOW the image.
-    Headline is the first larger text element below image.
-    Description is the smaller text element below the headline.
-    Uses size comparison and position tracking to determine order.
+    Polls for Headline and Description inside iframes ONLY.
+    Uses structural class patterns (-e-15, -e-67) and visibility checks 
+    to avoid grabbing hidden template text.
     """
     js = r"""
     () => {
-        const cleanText = (txt) => (txt || "").replace(/\n/g, " ").replace(/\s+/g, " ").trim();
+        let headText = "N/A";
+        let descText = "N/A";
 
+        // Helper to ensure we don't grab hidden/template elements
         const isVisible = (el) => {
             if (!el) return false;
             const rect = el.getBoundingClientRect();
             const style = window.getComputedStyle(el);
-            return rect.width > 0 && rect.height > 0 &&
-                   style.visibility !== 'hidden' &&
-                   style.display !== 'none' &&
-                   style.opacity !== '0';
+            return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none' && style.opacity !== '0';
         };
 
-        // Find main image first
-        let imageBottomY = 0;
-        const images = Array.from(document.querySelectorAll('img')).filter(img => {
-            const src = String(img.getAttribute('src') || img.src || '').toLowerCase();
-            const alt = String(img.getAttribute('alt') || '').toLowerCase();
-            
-            // Skip logos and icons
-            if (src.includes('googlelogo') || alt.includes('google') || 
-                src.includes('logo') || src.includes('icon')) {
-                return false;
-            }
-            
-            const rect = img.getBoundingClientRect();
-            return isVisible(img) && rect.width >= 100 && rect.height >= 100;
-        });
-
-        if (images.length > 0) {
-            images.sort((a, b) => {
-                const aRect = a.getBoundingClientRect();
-                const bRect = b.getBoundingClientRect();
-                return (bRect.width * bRect.height) - (aRect.width * aRect.height);
-            });
-            imageBottomY = images[0].getBoundingClientRect().bottom;
-        }
-
-        // Find all text elements below the image
-        const textElements = Array.from(document.querySelectorAll('*')).filter(el => {
-            if (el.childElementCount > 0) return false;
-            
-            const txt = cleanText(el.innerText || el.textContent || '');
-            if (txt.length < 2 || txt.length > 300) return false;
-            if (txt.includes('{{') || txt.includes('}}')) return false;
-            if (txt.toLowerCase().includes('transparency') || txt.toLowerCase().includes('report')) return false;
-            
-            const rect = el.getBoundingClientRect();
-            // Must be below image
-            if (imageBottomY > 0 && rect.top < imageBottomY - 10) return false;
-            
-            return isVisible(el);
-        }).map(el => {
-            const rect = el.getBoundingClientRect();
-            const txt = cleanText(el.innerText || el.textContent || '');
-            const fontSize = parseFloat(window.getComputedStyle(el).fontSize || '0');
-            const fontWeight = window.getComputedStyle(el).fontWeight;
-            
-            return {
-                text: txt,
-                fontSize: fontSize,
-                fontWeight: fontWeight,
-                y: rect.top,
-                height: rect.height,
-                length: txt.length
-            };
-        });
-
-        // Sort by Y position (top to bottom)
-        textElements.sort((a, b) => a.y - b.y);
-
-        let headline = "N/A";
-        let description = "N/A";
-
-        if (textElements.length > 0) {
-            // First text below image = Headline (usually larger/bolder)
-            headline = textElements[0].text;
-
-            // Second text below headline = Description (usually smaller)
-            if (textElements.length > 1) {
-                description = textElements[1].text;
+        // SEARCH HEADLINE: Matches any class containing '-e-15' OR 'headline'
+        const headNodes = document.querySelectorAll('[class*="-e-15"], [class*="headline"]');
+        for (let el of headNodes) {
+            if (isVisible(el)) {
+                let text = (el.innerText || el.textContent || "").replace(/\n/g, ' ').trim();
+                // Ensure it's not a template placeholder like {{headline}}
+                if (text.length > 1 && !text.includes('{{')) { 
+                    headText = text; 
+                    break; 
+                }
             }
         }
 
-        return { headline, description };
+        // SEARCH DESCRIPTION: Matches any class containing '-e-67' OR 'long-description'
+        const descNodes = document.querySelectorAll('[class*="-e-67"], [class*="long-description"]');
+        for (let el of descNodes) {
+            if (isVisible(el)) {
+                let text = (el.innerText || el.textContent || "").replace(/\n/g, ' ').trim();
+                if (text.length > 1 && text !== headText && !text.includes('{{')) { 
+                    descText = text; 
+                    break; 
+                }
+            }
+        }
+
+        // If we found either one, return it
+        if (headText !== "N/A" || descText !== "N/A") {
+            return { headline: headText, description: descText };
+        }
+
+        return null;
     }
     """
 
-    def read_target(target):
-        try:
-            data = target.evaluate(js)
-            if data and (data.get("headline", "N/A") != "N/A" or data.get("description", "N/A") != "N/A"):
-                return data
-        except Exception:
-            return None
-        return None
-
-    start_time = time.time()
-
-    # Retry loop
-    while time.time() - start_time < max_wait_seconds:
+    start = time.time()
+    
+    # Retry loop: Keeps trying for up to max_wait_seconds (15s)
+    while time.time() - start < max_wait_seconds:
         
-        # Check main page first
-        data = read_target(page)
-        if data:
-            return data
-
-        # Check iframes
+        # STRICTLY CHECK IFRAMES ONLY.
         for frame in page.frames:
-            if frame == page.main_frame:
+            try:
+                result = frame.evaluate(js)
+                if result and (result.get("headline", "N/A") != "N/A" or result.get("description", "N/A") != "N/A"):
+                    return result.get("headline", "N/A"), result.get("description", "N/A")
+            except Exception:
                 continue
-            data = read_target(frame)
-            if data:
-                return data
-
+        
+        # Wait 1 second and loop again to let the ad iframe fully load
         page.wait_for_timeout(1000)
 
-    return {"headline": "N/A", "description": "N/A"}
+    # If the timer runs out, return N/A
+    return "N/A", "N/A"
 
 # =========================
 # STRICT TEXT-AD PACKAGE MATCHER
@@ -1298,14 +1159,14 @@ def _score_non_video_target(target):
             return txt.length >= 8 && txt.length <= 260 && isVisible(el) && !txt.includes('{{');
         });
 
-        const ctaNodes = Array.from(document.querySelectorAll('a[href], a[data-href], button')).filter(el => {
+        const installNodes = Array.from(document.querySelectorAll('a[href], a[data-href], button')).filter(el => {
             const txt = cleanText(el.innerText || el.textContent || '').toLowerCase();
             const cls = String(el.className || '').toLowerCase();
             const aria = String(el.getAttribute('aria-label') || '').toLowerCase();
             const href = String(el.href || el.getAttribute('href') || el.getAttribute('data-href') || '').toLowerCase();
-            const looksCta = cls.includes('install-button-anchor') || txt.includes('get') || txt.includes('download') || txt.includes('open') || aria.includes('get');
+            const looksInstall = cls.includes('install-button-anchor') || txt.includes('install') || txt === 'get' || txt.includes('download') || aria.includes('install');
             const goodHref = href.includes('googleadservices.com/pagead/aclk') || href.includes('play.google.com') || href.includes('apps.apple.com') || href.includes('itunes.apple.com');
-            return isVisible(el) && (looksCta || goodHref);
+            return isVisible(el) && (looksInstall || goodHref);
         });
 
         const imageNodes = Array.from(document.querySelectorAll('img, picture, canvas, svg')).filter(el => {
@@ -1327,7 +1188,7 @@ def _score_non_video_target(target):
         let score = 0;
         score += Math.min(headlineNodes.length, 2) * 120;
         score += Math.min(descNodes.length, 2) * 100;
-        score += Math.min(ctaNodes.length, 2) * 80;
+        score += Math.min(installNodes.length, 2) * 80;
         score += Math.min(imageNodes.length, 3) * 25;
         score += Math.min(leafTextNodes.length, 8) * 8;
 
@@ -1340,7 +1201,7 @@ def _score_non_video_target(target):
             score,
             headlineCount: headlineNodes.length,
             descriptionCount: descNodes.length,
-            ctaCount: ctaNodes.length,
+            installCount: installNodes.length,
             imageCount: imageNodes.length,
             leafTextCount: leafTextNodes.length,
             visibleTextLength: visibleText.length
@@ -1405,6 +1266,75 @@ def get_ranked_non_video_targets(page):
     return ranked
 
 
+def wait_and_extract_text_ad_details(page, max_wait_seconds=15):
+    """
+    Extracts headline and description for non-video ads.
+    - Prefers visible elements from the active creative (main DOM).
+    - Uses specific selectors: <div role="link">, div.HFTpmd-WsjYwc-hgDUwe, div.cS4Vcb-vnv8ic
+    - Falls back to iframe if necessary.
+    - Relaxed visibility check to allow offscreen or special-language creatives (e.g., Arabic).
+    """
+    js = r"""
+    () => {
+        const cleanText = (txt) => (txt || "").replace(/\n/g, " ").replace(/\s+/g, " ").trim();
+
+        // RELAXED visibility: ignore offscreen top/bottom/left/right but still require positive width/height
+        const isVisible = (el) => {
+            if (!el) return false;
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return rect.width > 0 && rect.height > 0 &&
+                   style.visibility !== 'hidden' &&
+                   style.display !== 'none' &&
+                   style.opacity !== '0';
+        };
+
+        let headline = "N/A";
+        let description = "N/A";
+
+        // 1️⃣ Main visible creative first
+        const headlineEl = document.querySelector('div[role="link"] span, div.HFTpmd-WsjYwc-hgDUwe, div.cS4Vcb-vnv8ic');
+        if (headlineEl && isVisible(headlineEl)) {
+            headline = cleanText(headlineEl.innerText || headlineEl.textContent);
+        }
+
+        const descriptionEl = document.querySelector('div.HFTpmd-WsjYwc-hgDUwe, div.cS4Vcb-vnv8ic');
+        if (descriptionEl && isVisible(descriptionEl)) {
+            description = cleanText(descriptionEl.innerText || descriptionEl.textContent);
+        }
+
+        return { headline, description };
+    }
+    """
+
+    def read_target(target):
+        try:
+            data = target.evaluate(js)
+            if data and (data.get("headline") != "N/A" or data.get("description") != "N/A"):
+                return data
+        except Exception:
+            return None
+        return None
+
+    start_time = time.time()
+
+    while time.time() - start_time < max_wait_seconds:
+        # 1) Check main page DOM first (active visible creative)
+        data = read_target(page)
+        if data:
+            return data
+
+        # 2) Fallback: check iframes only if main DOM didn't yield headline/description
+        for frame in page.frames:
+            if frame == page.main_frame:
+                continue
+            data = read_target(frame)
+            if data:
+                return data
+
+        page.wait_for_timeout(1000)
+
+    return {"headline": "N/A", "description": "N/A"}
 # =========================
 # MAIN COMBINED SCRAPER: VIDEO ADS + TEXT ADS
 # =========================
@@ -1553,23 +1483,15 @@ def scrape_single_url(url_row):
                 
                 # Extract image URL for video ads too
                 image_url = extract_primary_image_url(page)
-                
-                # Try to extract package from script var data.appId
-                script_package = extract_package_from_script_var(page)
 
                 if app_link == "N/A":
                     status = "VIDEO_FOUND_APP_LINK_NOT_FOUND"
-                    message = "Video ID found, but exact visible app link not found"
+                    message = "Video ID found, but exact visible install link not found"
                 else:
                     status = "SUCCESS"
                     message = "Video ID and app link saved"
 
                 package_name = extract_package_name(app_link)
-                
-                # If no package from app link, try script variable
-                if package_name == "N/A" and script_package != "N/A":
-                    package_name = script_package
-                    print(f"✅ Row {row_num}: extracted package from script var: {package_name}")
 
                 data = [
                     advertiser,
@@ -1595,7 +1517,7 @@ def scrape_single_url(url_row):
                     message=message
                 )
 
-                print(f"✅ Row {row_num}: saved VIDEO ad advertiser + package + video ID + headline + description + image")
+                print(f"✅ Row {row_num}: saved VIDEO ad advertiser + package + video ID + text + image")
                 return
 
             # =========================
@@ -1603,7 +1525,7 @@ def scrape_single_url(url_row):
             # =========================
             print(f"📄 Row {row_num}: no video found, checking text/image ad")
 
-            text_data = wait_and_extract_headline_description(page, max_wait_seconds=15)
+            text_data = wait_and_extract_text_ad_details(page, max_wait_seconds=15)
             headline = clean_text(text_data.get("headline"))
             description = clean_text(text_data.get("description"))
             process_time = get_exact_time()
@@ -1612,7 +1534,7 @@ def scrape_single_url(url_row):
             # Extract image URL
             image_url = extract_primary_image_url(page)
 
-            # First try visible app link from the active creative.
+            # First try visible install/app link from the active creative.
             visible_app_link = wait_and_extract_install_link(page, max_wait_seconds=8)
             visible_package = extract_package_name(visible_app_link)
 
@@ -1620,79 +1542,61 @@ def scrape_single_url(url_row):
             ad_type = "text" if has_text else "image" if (is_image_like or visible_package != "N/A") else "N/A"
 
             if not has_text and visible_package == "N/A" and not is_image_like:
-                # Try to get package from script var
-                script_package = extract_package_from_script_var(page)
-                
-                if script_package != "N/A":
-                    package_name = script_package
-                    app_link = f"https://play.google.com/store/apps/details?id={package_name}"
-                    status = "SUCCESS"
-                    message = f"Non-video image ad package extracted from script var: {package_name}"
-                    print(f"✅ Row {row_num}: package from script var -> {package_name}")
-                else:
-                    data = [
-                        advertiser,
-                        "N/A",
-                        url,
-                        "N/A",
-                        process_time,
-                        "N/A",
-                        process_time
-                    ]
+                data = [
+                    advertiser,
+                    "N/A",
+                    url,
+                    "N/A",
+                    process_time,
+                    "N/A",
+                    process_time
+                ]
 
-                    safe_update_combined_row(row_num, data)
-                    safe_update_headline_desc(row_num, "N/A", "N/A")
-                    safe_update_image_url(row_num, "N/A")
+                safe_update_combined_row(row_num, data)
+                safe_update_headline_desc(row_num, "N/A", "N/A")
+                safe_update_image_url(row_num, "N/A")
 
-                    safe_add_log(
-                        row_number=row_num,
-                        status="NO_VIDEO_NO_TEXT_IMAGE",
-                        log_type="COMBINED",
-                        url=url,
-                        video_id="N/A",
-                        app_link="N/A",
-                        message="No video ID and no valid text/image creative found"
-                    )
+                safe_add_log(
+                    row_number=row_num,
+                    status="NO_VIDEO_NO_TEXT_IMAGE",
+                    log_type="COMBINED",
+                    url=url,
+                    video_id="N/A",
+                    app_link="N/A",
+                    message="No video ID and no valid text/image creative found"
+                )
 
-                    print(f"⏭ Row {row_num}: no video and no valid text/image ad found")
-                    return
+                print(f"⏭ Row {row_num}: no video and no valid text/image ad found")
+                return
 
             if has_text:
                 print(f"🔎 Row {row_num}: text/image headline -> {headline}")
             else:
                 print(f"🖼 Row {row_num}: likely image ad, headline/description not found")
 
-            print(f"📦 Row {row_num}: resolving package from visible app link first")
+            print(f"📦 Row {row_num}: resolving package from visible install link first")
 
             if visible_package != "N/A":
                 package_name = visible_package
                 app_link = visible_app_link
                 match_score = 1.0
                 status = "SUCCESS"
-                message = f"Non-video {ad_type} ad package extracted from visible app link"
-                print(f"✅ Row {row_num}: package from visible app link -> {package_name}")
+                message = f"Non-video {ad_type} ad package extracted from visible install link"
+                print(f"✅ Row {row_num}: package from visible install link -> {package_name}")
             else:
                 package_name = None
                 match_score = 0.0
 
                 if has_text:
-                    print(f"📦 Row {row_num}: visible app link not found, strict matching with headline + description")
+                    print(f"📦 Row {row_num}: visible install link not found, strict matching with headline + description")
                     all_found_packages = extract_package_from_page(page)
                     package_name, match_score = get_best_matching_package(headline, description, all_found_packages)
-
-                # Try script var if text matching didn't work
-                if not package_name:
-                    script_package = extract_package_from_script_var(page)
-                    if script_package != "N/A":
-                        package_name = script_package
-                        match_score = 0.95  # High score for script var extraction
-                        print(f"✅ Row {row_num}: package from script var -> {package_name}")
 
                 if package_name:
                     app_link = f"https://play.google.com/store/apps/details?id={package_name}"
                     status = "SUCCESS"
-                    message = f"Non-video {ad_type} ad package extracted with score {match_score}"
-                    print(f"✅ Row {row_num}: matched package -> {package_name} | score={match_score}")
+                    message = f"Non-video {ad_type} ad package strictly matched with score {match_score}"
+                    print(f"✅ Row {row_num}: strict matched package -> {package_name} | score={match_score}")
                 else:
                     package_name = "N/A"
                     app_link = "N/A"
