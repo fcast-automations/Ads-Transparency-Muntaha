@@ -2523,6 +2523,100 @@ def has_visible_image_creative(page):
     return False
 
 
+
+def _looks_like_real_ad_image_url_for_fallback(image_url):
+    """Keep fallback conservative: accept real ad image URLs, skip logos/icons/UI assets."""
+    image_url = clean_text(image_url)
+    if image_url == "N/A":
+        return False
+
+    lower = image_url.lower()
+    if lower.startswith("data:image"):
+        return False
+
+    bad_parts = [
+        "googlelogo", "favicon", "adchoices", "/branding/", "doubleclick.net/static",
+        "gstatic.com/images/branding", "material-icons", "logo", "icon"
+    ]
+
+    # tpc simgad is the actual creative image in your debug, so always allow it.
+    if "tpc.googlesyndication.com/simgad/" in lower or "/simgad/" in lower:
+        return True
+
+    if any(bad in lower for bad in bad_parts):
+        return False
+
+    return lower.startswith(("http://", "https://", "blob:"))
+
+
+def fallback_extract_image_url_same_way(page, max_wait_seconds=20):
+    """
+    Last-resort IMAGE-ONLY fallback.
+    Uses the same existing image extractor (wait_and_extract_image_url_with_target)
+    and does NOT require headline/description. This is only for rows where text is missing.
+    """
+    try:
+        image_url, image_target, image_box = wait_and_extract_image_url_with_target(
+            page,
+            max_wait_seconds=max_wait_seconds
+        )
+        image_url = clean_text(image_url)
+        if _looks_like_real_ad_image_url_for_fallback(image_url):
+            return image_url
+    except Exception:
+        pass
+
+    # Extra backup: sometimes image-only creatives expose image URL only in template/adData,
+    # not as readable text. Still keep it scoped to visible ad roots, not the whole page.
+    try:
+        for root in _visible_top_level_ad_roots(page)[:3]:
+            root_frame = root.get("frame")
+            if not root_frame:
+                continue
+            records = extract_template_ad_records_from_target(root_frame)
+            for record in records or []:
+                for img in record.get("images", []) or []:
+                    img = _normalize_image_url(img, base_url=getattr(root_frame, "url", "") or "")
+                    img = clean_text(img)
+                    if _looks_like_real_ad_image_url_for_fallback(img):
+                        return img
+    except Exception:
+        pass
+
+    return "N/A"
+
+
+def save_image_url_only_row(row_num, advertiser, url, process_time, image_url, status="IMAGE_ONLY_URL_SAVED"):
+    """
+    Save image-only ad row. Advertiser logic remains unchanged because advertiser is passed in
+    from extract_advertiser_from_page(page). Text/package remain N/A.
+    """
+    image_url = clean_text(image_url)
+    data = [
+        advertiser,
+        "N/A",
+        url,
+        "N/A",
+        process_time,
+        "image",
+        process_time
+    ]
+
+    safe_update_combined_row(row_num, data)
+    safe_update_headline_desc(row_num, "N/A", "N/A")
+    safe_update_image_url(row_num, image_url)
+
+    safe_add_log(
+        row_number=row_num,
+        status=status,
+        log_type="IMAGE_AD",
+        url=url,
+        video_id="image",
+        app_link="N/A",
+        message="No headline/description found, but image URL was found and saved"
+    )
+
+
 def scrape_single_url(url_row):
     row_num, url = url_row
 
@@ -2672,6 +2766,21 @@ def scrape_single_url(url_row):
             )
 
             if not image_ad:
+                # Do NOT make full row N/A immediately.
+                # For image-only ads, headline/description may be missing but image URL can still exist.
+                fallback_image_url = fallback_extract_image_url_same_way(page, max_wait_seconds=20)
+                if fallback_image_url != "N/A":
+                    save_image_url_only_row(
+                        row_num=row_num,
+                        advertiser=advertiser,
+                        url=url,
+                        process_time=process_time,
+                        image_url=fallback_image_url,
+                        status="IMAGE_ONLY_URL_SAVED_NO_ACTIVE_TEXT"
+                    )
+                    print(f"✅ Row {row_num}: image-only ad saved with image URL -> {fallback_image_url[:80]}")
+                    return
+
                 data = [
                     advertiser,
                     "N/A",
@@ -2693,10 +2802,10 @@ def scrape_single_url(url_row):
                     url=url,
                     video_id="N/A",
                     app_link="N/A",
-                    message="No active image creative found after waiting"
+                    message="No active image creative and no image URL found after waiting"
                 )
 
-                print(f"⏭ Row {row_num}: no active image ad found, wrote N/A")
+                print(f"⏭ Row {row_num}: no active image ad and no image URL found, wrote N/A")
                 return
 
             image_url = clean_text(image_ad.get("image_url"))
@@ -2715,6 +2824,21 @@ def scrape_single_url(url_row):
             # but still save the extracted image_url.
             # Only write a full N/A row when the active creative has NO image URL at all.
             if not has_image:
+                # Active target exists but image_url is empty. Try the same image extractor one more time
+                # and save URL even when headline/description are missing.
+                fallback_image_url = fallback_extract_image_url_same_way(page, max_wait_seconds=20)
+                if fallback_image_url != "N/A":
+                    save_image_url_only_row(
+                        row_num=row_num,
+                        advertiser=advertiser,
+                        url=url,
+                        process_time=process_time,
+                        image_url=fallback_image_url,
+                        status="IMAGE_ONLY_URL_SAVED_NO_TEXT"
+                    )
+                    print(f"✅ Row {row_num}: image-only ad saved with fallback image URL -> {fallback_image_url[:80]}")
+                    return
+
                 data = [
                     advertiser,
                     "N/A",
