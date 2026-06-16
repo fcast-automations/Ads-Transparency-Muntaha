@@ -641,10 +641,14 @@ def wait_and_extract_install_link(page, max_wait_seconds=35):
     return "N/A"
 
 
+# =========================
+# TARGET-SAFE INSTALL/PACKAGE HELPERS
+# =========================
+
 def extract_visible_install_link_from_target(target):
     """
-    Target-locked install link extraction.
-    This does NOT scan other page frames, so a blank/missing ad cannot reuse another ad's link.
+    Reads install link only from the supplied target/frame.
+    This avoids using the first/other ad when the current creative is blank.
     """
     if target is None:
         return "N/A"
@@ -668,8 +672,8 @@ def extract_visible_install_link_from_target(target):
 
 def extract_install_link_by_precise_js_from_target(target):
     """
-    Target-locked JS fallback.
-    Only checks the provided page/frame, never other iframes.
+    Strict JS fallback for one target/frame only.
+    It does not scan the whole page or other frames.
     """
     if target is None:
         return "N/A"
@@ -716,7 +720,6 @@ def extract_install_link_by_precise_js_from_target(target):
 
             const cx = rect.left + rect.width / 2;
             const cy = rect.top + rect.height / 2;
-
             if (cx >= 350 && cx <= 850) score += 40;
             if (cy >= 50 && cy <= 700) score += 40;
             if (cy > 700) score -= 100;
@@ -741,8 +744,7 @@ def extract_install_link_by_precise_js_from_target(target):
 
 def wait_and_extract_install_link_from_target(target, max_wait_seconds=8):
     """
-    Waits for install link only inside the active creative target.
-    Prevents first/old ad data being reused when current row has no link.
+    First preference: get install link from the exact active creative target/frame.
     """
     if target is None:
         return "N/A"
@@ -751,23 +753,120 @@ def wait_and_extract_install_link_from_target(target, max_wait_seconds=8):
 
     while time.time() - start < max_wait_seconds:
         app_link = extract_visible_install_link_from_target(target)
-
         if app_link != "N/A":
             return app_link
 
         app_link = extract_install_link_by_precise_js_from_target(target)
-
         if app_link != "N/A":
             return app_link
-
-        try:
-            target.wait_for_load_state("networkidle", timeout=2000)
-        except Exception:
-            pass
 
         time.sleep(1)
 
     return "N/A"
+
+
+def collect_visible_install_links_from_target(target):
+    """
+    Returns visible install links from one target/frame.
+    Used for safe package recovery only.
+    """
+    links = []
+
+    if target is None:
+        return links
+
+    try:
+        for candidate in get_visible_install_candidates_from_target(target):
+            href = clean_googleadservices_link(candidate.get("href"))
+            if href and href != "N/A" and is_good_app_link(href):
+                links.append(href)
+    except Exception:
+        pass
+
+    try:
+        href = extract_install_link_by_precise_js_from_target(target)
+        if href and href != "N/A" and is_good_app_link(href):
+            links.append(href)
+    except Exception:
+        pass
+
+    deduped = []
+    seen = set()
+    for href in links:
+        key = href.strip()
+        if key not in seen:
+            seen.add(key)
+            deduped.append(href)
+
+    return deduped
+
+
+def collect_visible_install_links_from_page(page):
+    """
+    Page-wide collection is allowed only for package recovery.
+    It never blindly selects the first link; it must be unique or text-matched later.
+    """
+    links = []
+
+    targets = [page]
+    try:
+        targets.extend([f for f in page.frames if f != page.main_frame])
+    except Exception:
+        pass
+
+    for target in targets:
+        links.extend(collect_visible_install_links_from_target(target))
+
+    deduped = []
+    seen = set()
+    for href in links:
+        pkg = extract_package_name(href)
+        key = pkg if pkg != "N/A" else href
+        if key not in seen:
+            seen.add(key)
+            deduped.append(href)
+
+    return deduped
+
+
+def safe_resolve_package_from_visible_links(page, headline, description):
+    """
+    Recover package without first-ad contamination:
+    1) If only one unique visible package exists, use it.
+    2) If multiple packages exist, use only the one that matches headline/description.
+    3) If no text and multiple packages exist, return N/A instead of guessing first ad.
+    """
+    links = collect_visible_install_links_from_page(page)
+
+    pkg_to_link = {}
+    for link in links:
+        pkg = extract_package_name(link)
+        if pkg != "N/A" and pkg not in pkg_to_link:
+            pkg_to_link[pkg] = link
+
+    if not pkg_to_link:
+        return "N/A", "N/A", 0.0, "no_visible_package_link"
+
+    if len(pkg_to_link) == 1:
+        pkg, link = next(iter(pkg_to_link.items()))
+        return pkg, link, 1.0, "single_visible_package_link"
+
+    if is_valid_text_ad(headline, description):
+        best_pkg = None
+        best_score = 0.0
+
+        for pkg in sorted(pkg_to_link):
+            score = score_package_against_text(pkg, headline, description)
+            if score > best_score:
+                best_score = score
+                best_pkg = pkg
+
+        if best_pkg and best_score >= MIN_PACKAGE_MATCH_SCORE:
+            return best_pkg, pkg_to_link[best_pkg], best_score, "text_matched_visible_package_link"
+
+        return "N/A", "N/A", best_score, "multiple_visible_packages_no_text_match"
+
+    return "N/A", "N/A", 0.0, "multiple_visible_packages_no_text"
 
 
 # =========================
@@ -1304,8 +1403,7 @@ def extract_package_from_page(page):
 
 def extract_package_from_target(target):
     """
-    Target-locked package extraction.
-    Checks only the active creative page/frame, not every frame on the transparency page.
+    Package extraction from one active creative target/frame only.
     """
     if target is None:
         return set()
@@ -1332,6 +1430,60 @@ def extract_package_from_target(target):
 
     combined = '\n'.join(collected_texts)
     return extract_packages_from_text(combined)
+
+
+def get_requested_creative_id(transparency_url):
+    """
+    Extracts creative ID from Google Ads Transparency URL when available.
+    """
+    try:
+        match = re.search(r"/creative/([^/?#]+)", transparency_url)
+        if match:
+            return match.group(1)
+    except Exception:
+        pass
+    return None
+
+
+def transparency_url_still_matches_requested_creative(requested_url, current_url):
+    """
+    If Google redirects a creative URL to an advertiser/list page, avoid scraping the first visible ad.
+    """
+    requested_creative_id = get_requested_creative_id(requested_url)
+
+    if not requested_creative_id:
+        return True
+
+    try:
+        return requested_creative_id in (current_url or "")
+    except Exception:
+        return True
+
+
+def wait_and_get_active_non_video_target(page, max_wait_seconds=12):
+    """
+    Pick the best active non-video creative target first.
+    This replaces page-first image extraction in the non-video path.
+    """
+    start = time.time()
+
+    while time.time() - start < max_wait_seconds:
+        try:
+            ranked_targets = get_ranked_non_video_targets(page)
+        except Exception:
+            ranked_targets = []
+
+        iframe_targets = [item for item in ranked_targets if item[2] == "iframe"]
+        fallback_targets = ranked_targets if not iframe_targets else iframe_targets
+
+        for score, target, kind, inner in fallback_targets:
+            if score <= 0:
+                continue
+            return target, inner, score, kind
+
+        time.sleep(1)
+
+    return None, None, 0, "N/A"
 
 def extract_advertiser_from_page(page):
     try:
@@ -2085,12 +2237,11 @@ def scrape_single_url(url_row):
             # =========================
             print(f"📄 Row {row_num}: no video found, checking text/image ad")
 
-            # Extract image first and lock the current row to that exact creative target.
-            # If no active image target is found, do NOT scan other page frames.
-            image_url, image_target, image_box = wait_and_extract_image_url_with_target(page, max_wait_seconds=12)
             process_time = get_exact_time()
 
-            if image_url == "N/A" or image_target is None:
+            # If Google redirected this creative URL to an advertiser/list page,
+            # do not scrape the first visible ad from that page.
+            if not transparency_url_still_matches_requested_creative(url, page.url):
                 data = [
                     advertiser,
                     "N/A",
@@ -2107,72 +2258,161 @@ def scrape_single_url(url_row):
 
                 safe_add_log(
                     row_number=row_num,
-                    status="NO_ACTIVE_IMAGE_CREATIVE",
+                    status="CREATIVE_URL_REDIRECTED",
                     log_type="COMBINED",
                     url=url,
                     video_id="N/A",
                     app_link="N/A",
-                    message="No active image creative found; skipped whole-page fallback to avoid first-ad data reuse"
+                    message="Requested creative URL no longer matched loaded page URL; skipped to avoid first-ad reuse"
                 )
 
-                print(f"⏭ Row {row_num}: no active image creative found, writing N/A")
+                print(f"⏭ Row {row_num}: creative URL redirected/mismatched, writing N/A")
                 return
 
-            print(f"🖼 Row {row_num}: image URL found -> {image_url[:120]}")
+            # Pick active creative target first. Do not start by scanning page images,
+            # because page-level scanning can pick the first/other ad when current ad is blank.
+            active_target, active_info, active_score, active_kind = wait_and_get_active_non_video_target(page, max_wait_seconds=12)
 
-            # Read headline/description only from the same target where image was found.
+            if active_target is None:
+                data = [
+                    advertiser,
+                    "N/A",
+                    url,
+                    "N/A",
+                    process_time,
+                    "N/A",
+                    process_time
+                ]
+
+                safe_update_combined_row(row_num, data)
+                safe_update_headline_desc(row_num, "N/A", "N/A")
+                safe_update_image_url(row_num, "N/A")
+
+                safe_add_log(
+                    row_number=row_num,
+                    status="NO_ACTIVE_CREATIVE_TARGET",
+                    log_type="COMBINED",
+                    url=url,
+                    video_id="N/A",
+                    app_link="N/A",
+                    message="No active creative target found; skipped whole-page fallback to avoid first-ad data reuse"
+                )
+
+                print(f"⏭ Row {row_num}: no active creative target found, writing N/A")
+                return
+
+            # Extract image only from active target.
+            image_data = extract_primary_image_data_from_target(active_target)
+            if image_data:
+                image_url = image_data.get("url", "N/A")
+                image_box = image_data
+                print(f"🖼 Row {row_num}: image URL found from active target -> {image_url[:120]}")
+            else:
+                image_url = "N/A"
+                image_box = None
+
+            # Extract text only from active target.
             text_data = wait_and_extract_text_ad_details(
                 page,
                 max_wait_seconds=15,
-                preferred_target=image_target,
+                preferred_target=active_target,
                 image_box=image_box
             )
             headline = clean_text(text_data.get("headline"))
             description = clean_text(text_data.get("description"))
             has_text = is_valid_text_ad(headline, description)
 
-            # Read install/app link only from the same target where image was found.
-            visible_app_link = wait_and_extract_install_link_from_target(image_target, max_wait_seconds=8)
+            # First try package from the active target only.
+            visible_app_link = wait_and_extract_install_link_from_target(active_target, max_wait_seconds=6)
             visible_package = extract_package_name(visible_app_link)
 
-            # Do not use has_visible_image_creative(page) here because it scans all frames.
+            # If install link is outside the creative iframe, recover package safely:
+            # use only a single unique visible package, or a package that matches the active text.
+            package_recovery_mode = "active_target_link"
+            if visible_package == "N/A" and (image_url != "N/A" or has_text):
+                recovered_package, recovered_link, recovered_score, recovery_mode = safe_resolve_package_from_visible_links(
+                    page,
+                    headline,
+                    description
+                )
+                if recovered_package != "N/A":
+                    visible_package = recovered_package
+                    visible_app_link = recovered_link
+                    package_recovery_mode = recovery_mode
+
             is_image_like = image_url != "N/A"
             ad_type = "text" if has_text else "image" if is_image_like else "N/A"
 
-            if has_text:
-                print(f"🔎 Row {row_num}: text/image headline -> {headline}")
-            else:
-                print(f"🖼 Row {row_num}: image ad found, headline/description not found")
+            # If the active target has no image and no usable text, do not use any page-wide package.
+            if not has_text and not is_image_like:
+                data = [
+                    advertiser,
+                    "N/A",
+                    url,
+                    "N/A",
+                    process_time,
+                    "N/A",
+                    process_time
+                ]
 
-            print(f"📦 Row {row_num}: resolving package from active creative target only")
+                safe_update_combined_row(row_num, data)
+                safe_update_headline_desc(row_num, "N/A", "N/A")
+                safe_update_image_url(row_num, "N/A")
+
+                safe_add_log(
+                    row_number=row_num,
+                    status="NO_ACTIVE_IMAGE_OR_TEXT",
+                    log_type="COMBINED",
+                    url=url,
+                    video_id="N/A",
+                    app_link="N/A",
+                    message="Active target had no image/text; skipped package fallback to avoid first-ad reuse"
+                )
+
+                print(f"⏭ Row {row_num}: active target has no image/text, writing N/A")
+                return
+
+            if has_text:
+                print(f"🔎 Row {row_num}: active target headline -> {headline}")
+            else:
+                print(f"🖼 Row {row_num}: active image ad found, headline/description not found")
+
+            print(f"📦 Row {row_num}: resolving package safely")
 
             if visible_package != "N/A":
                 package_name = visible_package
                 app_link = visible_app_link
                 match_score = 1.0
                 status = "SUCCESS"
-                message = f"Non-video {ad_type} ad package extracted from active creative install link"
-                print(f"✅ Row {row_num}: package from active creative install link -> {package_name}")
+                message = f"Non-video {ad_type} ad package extracted by {package_recovery_mode}"
+                print(f"✅ Row {row_num}: package resolved -> {package_name} | mode={package_recovery_mode}")
             else:
                 package_name = None
                 match_score = 0.0
 
                 if has_text:
-                    print(f"📦 Row {row_num}: active install link not found, strict matching inside active creative target")
-                    all_found_packages = extract_package_from_target(image_target)
+                    print(f"📦 Row {row_num}: visible install link not found, strict matching with headline + description")
+
+                    # Prefer packages inside active target first.
+                    all_found_packages = extract_package_from_target(active_target)
+
+                    # If package lives outside iframe, page-wide package scan is allowed only with text matching.
+                    if not all_found_packages:
+                        all_found_packages = extract_package_from_page(page)
+
                     package_name, match_score = get_best_matching_package(headline, description, all_found_packages)
 
                 if package_name:
                     app_link = f"https://play.google.com/store/apps/details?id={package_name}"
                     status = "SUCCESS"
-                    message = f"Non-video {ad_type} ad package strictly matched inside active creative target with score {match_score}"
+                    message = f"Non-video {ad_type} ad package strictly matched with score {match_score}"
                     print(f"✅ Row {row_num}: strict matched package -> {package_name} | score={match_score}")
                 else:
                     package_name = "N/A"
                     app_link = "N/A"
                     status = "NON_VIDEO_PACKAGE_NOT_FOUND"
-                    message = f"Non-video {ad_type} ad found, but active creative package not found. Best score={match_score}"
-                    print(f"⚠️ Row {row_num}: package not found inside active creative target, writing N/A | best score={match_score}")
+                    message = f"Non-video {ad_type} ad found, but package was not safely resolved. Best score={match_score}"
+                    print(f"⚠️ Row {row_num}: package not safely resolved, writing N/A | best score={match_score}")
 
             data = [
                 advertiser,
