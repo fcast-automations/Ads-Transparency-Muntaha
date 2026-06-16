@@ -819,6 +819,344 @@ def extract_primary_image_data_from_target(target):
         return None
 
 
+def extract_image_url_by_right_click_from_target(target):
+    """
+    Image-only fallback.
+    Works like right-clicking the visible ad image: it hit-tests visible points in the
+    creative frame with document.elementsFromPoint(), then reads currentSrc/src/srcset,
+    SVG href, poster, and CSS background-image from the hit element, its parents, and
+    child image nodes.
+
+    This is used only when normal DOM image extraction returns N/A, so image-only ads
+    can still save the image URL even when there is no headline/description text.
+    """
+    js = r"""
+    () => {
+        const absUrl = (raw) => {
+            if (!raw) return '';
+            raw = String(raw).trim().replace(/^['\"]|['\"]$/g, '');
+            if (!raw || raw === 'none' || raw === 'null' || raw === 'undefined') return '';
+            if (raw.startsWith('data:image')) return '';
+            try { return new URL(raw, location.href).href; } catch (e) { return raw; }
+        };
+
+        const bestFromSrcset = (srcset) => {
+            if (!srcset) return '';
+            let bestUrl = '';
+            let bestScore = -1;
+            for (const rawPart of String(srcset).split(',')) {
+                const part = rawPart.trim();
+                if (!part) continue;
+                const pieces = part.split(/\s+/).filter(Boolean);
+                const url = pieces[0] || '';
+                const descriptor = pieces[1] || '';
+                let score = 1;
+                if (descriptor.endsWith('w')) score = parseFloat(descriptor) || 1;
+                if (descriptor.endsWith('x')) score = (parseFloat(descriptor) || 1) * 1000;
+                if (score >= bestScore) {
+                    bestScore = score;
+                    bestUrl = url;
+                }
+            }
+            return bestUrl;
+        };
+
+        const cleanBadUrl = (url, el) => {
+            const lower = String(url || '').toLowerCase();
+            const alt = String(el?.getAttribute?.('alt') || '').toLowerCase();
+            if (!lower) return true;
+            if (lower.startsWith('data:image')) return true;
+            if (lower.includes('googlelogo') || alt.includes('google')) return true;
+            if (lower.includes('/branding/') && lower.includes('google')) return true;
+            if (lower.includes('favicon') || lower.endsWith('/favicon.ico')) return true;
+            if (lower.includes('adchoices') || (lower.includes('doubleclick') && lower.includes('adchoices'))) return true;
+            if (lower.includes('gstatic.com') && lower.includes('material')) return true;
+            return false;
+        };
+
+        const visibleRect = (el, minW = 20, minH = 20) => {
+            if (!el || !el.getBoundingClientRect) return null;
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            if (rect.width < minW || rect.height < minH) return null;
+            if (rect.bottom <= 0 || rect.right <= 0 || rect.top >= window.innerHeight || rect.left >= window.innerWidth) return null;
+            if (style.visibility === 'hidden' || style.display === 'none' || style.opacity === '0') return null;
+            return rect;
+        };
+
+        const candidates = [];
+        const addCandidate = (rawUrl, el, kind, bonus = 0) => {
+            const url = absUrl(rawUrl);
+            if (!url || cleanBadUrl(url, el)) return;
+            const rect = visibleRect(el, 20, 20);
+            if (!rect) return;
+
+            let score = rect.width * rect.height;
+            score += bonus;
+            if (url.includes('/simgad/')) score += 60000;
+            if (kind.includes('right-click')) score += 25000;
+            if (kind.includes('currentSrc')) score += 12000;
+            if (kind.includes('srcset')) score += 9000;
+            if (kind.includes('background')) score += 8000;
+            if (kind.includes('poster')) score += 3000;
+            if (url.startsWith('blob:')) score -= 50000;
+
+            candidates.push({
+                url,
+                kind,
+                score,
+                top: rect.top,
+                bottom: rect.bottom,
+                left: rect.left,
+                right: rect.right,
+                width: rect.width,
+                height: rect.height
+            });
+        };
+
+        const addBgCandidates = (el, kind, bonus = 0) => {
+            if (!el) return;
+            const styles = [];
+            try { styles.push(window.getComputedStyle(el)); } catch(e) {}
+            try { styles.push(window.getComputedStyle(el, '::before')); } catch(e) {}
+            try { styles.push(window.getComputedStyle(el, '::after')); } catch(e) {}
+
+            for (const style of styles) {
+                const bg = style && style.backgroundImage || '';
+                if (!bg || bg === 'none' || !bg.includes('url(')) continue;
+                const matches = Array.from(bg.matchAll(/url\((['\"]?)(.*?)\1\)/g));
+                for (const match of matches) {
+                    addCandidate(match[2], el, `${kind}-background`, bonus);
+                }
+            }
+        };
+
+        const inspectElement = (el, kind, bonus = 0) => {
+            if (!el || !el.getAttribute) return;
+
+            addCandidate(el.currentSrc, el, `${kind}-currentSrc`, bonus + 9000);
+            addCandidate(el.src, el, `${kind}-src`, bonus + 8000);
+            addCandidate(el.poster, el, `${kind}-poster`, bonus + 4000);
+            addCandidate(bestFromSrcset(el.getAttribute('srcset')), el, `${kind}-srcset`, bonus + 7000);
+
+            for (const attr of [
+                'src', 'data-src', 'data-lazy-src', 'data-original', 'data-image',
+                'data-image-url', 'data-thumbnail-url', 'data-iurl', 'href', 'xlink:href'
+            ]) {
+                addCandidate(el.getAttribute(attr), el, `${kind}-${attr}`, bonus + 2500);
+            }
+
+            addBgCandidates(el, kind, bonus + 2500);
+
+            // If the right-click hit a wrapper div, inspect the actual visual children too.
+            try {
+                for (const img of Array.from(el.querySelectorAll('img, image, source'))) {
+                    inspectElement(img, `${kind}-child`, bonus + 3500);
+                }
+            } catch(e) {}
+        };
+
+        const inspectWithParents = (el, kind, bonus = 0) => {
+            let current = el;
+            let depth = 0;
+            while (current && depth < 6) {
+                inspectElement(current, `${kind}-depth${depth}`, bonus - depth * 400);
+                current = current.parentElement;
+                depth += 1;
+            }
+        };
+
+        // 1) Real right-click style hit testing: try the points where the image is visually shown.
+        const points = [];
+        const w = window.innerWidth || 360;
+        const h = window.innerHeight || 640;
+        for (const px of [0.25, 0.5, 0.75]) {
+            for (const py of [0.25, 0.35, 0.45, 0.55, 0.65, 0.75]) {
+                points.push({x: Math.round(w * px), y: Math.round(h * py)});
+            }
+        }
+        // Common UAC landscape image area from your debug: top area of the creative card.
+        for (const p of [{x: w/2, y: h*0.38}, {x: w/2, y: h*0.42}, {x: w*0.5, y: Math.min(320, h*0.5)}]) {
+            points.push({x: Math.round(p.x), y: Math.round(p.y)});
+        }
+
+        for (const p of points) {
+            try {
+                const els = document.elementsFromPoint(p.x, p.y) || [];
+                for (const el of els.slice(0, 8)) {
+                    inspectWithParents(el, 'right-click-hit', 30000);
+                }
+            } catch(e) {}
+        }
+
+        // 2) Also inspect all visible image-like nodes with loose size rules.
+        for (const img of Array.from(document.querySelectorAll('img'))) {
+            const rect = visibleRect(img, 20, 20);
+            if (!rect) continue;
+            inspectElement(img, 'visible-img', 15000);
+        }
+
+        for (const source of Array.from(document.querySelectorAll('picture source[srcset], source[srcset]'))) {
+            const picture = source.closest('picture');
+            const visualEl = picture?.querySelector('img') || picture || source;
+            const rect = visibleRect(visualEl, 20, 20);
+            if (!rect) continue;
+            addCandidate(bestFromSrcset(source.getAttribute('srcset')), visualEl, 'visible-source-srcset', 13000);
+        }
+
+        for (const svgImage of Array.from(document.querySelectorAll('image'))) {
+            const rect = visibleRect(svgImage, 20, 20);
+            if (!rect) continue;
+            addCandidate(svgImage.getAttribute('href') || svgImage.getAttribute('xlink:href'), svgImage, 'visible-svg-image', 12000);
+        }
+
+        // 3) CSS background-image fallback, including wrapper div ads.
+        for (const el of Array.from(document.querySelectorAll('body *'))) {
+            const rect = visibleRect(el, 60, 40);
+            if (!rect) continue;
+            addBgCandidates(el, 'visible-element', 11000);
+        }
+
+        if (!candidates.length) return null;
+
+        const deduped = [];
+        const seen = new Set();
+        for (const c of candidates) {
+            if (!c.url || seen.has(c.url)) continue;
+            seen.add(c.url);
+            deduped.push(c);
+        }
+
+        if (!deduped.length) return null;
+        deduped.sort((a, b) => b.score - a.score);
+        return deduped[0] || null;
+    }
+    """
+    try:
+        data = target.evaluate(js)
+        if not data:
+            return None
+
+        base_url = getattr(target, "url", "") or ""
+        data["url"] = _normalize_image_url(data.get("url"), base_url=base_url)
+        if data["url"] == "N/A":
+            return None
+
+        data["right_click_fallback"] = True
+        return data
+    except Exception:
+        return None
+
+
+def get_visible_right_click_image_candidate_once(page):
+    """
+    Last-resort image-only fallback.
+    It does NOT read headline/description from random frames. It only looks for a visible
+    iframe in the current preview area and extracts the image URL by right-click-style
+    hit testing inside that visible frame.
+    """
+    try:
+        frames = list(page.frames)
+    except Exception:
+        return None
+
+    try:
+        vp = page.viewport_size or {}
+        viewport_width = vp.get("width", 1366) or 1366
+        viewport_height = vp.get("height", 768) or 768
+    except Exception:
+        viewport_width = 1366
+        viewport_height = 768
+
+    main_frame = getattr(page, "main_frame", None)
+    candidates = []
+
+    for frame in frames:
+        if frame == main_frame:
+            continue
+
+        try:
+            box = _image_target_parent_box(frame)
+            if not box:
+                continue
+
+            x = float(box.get("x", 0) or 0)
+            y = float(box.get("y", 0) or 0)
+            width = float(box.get("width", 0) or 0)
+            height = float(box.get("height", 0) or 0)
+
+            # Visible current ad preview area only. This avoids hidden/stale frames.
+            if width < 120 or height < 100:
+                continue
+            if x + width <= 0 or x >= viewport_width:
+                continue
+            if y + height <= 250 or y >= max(1800, viewport_height + 1200):
+                continue
+
+            image_data = extract_image_url_by_right_click_from_target(frame)
+            if not image_data:
+                continue
+
+            image_url = clean_text(image_data.get("url"))
+            if image_url == "N/A":
+                continue
+
+            text_data = extract_image_ad_text_quick_from_target(frame, image_data)
+            headline = clean_text(text_data.get("headline"))
+            description = clean_text(text_data.get("description"))
+            body_text = clean_text(text_data.get("body_text"))
+
+            scoped_packages = extract_packages_from_target_and_ancestors(frame, page=page, max_depth=4)
+
+            center_x = x + width / 2
+            page_center_x = viewport_width / 2
+
+            score = 0.0
+            score += float(image_data.get("width", 0) or 0) * float(image_data.get("height", 0) or 0) / 1000.0
+            score += min((width * height) / 4000.0, 180)
+            score += max(0, 160 - abs(center_x - page_center_x) / 3)
+            if 350 <= y <= 1250:
+                score += 180
+            elif 250 <= y <= 1500:
+                score += 90
+            if image_url.startswith("https://tpc.googlesyndication.com/simgad/") or "/simgad/" in image_url:
+                score += 300
+            if headline != "N/A":
+                score += 80
+            if description != "N/A":
+                score += 60
+
+            lower_body = body_text.lower()
+            if "ads transparency" in lower_body or "report this ad" in lower_body or "see more ads" in lower_body:
+                score -= 500
+
+            candidates.append({
+                "score": round(score, 2),
+                "target": frame,
+                "root_frame": _get_parent_frame(frame),
+                "root_box": box,
+                "image_url": image_url,
+                "image_box": image_data,
+                "headline": headline,
+                "description": description,
+                "packages": scoped_packages,
+                "template_package": "N/A",
+                "template_records_count": 0,
+                "matched_template_record": False,
+                "body_text": body_text,
+                "parent_box": box,
+                "right_click_fallback": True,
+            })
+        except Exception:
+            continue
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda c: c["score"], reverse=True)
+    return candidates[0]
+
+
 def wait_and_extract_image_url_with_target(page, max_wait_seconds=12):
     """
     Returns (image_url, target, image_box).
@@ -829,6 +1167,8 @@ def wait_and_extract_image_url_with_target(page, max_wait_seconds=12):
     while time.time() - start_time < max_wait_seconds:
         # Keep the same behavior as your working image extractor: main page first, then frames.
         image_data = extract_primary_image_data_from_target(page)
+        if not image_data:
+            image_data = extract_image_url_by_right_click_from_target(page)
         if image_data:
             return image_data.get("url", "N/A"), page, image_data
 
@@ -836,6 +1176,8 @@ def wait_and_extract_image_url_with_target(page, max_wait_seconds=12):
             if frame == page.main_frame:
                 continue
             image_data = extract_primary_image_data_from_target(frame)
+            if not image_data:
+                image_data = extract_image_url_by_right_click_from_target(frame)
             if image_data:
                 return image_data.get("url", "N/A"), frame, image_data
 
@@ -2299,6 +2641,9 @@ def get_active_image_ad_candidate_once(page):
             try:
                 image_data = extract_primary_image_data_from_target(target)
                 if not image_data:
+                    # Image-only fallback: same as right-clicking the visible creative image.
+                    image_data = extract_image_url_by_right_click_from_target(target)
+                if not image_data:
                     continue
 
                 image_url = clean_text(image_data.get("url"))
@@ -2367,7 +2712,10 @@ def get_active_image_ad_candidate_once(page):
                 continue
 
     if not all_candidates:
-        return None
+        # Final image-only fallback: use right-click-style hit testing on the visible iframe.
+        # This still does not borrow headline/description from random frames; it only saves
+        # an image URL when a visible image exists.
+        return get_visible_right_click_image_candidate_once(page)
 
     all_candidates.sort(key=lambda c: c["score"], reverse=True)
     return all_candidates[0]
@@ -2415,7 +2763,8 @@ def wait_and_extract_active_image_ad_data(page, max_wait_seconds=IMAGE_AD_MAX_WA
             has_text = is_valid_text_ad(candidate.get("headline"), candidate.get("description"))
 
             # Wait at least 10 sec for Google creative hydration, then accept active image data.
-            if elapsed >= min_wait_seconds and has_image and has_text:
+            # Headline/description are optional now: image-only ads must still save image_url.
+            if elapsed >= min_wait_seconds and has_image:
                 package_name, package_score = resolve_package_from_scoped_packages(
                     candidate.get("headline", "N/A"),
                     candidate.get("description", "N/A"),
