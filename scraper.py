@@ -1092,13 +1092,46 @@ _SKIP_PFX = re.compile(
     r'org\.json\.|org\.apache\.)', re.I)
 
 def _is_valid_pkg(pkg):
+    """Strict Android package validator; avoids JS symbols and web domains."""
+    if not pkg:
+        return False
+
+    pkg = str(pkg).strip().rstrip('.,;\'"\\ ')
     parts = pkg.split('.')
-    if len(parts) < 3 or len(pkg) < 8:  return False
-    if _SKIP_EXT.search(pkg):            return False
-    if _SKIP_PFX.match(pkg):             return False
+
+    if len(parts) < 3 or len(pkg) < 8:
+        return False
+
+    # Android package IDs are normally lowercase. This removes JS symbols like Array.prototype.forEach.
+    if pkg != pkg.lower():
+        return False
+
+    if _SKIP_EXT.search(pkg):
+        return False
+
+    if _SKIP_PFX.match(pkg):
+        return False
+
+    domain_prefixes = (
+        'www.', 'tpc.', 'fonts.', 'play.', 'support.', 'adssettings.',
+        'googleads.', 'pagead2.', 'lh3.', 'i1.', 'pnce.', 'apis.',
+        'feedback-pa.', 'cm.', 'csi.'
+    )
+    domain_markers = (
+        'google', 'googlesyndication', 'googleadservices', 'googleapis',
+        'gstatic', 'doubleclick', 'w3.org', 'ytimg', 'youtube'
+    )
+
+    if pkg.startswith(domain_prefixes):
+        return False
+
+    if any(marker in pkg for marker in domain_markers):
+        return False
+
     for p in parts:
-        if not p or not re.match(r'^[A-Za-z][A-Za-z0-9_]*$', p):
+        if not p or not re.match(r'^[a-z][a-z0-9_]*$', p):
             return False
+
     return True
 
 def extract_packages_from_text(raw_text):
@@ -1989,108 +2022,355 @@ def _image_target_parent_box(target):
     return None
 
 
-def get_active_image_ad_candidate_once(page):
-    """
-    Pick the active image creative by ranking frames instead of using browser frame order.
-    Browser frame order caused the first/stale ad data issue.
-    """
-    candidates = []
-
-    possible_targets = []
+def _get_parent_frame(frame):
+    """Playwright exposes parent_frame as a property in sync API; keep safe for variants."""
     try:
-        possible_targets.append(page)
+        parent = getattr(frame, "parent_frame", None)
+        if callable(parent):
+            parent = parent()
+        return parent
+    except Exception:
+        return None
+
+
+def _get_child_frames(frame):
+    try:
+        children = getattr(frame, "child_frames", [])
+        if callable(children):
+            children = children()
+        return list(children or [])
+    except Exception:
+        return []
+
+
+def _frame_descendants_including_self(frame, max_depth=5):
+    """Return frame + descendants only inside one visible ad root."""
+    out = []
+    stack = [(frame, 0)]
+    seen = set()
+
+    while stack:
+        current, depth = stack.pop(0)
+        key = id(current)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(current)
+
+        if depth >= max_depth:
+            continue
+
+        for child in _get_child_frames(current):
+            stack.append((child, depth + 1))
+
+    return out
+
+
+def _visible_top_level_ad_roots(page):
+    """
+    Strict root selection:
+    only top-level iframes whose element is visibly placed in the current ad preview card.
+    This prevents using stale/background iframes from other variations/ads.
+    """
+    roots = []
+
+    try:
+        frames = list(page.frames)
+    except Exception:
+        frames = []
+
+    viewport_width = 1366
+    viewport_height = 768
+    try:
+        vp = page.viewport_size or {}
+        viewport_width = vp.get("width", viewport_width) or viewport_width
+        viewport_height = vp.get("height", viewport_height) or viewport_height
     except Exception:
         pass
 
-    try:
-        for frame in page.frames:
-            if frame == page.main_frame:
-                continue
-            possible_targets.append(frame)
-    except Exception:
-        pass
+    main_frame = getattr(page, "main_frame", None)
 
-    for target in possible_targets:
+    for frame in frames:
         try:
-            image_data = extract_primary_image_data_from_target(target)
-            if not image_data:
+            if frame == main_frame:
                 continue
 
-            image_url = image_data.get("url", "N/A")
-            if image_url == "N/A":
+            # Root must be directly embedded in the main Transparency page.
+            # Child creative frames are evaluated only under this root.
+            parent = _get_parent_frame(frame)
+            if main_frame is not None and parent != main_frame:
                 continue
 
-            text_data = extract_image_ad_text_quick_from_target(target, image_data)
-            headline = clean_text(text_data.get("headline"))
-            description = clean_text(text_data.get("description"))
-            body_text = clean_text(text_data.get("body_text"))
+            box = _frame_parent_box(frame)
+            if not box:
+                continue
 
-            packages = extract_packages_from_target_and_ancestors(target, page=page)
+            x = float(box.get("x", 0) or 0)
+            y = float(box.get("y", 0) or 0)
+            width = float(box.get("width", 0) or 0)
+            height = float(box.get("height", 0) or 0)
 
-            parent_box = _image_target_parent_box(target)
+            if width < 250 or height < 250:
+                continue
+
+            # Must be at least partially visible in/near current viewport.
+            if x + width <= 0 or x >= viewport_width:
+                continue
+            if y + height <= 250 or y >= max(1800, viewport_height + 1200):
+                continue
+
+            url = getattr(frame, "url", "") or ""
+            url_l = url.lower()
+            if not (
+                "safeframe" in url_l
+                or "adframe" in url_l
+                or "googlesyndication" in url_l
+                or "doubleclick" in url_l
+            ):
+                continue
+
+            # Prefer the central visible preview slot, not offscreen/repeated frames.
+            center_x = x + width / 2
+            center_y = y + height / 2
+            page_center_x = viewport_width / 2
 
             score = 0.0
-            score += float(image_data.get("width", 0) or 0) * float(image_data.get("height", 0) or 0) / 1000.0
-
-            if image_url.startswith("https://tpc.googlesyndication.com/simgad/"):
-                score += 120
-
-            if headline != "N/A":
-                score += 120
-            if description != "N/A":
+            score += min((width * height) / 4000.0, 180)
+            score += max(0, 140 - abs(center_x - page_center_x) / 3)
+            if 350 <= y <= 1250:
+                score += 160
+            elif 250 <= y <= 1500:
                 score += 80
-            if packages:
-                score += 80
-
-            lower_body = body_text.lower()
-            if "install" in lower_body or "get" in lower_body or "download" in lower_body:
-                score += 60
-
-            if parent_box:
-                width = parent_box.get("width", 0) or 0
-                height = parent_box.get("height", 0) or 0
-                y = parent_box.get("y", 99999) or 99999
-                area = width * height
-
-                if width >= 250 and height >= 250:
-                    score += 140
-                    score += min(area / 5000, 120)
-                else:
-                    score -= 80
-
-                # Transparency preview card is normally visible in this range.
-                if -50 <= y <= 1300:
-                    score += 120
-                else:
-                    score -= 100
             else:
-                # Main page or detached stale frames should not beat visible ad iframe.
-                score -= 60
+                score -= 80
 
-            # Never prefer Google Transparency shell text as image ad.
-            if "ads transparency" in lower_body or "report this ad" in lower_body or "see more ads" in lower_body:
-                score -= 200
-
-            candidates.append({
+            roots.append({
                 "score": round(score, 2),
-                "target": target,
-                "image_url": image_url,
-                "image_box": image_data,
-                "headline": headline,
-                "description": description,
-                "packages": packages,
-                "body_text": body_text,
-                "parent_box": parent_box
+                "frame": frame,
+                "box": box,
+                "url": url,
             })
         except Exception:
             continue
 
-    if not candidates:
+    roots.sort(key=lambda r: r["score"], reverse=True)
+    return roots
+
+
+def extract_template_ad_records_from_target(target):
+    """
+    Extracts Google template adData from the visible safeframe/root.
+    This is the most reliable source for appId/package and the intended image URL.
+    """
+    js = r"""
+    () => {
+        const clean = (v) => (typeof v === 'string' ? v.trim() : '');
+        const abs = (u) => {
+            u = clean(u);
+            if (!u) return '';
+            try { return new URL(u, location.href).href; } catch(e) { return u; }
+        };
+        const first = (obj, keys) => {
+            if (!obj) return '';
+            for (const k of keys) {
+                const v = clean(obj[k]);
+                if (v) return v;
+            }
+            return '';
+        };
+        const allImages = (obj) => {
+            const keys = [
+                'landscapeImage', 'portraitImage', 'squareImage', 'image', 'imageUrl',
+                'marketingImage', 'thumbnailImage', 'mediaImage', 'appIcon', 'iconUrl'
+            ];
+            const out = [];
+            for (const k of keys) {
+                const u = abs(obj && obj[k]);
+                if (u) out.push(u);
+            }
+            return Array.from(new Set(out));
+        };
+        const records = [];
+        const configs = [];
+
+        try { if (window.exitConfig) configs.push(window.exitConfig); } catch(e) {}
+        try { if (window.google_template_data) configs.push({google_template_data: window.google_template_data}); } catch(e) {}
+        try { if (window.adData) configs.push({google_template_data: {adData: Array.isArray(window.adData) ? window.adData : [window.adData]}}); } catch(e) {}
+
+        for (const cfg of configs) {
+            const gtd = cfg.google_template_data || cfg.googleTemplateData || {};
+            let arr = gtd.adData || cfg.adData || [];
+            if (!Array.isArray(arr)) arr = [arr];
+            for (const d of arr) {
+                if (!d || typeof d !== 'object') continue;
+                const appId = first(d, ['appId', 'packageName', 'package', 'androidPackage']);
+                const destinationUrl = first(d, ['destination_url', 'destinationUrl', 'final_url', 'finalUrl', 'click_url', 'clickUrl']) || clean(cfg.destination_url) || clean(cfg.final_url);
+                const redirectUrl = first(d, ['redirect_url', 'redirectUrl']) || clean(cfg.redirect_url);
+                const headline = first(d, ['headline', 'headline1', 'appTitle', 'appName', 'title', 'name', 'shortTitle']);
+                const description = first(d, ['description1', 'description', 'longDescription', 'description2', 'body', 'subtitle', 'appText']);
+                const images = allImages(d);
+                if (!appId && !destinationUrl && !redirectUrl && !images.length && !headline && !description) continue;
+                records.push({
+                    appId,
+                    destinationUrl,
+                    redirectUrl,
+                    headline,
+                    description,
+                    images,
+                    rawKeys: Object.keys(d).slice(0, 80)
+                });
+            }
+        }
+        return records;
+    }
+    """
+    try:
+        records = target.evaluate(js) or []
+        if not isinstance(records, list):
+            return []
+        return records
+    except Exception:
+        return []
+
+
+def _extract_package_from_template_record(record):
+    if not record:
+        return "N/A"
+
+    for key in ["appId", "packageName", "package"]:
+        pkg = clean_text(record.get(key))
+        if pkg != "N/A" and _is_valid_pkg(pkg):
+            return pkg
+
+    for key in ["destinationUrl", "redirectUrl"]:
+        link = clean_text(record.get(key))
+        pkg = extract_package_name(clean_googleadservices_link(link))
+        if pkg != "N/A" and _is_valid_pkg(pkg):
+            return pkg
+
+    return "N/A"
+
+
+def _urls_match(u1, u2):
+    u1 = clean_text(u1)
+    u2 = clean_text(u2)
+    if u1 == "N/A" or u2 == "N/A":
+        return False
+    if u1 == u2:
+        return True
+    try:
+        p1 = urlparse(u1)
+        p2 = urlparse(u2)
+        return p1.netloc == p2.netloc and p1.path.rstrip('/') == p2.path.rstrip('/')
+    except Exception:
+        return False
+
+
+def _record_matches_image(record, image_url):
+    for img in record.get("images", []) or []:
+        if _urls_match(img, image_url):
+            return True
+    return False
+
+
+def get_active_image_ad_candidate_once(page):
+    """
+    Strict image-ad extraction:
+    1) choose a visible top-level ad root iframe from the current preview only
+    2) read package/template data from that root
+    3) read image/text only from children inside that same root
+    No page-wide frame scan.
+    """
+    roots = _visible_top_level_ad_roots(page)
+    if not roots:
         return None
 
-    candidates.sort(key=lambda c: c["score"], reverse=True)
-    return candidates[0]
+    all_candidates = []
 
+    for root in roots[:3]:
+        root_frame = root["frame"]
+        root_box = root["box"]
+        root_records = extract_template_ad_records_from_target(root_frame)
+
+        # Strict scoped packages only from this visible root.
+        scoped_packages = extract_packages_from_target_and_ancestors(root_frame, page=page, max_depth=1)
+
+        for target in _frame_descendants_including_self(root_frame, max_depth=5):
+            try:
+                image_data = extract_primary_image_data_from_target(target)
+                if not image_data:
+                    continue
+
+                image_url = clean_text(image_data.get("url"))
+                if image_url == "N/A":
+                    continue
+
+                text_data = extract_image_ad_text_quick_from_target(target, image_data)
+                headline = clean_text(text_data.get("headline"))
+                description = clean_text(text_data.get("description"))
+                body_text = clean_text(text_data.get("body_text"))
+
+                matching_records = [r for r in root_records if _record_matches_image(r, image_url)]
+                best_record = matching_records[0] if matching_records else (root_records[0] if len(root_records) == 1 else None)
+
+                template_package = _extract_package_from_template_record(best_record) if best_record else "N/A"
+                if template_package != "N/A":
+                    scoped_packages = set(scoped_packages or set())
+                    scoped_packages.add(template_package)
+
+                # Use visible text first. Template text is only fallback.
+                if (headline == "N/A" or not headline) and best_record:
+                    headline = clean_text(best_record.get("headline"))
+                if (description == "N/A" or not description) and best_record:
+                    description = clean_text(best_record.get("description"))
+
+                score = 0.0
+                score += float(image_data.get("width", 0) or 0) * float(image_data.get("height", 0) or 0) / 1000.0
+                score += float(root.get("score", 0) or 0)
+
+                if image_url.startswith("https://tpc.googlesyndication.com/simgad/"):
+                    score += 150
+                if headline != "N/A":
+                    score += 120
+                if description != "N/A":
+                    score += 80
+                if matching_records:
+                    score += 220
+                if template_package != "N/A":
+                    score += 160
+                if scoped_packages:
+                    score += 80
+
+                lower_body = body_text.lower()
+                if "install" in lower_body or "get" in lower_body or "download" in lower_body:
+                    score += 60
+                if "ads transparency" in lower_body or "report this ad" in lower_body or "see more ads" in lower_body:
+                    score -= 300
+
+                all_candidates.append({
+                    "score": round(score, 2),
+                    "target": target,
+                    "root_frame": root_frame,
+                    "root_box": root_box,
+                    "image_url": image_url,
+                    "image_box": image_data,
+                    "headline": headline,
+                    "description": description,
+                    "packages": scoped_packages,
+                    "template_package": template_package,
+                    "template_records_count": len(root_records),
+                    "matched_template_record": bool(matching_records),
+                    "body_text": body_text,
+                    "parent_box": _image_target_parent_box(target),
+                })
+            except Exception:
+                continue
+
+    if not all_candidates:
+        return None
+
+    all_candidates.sort(key=lambda c: c["score"], reverse=True)
+    return all_candidates[0]
 
 def resolve_package_from_scoped_packages(headline, description, scoped_packages):
     """
@@ -2303,8 +2583,11 @@ def scrape_single_url(url_row):
 
             advertiser = extract_advertiser_from_page(page)
 
-            # VIDEO LOGIC: same original flow. No text/image extraction runs before this.
-            video_id = detect_video_id(page, captured)
+            # IMAGE-AD ONLY MODE:
+            # Do not run video detection here. detect_video_id() clicks/scrolls frames,
+            # which can move the carousel or hydrate stale/background ads and causes
+            # wrong image/headline/description for image-ad scraping.
+            video_id = "N/A"
             video_time = get_exact_time()
 
             # =========================
@@ -2562,7 +2845,7 @@ def run_parallel_combined_scraper(max_workers=2):
                 except Exception:
                     pass
 
-    print("✅ Finished combined video + text scraping")
+    print("✅ Finished image-ad scraping")
 
 
 if __name__ == "__main__":
