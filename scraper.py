@@ -45,10 +45,24 @@ SHEET_LOCK = threading.Lock()
 
 VIDEO_EXTENSIONS = (".mp4", ".webm", ".mov", ".m4v", ".m3u8")
 
+APP_LINK_INSPECT_CLASSES = [
+    "ns-zxqs8-e-16",
+    "ns-zxqs8-e-13",
+]
+
 INSTALL_SELECTORS = [
     "a.install-button-anchor.svg-anchor",
     "a.install-button-anchor",
     'a[data-asoch-targets-ad-objective-type]',
+
+    # Google creative inspected classes supplied by user.
+    # These are checked first so column D gets the link from the same image creative,
+    # instead of a random Install/link elsewhere on the Transparency page.
+    "a.ns-zxqs8-e-16",
+    "a.ns-zxqs8-e-13",
+    ".ns-zxqs8-e-16 a[href]",
+    ".ns-zxqs8-e-13 a[href]",
+
     'a:has-text("Install")',
     'a:has-text("Get")',
     'a:has-text("Download")',
@@ -70,6 +84,14 @@ def safe_update_headline_desc(row_num, headline, description):
     """
     with SHEET_LOCK:
         sheets.update_headline_and_description(row_num, headline, description)
+
+
+def safe_update_image_url(row_num, image_url):
+    """
+    Thread-safe Google Sheet row update for Image URL in column O.
+    """
+    with SHEET_LOCK:
+        sheets.update_image_url(row_num, image_url)
 
 
 def safe_add_log(row_number, status, log_type, url="", video_id="", app_link="", message=""):
@@ -422,6 +444,174 @@ def is_good_app_link(href):
     )
 
 
+def build_store_link_from_package(package_name):
+    """Builds a Play Store URL when only appId/package is present in inspected HTML."""
+    if not package_name or package_name == "N/A":
+        return "N/A"
+    return f"https://play.google.com/store/apps/details?id={package_name}"
+
+
+def normalize_app_link(href):
+    """Decode adservice redirects and keep only Play/App Store style app links."""
+    if not href:
+        return "N/A"
+
+    href = clean_googleadservices_link(str(href).strip())
+
+    if href.startswith("//"):
+        href = "https:" + href
+
+    if is_good_app_link(href):
+        return href
+
+    package_name = extract_package_name(href)
+    if package_name != "N/A":
+        return build_store_link_from_package(package_name)
+
+    return "N/A"
+
+
+def extract_app_link_from_inspected_classes_in_target(target):
+    """
+    Highest-priority app-link extractor for image ads.
+    It checks the inspected Google creative classes:
+      - ns-zxqs8-e-16
+      - ns-zxqs8-e-13
+
+    It looks at the element, child anchors, closest parent anchors, onclick/data attrs,
+    and outerHTML appId/package values. This is what fills column D with the app link
+    from the same creative/image area.
+    """
+    js = r"""
+    (classNames) => {
+        const isVisibleEnough = (el) => {
+            if (!el) return false;
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return (
+                rect.width > 0 &&
+                rect.height > 0 &&
+                style.visibility !== 'hidden' &&
+                style.display !== 'none' &&
+                style.opacity !== '0'
+            );
+        };
+
+        const getAttrs = (el) => {
+            if (!el) return [];
+            const attrs = [];
+            const names = [
+                'href', 'data-href', 'data-url', 'data-destination-url',
+                'data-final-url', 'data-click-url', 'data-ved', 'onclick',
+                'aria-label'
+            ];
+            for (const name of names) {
+                const value = el.getAttribute && el.getAttribute(name);
+                if (value) attrs.push(value);
+            }
+            if (el.href) attrs.push(el.href);
+            return attrs;
+        };
+
+        const collectFromElement = (el) => {
+            const out = [];
+            if (!el) return out;
+
+            // The class can be on the anchor itself.
+            out.push(...getAttrs(el));
+
+            // Or the class can be on a wrapper around the anchor.
+            for (const a of Array.from(el.querySelectorAll('a[href], a[data-href]'))) {
+                out.push(...getAttrs(a));
+            }
+
+            // Or the anchor can be a parent of the inspected element.
+            const closestAnchor = el.closest && el.closest('a[href], a[data-href]');
+            if (closestAnchor) out.push(...getAttrs(closestAnchor));
+
+            // Keep outerHTML too because some creatives keep appId/package inside script/json.
+            if (el.outerHTML) out.push(el.outerHTML);
+
+            // Also inspect a few parent wrappers because the class can be on the
+            // text/button while the href/appId is stored one level above.
+            let parent = el.parentElement;
+            let depth = 0;
+            while (parent && depth < 4) {
+                out.push(...getAttrs(parent));
+                if (parent.outerHTML) out.push(parent.outerHTML);
+                parent = parent.parentElement;
+                depth += 1;
+            }
+
+            return out;
+        };
+
+        const nodes = [];
+        for (const cls of classNames) {
+            nodes.push(...Array.from(document.getElementsByClassName(cls)));
+        }
+
+        const uniqueNodes = Array.from(new Set(nodes));
+        const candidates = [];
+
+        for (const el of uniqueNodes) {
+            if (!isVisibleEnough(el)) continue;
+            candidates.push(...collectFromElement(el));
+        }
+
+        // Fallback: class may be copied into generated className text with extra tokens.
+        for (const el of Array.from(document.querySelectorAll('a[href], a[data-href], [class]'))) {
+            const clsText = String(el.className || '');
+            if (!classNames.some(cls => clsText.includes(cls))) continue;
+            if (!isVisibleEnough(el)) continue;
+            candidates.push(...collectFromElement(el));
+        }
+
+        return candidates.filter(Boolean);
+    }
+    """
+
+    try:
+        raw_candidates = target.evaluate(js, APP_LINK_INSPECT_CLASSES) or []
+    except Exception:
+        return "N/A"
+
+    for candidate in raw_candidates:
+        link = normalize_app_link(candidate)
+        if link != "N/A":
+            return link
+
+    combined = "\n".join(str(x) for x in raw_candidates if x)
+    packages = extract_packages_from_text(combined)
+    if packages:
+        # Prefer the first stable package after sorting for deterministic output.
+        return build_store_link_from_package(sorted(packages)[0])
+
+    return "N/A"
+
+
+def extract_app_link_from_inspected_classes(page):
+    """
+    Checks main page and every iframe for the inspected class-based app link.
+    """
+    try:
+        link = extract_app_link_from_inspected_classes_in_target(page)
+        if link != "N/A":
+            return link
+    except Exception:
+        pass
+
+    for frame in page.frames:
+        try:
+            link = extract_app_link_from_inspected_classes_in_target(frame)
+            if link != "N/A":
+                return link
+        except Exception:
+            continue
+
+    return "N/A"
+
+
 def get_visible_install_candidates_from_target(target):
     candidates = []
 
@@ -613,11 +803,20 @@ def wait_and_extract_install_link(page, max_wait_seconds=35):
     start = time.time()
 
     while time.time() - start < max_wait_seconds:
+        # 1) Highest priority: app link from inspected image-creative classes.
+        #    This is the link that should be written in column D.
+        app_link = extract_app_link_from_inspected_classes(page)
+
+        if app_link != "N/A":
+            return app_link
+
+        # 2) Existing visible install button logic.
         app_link = extract_visible_install_link(page)
 
         if app_link != "N/A":
             return app_link
 
+        # 3) Existing JS fallback.
         app_link = extract_install_link_by_precise_js(page)
 
         if app_link != "N/A":
@@ -629,6 +828,103 @@ def wait_and_extract_install_link(page, max_wait_seconds=35):
             pass
 
         page.wait_for_timeout(1500)
+
+    return "N/A"
+
+
+# =========================
+# IMAGE URL EXTRACTION LOGIC
+# =========================
+
+def extract_primary_image_url(page):
+    """
+    Extracts the primary/main image URL from the ad creative.
+    Looks for large, visible images that aren't icons or logos.
+    Returns the full image URL or "N/A".
+    """
+    js = r"""
+    () => {
+        const isVisible = (el) => {
+            if (!el) return false;
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return (
+                rect.width >= 100 &&
+                rect.height >= 100 &&
+                rect.bottom > 0 &&
+                rect.right > 0 &&
+                rect.top < window.innerHeight &&
+                rect.left < window.innerWidth &&
+                style.visibility !== 'hidden' &&
+                style.display !== 'none' &&
+                style.opacity !== '0'
+            );
+        };
+
+        const images = Array.from(document.querySelectorAll('img')).map(img => {
+            const src = String(img.getAttribute('src') || img.src || '');
+            const alt = String(img.getAttribute('alt') || '').toLowerCase();
+            const rect = img.getBoundingClientRect();
+            
+            // Skip logos, icons, and Google branding
+            if (src.includes('googlelogo') || alt.includes('google') || 
+                alt.includes('logo') || alt.includes('icon') ||
+                src.includes('logo') || src.includes('icon')) {
+                return null;
+            }
+            
+            // Only include visible images
+            if (!isVisible(img)) {
+                return null;
+            }
+            
+            // Calculate score based on size and position
+            const area = rect.width * rect.height;
+            const score = area + (rect.y < 400 ? 5000 : 0); // Prefer top images
+            
+            return { src, area, score };
+        }).filter(Boolean);
+
+        // Sort by score descending and return the best one
+        if (images.length > 0) {
+            images.sort((a, b) => b.score - a.score);
+            return images[0].src;
+        }
+
+        return null;
+    }
+    """
+
+    try:
+        image_url = page.evaluate(js)
+        if image_url and isinstance(image_url, str) and len(image_url) > 0:
+            # Handle relative URLs
+            if image_url.startswith("http"):
+                return image_url
+            elif image_url.startswith("//"):
+                return "https:" + image_url
+            elif image_url.startswith("/"):
+                try:
+                    base_url = urlparse(page.url).netloc
+                    return f"https://{base_url}{image_url}"
+                except:
+                    return image_url
+            return image_url
+    except Exception:
+        pass
+
+    # Fallback: check iframes
+    for frame in page.frames:
+        try:
+            image_url = frame.evaluate(js)
+            if image_url and isinstance(image_url, str) and len(image_url) > 0:
+                if image_url.startswith("http"):
+                    return image_url
+                elif image_url.startswith("//"):
+                    return "https:" + image_url
+                return image_url
+        except Exception:
+            continue
 
     return "N/A"
 
@@ -845,9 +1141,6 @@ def get_best_matching_package(headline, description, package_list, min_score=MIN
 
 def decode_all(text):
     """Decode every encoding variant so no package name is missed."""
-    text = str(text or "")
-    text = text.replace('\\/', '/')
-    text = re.sub(r'\\u002[Ff]', '/', text)
     text = re.sub(r'\\x3[Dd]', '=', text)
     text = re.sub(r'\\x26',    '&', text)
     text = re.sub(r'\\x3[Ff]', '?', text)
@@ -1301,648 +1594,6 @@ def has_visible_image_creative(page):
     return False
 
 
-# =========================
-# IMAGE AD LOGIC (STRICT SAME CREATIVE)
-# =========================
-
-_IMAGE_BAD_TEXT_WORDS = {
-    "install", "get", "open", "download", "play", "learn more", "visit site",
-    "sponsored", "ad", "ads", "advertisement", "google", "google play",
-    "apps", "app", "privacy", "terms", "report this ad", "see more ads",
-    "ads transparency center", "ads transparency centre", "last shown", "shown in",
-    "more options", "close", "menu"
-}
-
-
-def _clean_image_url(url):
-    """Return the exact usable image src URL, especially tpc.googlesyndication.com/archive/simgad."""
-    if not url or url == "N/A":
-        return "N/A"
-    url = str(url).strip().strip('"\'')
-    if not url:
-        return "N/A"
-    if url.startswith("//"):
-        return "https:" + url
-    return url
-
-
-def _extract_image_ad_details_from_target(target):
-    """
-    Extracts image URL and visible headline/description from the SAME visual creative.
-
-    Important fixes:
-    - Uses the exact DOM attribute: img.getAttribute('src'), the same URL you see in Inspect Element.
-    - Chooses the visible tpc.googlesyndication.com/archive/simgad image closest to the active preview area.
-    - Reads text only in the visual band directly below that exact image.
-    - Stops before the next visible image, so it cannot steal title/description from another ad.
-    - If no clean text is visually attached to the selected image, returns N/A instead of random text.
-    """
-    js = r"""
-    () => {
-        const cleanText = (txt) => (txt || '').replace(/\n/g, ' ').replace(/\s+/g, ' ').trim();
-
-        const isVisible = (el, relaxed=false) => {
-            if (!el) return false;
-            const rect = el.getBoundingClientRect();
-            const style = window.getComputedStyle(el);
-            if (!(rect.width > 0 && rect.height > 0)) return false;
-            if (style.visibility === 'hidden' || style.display === 'none' || style.opacity === '0') return false;
-            if (relaxed) return true;
-            return rect.bottom > 0 && rect.right > 0 && rect.top < window.innerHeight && rect.left < window.innerWidth;
-        };
-
-        const viewportVisibleArea = (rect) => {
-            const left = Math.max(0, rect.left);
-            const right = Math.min(window.innerWidth, rect.right);
-            const top = Math.max(0, rect.top);
-            const bottom = Math.min(window.innerHeight, rect.bottom);
-            return Math.max(0, right - left) * Math.max(0, bottom - top);
-        };
-
-        const absoluteUrl = (raw) => {
-            raw = String(raw || '').trim().replace(/^["']|["']$/g, '');
-            if (!raw) return '';
-            // For img src this remains exact. Only srcset fallback needs descriptor trimming.
-            raw = raw.split(',')[0].trim().split(/\s+/)[0].trim();
-            if (!raw || raw.startsWith('data:') || raw.startsWith('blob:')) return '';
-            if (raw.startsWith('//')) raw = 'https:' + raw;
-            try { return new URL(raw, location.href).href; } catch(e) { return raw; }
-        };
-
-        const isBadImageUrl = (url) => {
-            const u = String(url || '').toLowerCase();
-            return (
-                !u ||
-                u.startsWith('data:') ||
-                u.startsWith('blob:') ||
-                u.includes('googlelogo') ||
-                u.includes('favicon') ||
-                u.includes('sprite') ||
-                u.includes('/icons/') ||
-                u.includes('gstatic.com/images/branding') ||
-                u.includes('ssl.gstatic.com') ||
-                u.includes('doubleclick.net/pagead/images')
-            );
-        };
-
-        const hasAncestorMatch = (el, regex) => {
-            let cur = el;
-            let depth = 0;
-            while (cur && depth < 12) {
-                const key = `${cur.tagName || ''} ${String(cur.id || '')} ${String(cur.className || '')}`.toLowerCase();
-                if (regex.test(key)) return true;
-                cur = cur.parentElement;
-                depth += 1;
-            }
-            return false;
-        };
-
-        const imageCandidates = [];
-        const imgNodes = Array.from(document.querySelectorAll('img[src]'));
-
-        for (const img of imgNodes) {
-            if (!isVisible(img)) continue;
-            const rect = img.getBoundingClientRect();
-
-            // Real ad creative image. This avoids 72x72 app icons and tiny tracking pixels.
-            if (rect.width < 140 || rect.height < 90) continue;
-
-            const rawSrc = img.getAttribute('src') || '';       // EXACT inspect-element src first
-            const url = absoluteUrl(rawSrc || img.getAttribute('data-src') || img.getAttribute('data-lazy-src') || img.src || img.currentSrc || '');
-            if (isBadImageUrl(url)) continue;
-
-            const lowerUrl = url.toLowerCase();
-            const alt = String(img.getAttribute('alt') || '').toLowerCase();
-            const cls = String(img.className || '').toLowerCase();
-            const id = String(img.id || '').toLowerCase();
-            if (alt.includes('google') || cls.includes('logo') || id.includes('logo')) continue;
-
-            const area = rect.width * rect.height;
-            const visibleArea = viewportVisibleArea(rect);
-            const visibleRatio = visibleArea / Math.max(1, area);
-            const centerY = rect.top + rect.height / 2;
-            const centerX = rect.left + rect.width / 2;
-
-            let score = 0;
-            score += area;
-            score += visibleArea * 1.8;
-            score += visibleRatio * 120000;
-
-            // Strongly prefer the actual creative URL pattern from Inspect Element.
-            if (lowerUrl.includes('tpc.googlesyndication.com')) score += 650000;
-            if (lowerUrl.includes('/archive/') || lowerUrl.includes('/simgad/')) score += 450000;
-            if (hasAncestorMatch(img, /(html-renderer|html-container|creative|ad-container|landscape|portrait|preview)/)) score += 180000;
-            if (rawSrc && rawSrc === img.getAttribute('src')) score += 120000;
-
-            // Prefer the active preview in the current viewport, not another visible repeated ad.
-            score += Math.max(0, 520 - Math.abs(centerY - window.innerHeight * 0.42)) * 650;
-            score += Math.max(0, 520 - Math.abs(centerX - window.innerWidth * 0.50)) * 120;
-            if (rect.top < -10) score -= 300000;
-            if (rect.top > window.innerHeight * 0.72) score -= 260000;
-            if (rect.bottom < 60) score -= 260000;
-
-            imageCandidates.push({
-                el: img,
-                url,
-                rawSrc,
-                score,
-                rect: {top: rect.top, left: rect.left, bottom: rect.bottom, right: rect.right, width: rect.width, height: rect.height}
-            });
-        }
-
-        imageCandidates.sort((a, b) => b.score - a.score);
-        if (!imageCandidates.length) {
-            return {
-                image_url: 'N/A', headline: 'N/A', description: 'N/A',
-                candidate_score: 0, debug: 'no_visible_large_img_src'
-            };
-        }
-
-        const image = imageCandidates[0];
-
-        // Find the next visible image below the selected image. Text after this belongs to another creative.
-        let nextImageTop = Infinity;
-        for (const cand of imageCandidates) {
-            if (cand.url === image.url && Math.abs(cand.rect.top - image.rect.top) < 2) continue;
-            if (cand.rect.top > image.rect.bottom + 8) {
-                nextImageTop = Math.min(nextImageTop, cand.rect.top);
-            }
-        }
-
-        const badExact = new Set([
-            'install', 'get', 'open', 'download', 'play', 'learn more', 'visit site',
-            'sponsored', 'ad', 'ads', 'advertisement', 'google', 'google play',
-            'privacy', 'terms', 'report this ad', 'see more ads', 'ads transparency center',
-            'ads transparency centre', 'last shown', 'shown in', 'more options', 'close', 'menu'
-        ]);
-
-        const textLooksUseful = (txt) => {
-            const t = cleanText(txt);
-            const lower = t.toLowerCase();
-            if (t.length < 3 || t.length > 220) return false;
-            if (t.includes('{{') || t.includes('}}')) return false;
-            if (/https?:\/\//i.test(t)) return false;
-            if (badExact.has(lower)) return false;
-            if (/^(install|get|open|download|play|open app)$/i.test(t)) return false;
-            if (/^(\d+\s*)?$/.test(t)) return false;
-            if (lower.includes('ads transparency') || lower.includes('report this ad')) return false;
-            if (lower.includes('install') || lower.includes('download')) return false;
-            if (/^\W+$/.test(t)) return false;
-            return true;
-        };
-
-        const horizontalOverlapRatio = (a, b) => {
-            const overlap = Math.max(0, Math.min(a.right, b.right) - Math.max(a.left, b.left));
-            const minWidth = Math.max(1, Math.min(a.width, b.width));
-            return overlap / minWidth;
-        };
-
-        const getOwnText = (el) => {
-            const own = Array.from(el.childNodes)
-                .filter(n => n.nodeType === Node.TEXT_NODE)
-                .map(n => n.textContent || '')
-                .join(' ');
-            return cleanText(own);
-        };
-
-        const textItems = [];
-        const textSelectors = 'span, div, p, h1, h2, h3, h4, a';
-        const maxTextTop = Math.min(image.rect.bottom + 260, nextImageTop - 6);
-        const maxTextBottom = Math.min(image.rect.bottom + 310, nextImageTop - 4);
-
-        for (const el of Array.from(document.querySelectorAll(textSelectors))) {
-            if (!isVisible(el, true)) continue;
-            const rect = el.getBoundingClientRect();
-
-            // Strict visual rule: text must be directly below the selected image only.
-            if (rect.top < image.rect.bottom - 4) continue;
-            if (rect.top > maxTextTop || rect.bottom > maxTextBottom) continue;
-
-            const overlap = horizontalOverlapRatio(rect, image.rect);
-            const alignedByLeft = Math.abs(rect.left - image.rect.left) <= 70;
-            const alignedByCenter = Math.abs((rect.left + rect.width / 2) - (image.rect.left + image.rect.width / 2)) <= Math.max(120, image.rect.width * 0.35);
-            if (!(overlap >= 0.28 || alignedByLeft || alignedByCenter)) continue;
-
-            const key = `${String(el.id || '')} ${String(el.className || '')} ${String(el.getAttribute('aria-label') || '')}`.toLowerCase();
-            if (/(action|button|install|more-vert|menu|icon|logo|svg)/.test(key)) continue;
-
-            const classIsDirectText = /(app-title|app-text|headline|description|desc|title|body|subtitle|long-description|text)/i.test(key);
-            const ownText = getOwnText(el);
-            let txt = ownText || cleanText(el.innerText || el.textContent || '');
-
-            // Avoid wrappers that combine multiple unrelated texts. Only accept wrappers if their class is a known text class.
-            if (el.childElementCount > 0 && !classIsDirectText) continue;
-            if (el.childElementCount > 0 && classIsDirectText && ownText.length < 3) {
-                txt = cleanText(el.innerText || el.textContent || '');
-            }
-
-            if (!textLooksUseful(txt)) continue;
-
-            const style = window.getComputedStyle(el);
-            const fontSize = parseFloat(style.fontSize || '0');
-            const fontWeight = parseInt(style.fontWeight || '400', 10) || 400;
-
-            let score = 0;
-            score += 1200;
-            score += Math.max(0, 260 - Math.abs(rect.top - image.rect.bottom)) * 4;
-            score += overlap * 450;
-            if (/(app-title|headline|title)/.test(key)) score += 850;
-            if (/(app-text|description|desc|body|subtitle|long-description)/.test(key)) score += 780;
-            score += Math.min(fontSize, 34) * 8;
-            if (fontWeight >= 600) score += 180;
-
-            textItems.push({
-                text: txt,
-                key,
-                score,
-                rect: {top: rect.top, left: rect.left, bottom: rect.bottom, right: rect.right, width: rect.width, height: rect.height},
-                fontSize,
-                fontWeight
-            });
-        }
-
-        // Deduplicate by text, keeping the visually strongest item.
-        const byText = new Map();
-        for (const item of textItems) {
-            const k = item.text.toLowerCase();
-            if (!byText.has(k) || byText.get(k).score < item.score) byText.set(k, item);
-        }
-
-        const items = Array.from(byText.values()).sort((a, b) => {
-            const dy = a.rect.top - b.rect.top;
-            if (Math.abs(dy) > 4) return dy;
-            return b.score - a.score;
-        });
-
-        let headline = 'N/A';
-        let description = 'N/A';
-
-        const titleCandidate = items
-            .filter(x => /(app-title|headline|title)/.test(x.key) && !/(action|button|install|bar)/.test(x.key))
-            .sort((a, b) => b.score - a.score)[0];
-        if (titleCandidate) headline = titleCandidate.text;
-
-        const descCandidate = items
-            .filter(x => x.text !== headline && /(app-text|description|desc|body|subtitle|long-description)/.test(x.key) && !/(action|button|install|bar)/.test(x.key))
-            .sort((a, b) => b.score - a.score)[0];
-        if (descCandidate) description = descCandidate.text;
-
-        // If there are no class-labelled title/desc nodes, use visual order only.
-        if (headline === 'N/A' && items[0]) headline = items[0].text;
-        if (description === 'N/A') {
-            const second = items.find(x => x.text !== headline);
-            if (second) description = second.text;
-        }
-
-        return {
-            image_url: image.url || 'N/A',
-            headline: headline || 'N/A',
-            description: description || 'N/A',
-            candidate_score: image.score,
-            image_rect: image.rect,
-            debug: `imgCandidates=${imageCandidates.length}, visualTextItems=${items.length}, nextImageTop=${nextImageTop}`
-        };
-    }
-    """
-    try:
-        return target.evaluate(js) or {"image_url": "N/A", "headline": "N/A", "description": "N/A", "candidate_score": 0}
-    except Exception:
-        return {"image_url": "N/A", "headline": "N/A", "description": "N/A", "candidate_score": 0}
-
-
-def wait_and_extract_image_ad_details(page, max_wait_seconds=15):
-    """
-    Returns (data, target). Checks the main page and all frames, then chooses the best
-    same-creative image candidate. The image candidate itself carries a very strong
-    tpc/archive/simgad score and viewport score, so repeated ads lower on the page lose.
-    """
-    start_time = time.time()
-
-    while time.time() - start_time < max_wait_seconds:
-        candidates = []
-
-        target_list = []
-        # Main page is important because html-renderer often lives directly in the page DOM.
-        target_list.append((page, "main_page", 0))
-
-        for frame in page.frames:
-            if frame == page.main_frame:
-                continue
-
-            parent_bonus = 0
-            box = _frame_parent_box(frame)
-            if box:
-                width = box.get("width", 0) or 0
-                height = box.get("height", 0) or 0
-                y = box.get("y", 99999) or 99999
-                area = width * height
-                if width >= 120 and height >= 70:
-                    parent_bonus += min(area / 5000, 140)
-                else:
-                    parent_bonus -= 160
-                # Prefer active visible preview, not hidden/lower repeated ad slots.
-                if -30 <= y <= 820:
-                    parent_bonus += 180
-                elif 820 < y <= 1100:
-                    parent_bonus -= 80
-                else:
-                    parent_bonus -= 220
-            else:
-                parent_bonus -= 80
-
-            target_list.append((frame, "iframe", parent_bonus))
-
-        for target, kind, target_bonus in target_list:
-            data = _extract_image_ad_details_from_target(target)
-            image_url = _clean_image_url(data.get("image_url"))
-            if image_url == "N/A":
-                continue
-
-            data["image_url"] = image_url
-            data["target_kind"] = kind
-            try:
-                final_score = float(data.get("candidate_score", 0) or 0) + float(target_bonus or 0)
-            except Exception:
-                final_score = 0
-            data["final_candidate_score"] = final_score
-            candidates.append((final_score, data, target))
-
-        if candidates:
-            candidates.sort(key=lambda item: item[0], reverse=True)
-            return candidates[0][1], candidates[0][2]
-
-        page.wait_for_timeout(1000)
-
-    return {"image_url": "N/A", "headline": "N/A", "description": "N/A", "target_kind": "N/A"}, None
-
-
-def _collect_target_text_for_package(target):
-    """Collect DOM/script text from a target. This does not click or use visible Install links."""
-    collected = []
-    if target is None:
-        return ""
-
-    try:
-        scripts = target.evaluate("""
-            () => Array.from(document.scripts)
-                .map(s => s.textContent || '')
-                .filter(Boolean)
-                .join('\n')
-        """)
-        if scripts:
-            collected.append(scripts)
-    except Exception:
-        pass
-
-    try:
-        html = target.evaluate("() => document.documentElement ? document.documentElement.outerHTML : ''")
-        if html:
-            collected.append(html)
-    except Exception:
-        pass
-
-    try:
-        hrefs = target.evaluate("""
-            () => Array.from(document.querySelectorAll('a[href]'))
-                .map(a => a.href || a.getAttribute('href') || '')
-                .filter(Boolean)
-                .join('\n')
-        """)
-        if hrefs:
-            collected.append(hrefs)
-    except Exception:
-        pass
-
-    return "\n".join(collected)
-
-
-def extract_packages_from_target(target):
-    """Package candidates from the selected creative target only."""
-    raw = _collect_target_text_for_package(target)
-    if not raw:
-        return set()
-    return extract_packages_from_text(raw)
-
-
-def _image_url_keys_for_context(image_url):
-    """Keys from the selected image URL used to prove that an appId belongs to the same ad."""
-    keys = []
-    if not image_url or image_url == "N/A":
-        return keys
-    try:
-        decoded = decode_all(image_url)
-        keys.append(decoded)
-        parsed = urlparse(decoded)
-        parts = [p for p in parsed.path.split('/') if p]
-        if parts:
-            keys.append(parts[-1])
-        # tpc image URLs often include numeric simgad IDs. Keep long numeric IDs only.
-        for m in re.finditer(r"\b\d{6,}\b", decoded):
-            keys.append(m.group(0))
-    except Exception:
-        pass
-    return list(dict.fromkeys([k for k in keys if k]))
-
-
-def _context_contains_text(context, value):
-    if not value or value == "N/A":
-        return False
-    a = clean_text_for_comparison(context)
-    b = clean_text_for_comparison(value)
-    return bool(b and len(b) >= 6 and b in a)
-
-
-def extract_appid_candidates_from_addata_text(raw_text, image_url=None, headline=None, description=None, source_priority=0, require_related=True):
-    """
-    Returns scored appId candidates from adData/script text.
-
-    For IMAGE ads, require_related=True is critical:
-    an appId is accepted only when the same adData/script context also contains the
-    selected image URL/simgad id OR the selected headline/description. This prevents
-    package names from another ad on the same Transparency page.
-    """
-    if not raw_text:
-        return []
-
-    text = decode_all(raw_text)
-    candidates = []
-
-    patterns = [
-        r"""['\"]appId['\"]\s*:\s*['\"]([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*){2,})['\"]""",
-        r"""\bappId\b\s*[:=]\s*['\"]([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*){2,})['\"]""",
-        r"""['\"]app_id['\"]\s*:\s*['\"]([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*){2,})['\"]""",
-        r"""\bapp_id\b\s*[:=]\s*['\"]([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*){2,})['\"]""",
-    ]
-
-    image_keys = _image_url_keys_for_context(image_url)
-
-    for pattern in patterns:
-        for m in re.finditer(pattern, text, flags=re.IGNORECASE):
-            pkg = m.group(1).rstrip('.,;\'"\\ ')
-            if not _is_valid_pkg(pkg):
-                continue
-
-            start = max(0, m.start() - 12000)
-            end = min(len(text), m.end() + 12000)
-            context = text[start:end]
-            context_lower = context.lower()
-
-            score = float(source_priority)
-            related = False
-
-            if re.search(r"\badData\b", context, flags=re.IGNORECASE):
-                score += 180
-            if 'appid' in context_lower or 'app_id' in context_lower:
-                score += 40
-
-            for key in image_keys:
-                if key and key in context:
-                    related = True
-                    score += 900 if key == image_url else 650
-
-            if _context_contains_text(context, headline):
-                related = True
-                score += 260
-            if _context_contains_text(context, description):
-                related = True
-                score += 220
-
-            # When searching a full page with many ads, never accept unrelated appId values.
-            if require_related and not related:
-                continue
-
-            candidates.append({"package": pkg, "score": score, "related": related, "context_start": start})
-
-    # Deduplicate package names, keeping highest score.
-    best_by_pkg = {}
-    for c in candidates:
-        pkg = c["package"]
-        if pkg not in best_by_pkg or c["score"] > best_by_pkg[pkg]["score"]:
-            best_by_pkg[pkg] = c
-
-    return sorted(best_by_pkg.values(), key=lambda x: x["score"], reverse=True)
-
-
-def extract_appid_from_addata_text(raw_text, image_url=None, headline=None, description=None, source_priority=0, require_related=True):
-    candidates = extract_appid_candidates_from_addata_text(
-        raw_text,
-        image_url=image_url,
-        headline=headline,
-        description=description,
-        source_priority=source_priority,
-        require_related=require_related,
-    )
-    return candidates[0]["package"] if candidates else None
-
-
-def extract_appid_from_addata_target(target, image_url=None, headline=None, description=None, source_priority=0, require_related=True):
-    raw = _collect_target_text_for_package(target)
-    return extract_appid_from_addata_text(
-        raw,
-        image_url=image_url,
-        headline=headline,
-        description=description,
-        source_priority=source_priority,
-        require_related=require_related,
-    )
-
-
-def extract_appid_from_addata_page(page, image_target=None, image_url=None, headline=None, description=None):
-    """
-    Search adData.appId but only accept it when it is tied to the selected image/text.
-    This means wrong packages from other ads are ignored and N/A is written instead.
-    """
-    all_candidates = []
-
-    def add_candidates_from_target(target, priority):
-        raw = _collect_target_text_for_package(target)
-        all_candidates.extend(
-            extract_appid_candidates_from_addata_text(
-                raw,
-                image_url=image_url,
-                headline=headline,
-                description=description,
-                source_priority=priority,
-                require_related=True,
-            )
-        )
-
-    if image_target is not None:
-        add_candidates_from_target(image_target, 450)
-
-    try:
-        add_candidates_from_target(page, 120)
-    except Exception:
-        pass
-
-    try:
-        for frame in page.frames:
-            if image_target is not None and frame == image_target:
-                continue
-            add_candidates_from_target(frame, 80)
-    except Exception:
-        pass
-
-    if not all_candidates:
-        return None
-
-    best_by_pkg = {}
-    for c in all_candidates:
-        pkg = c["package"]
-        if pkg not in best_by_pkg or c["score"] > best_by_pkg[pkg]["score"]:
-            best_by_pkg[pkg] = c
-
-    best = sorted(best_by_pkg.values(), key=lambda x: x["score"], reverse=True)[0]
-    return best["package"]
-
-
-def resolve_image_ad_package(headline, description, image_target, page=None, image_url=None):
-    """
-    Image ads package flow:
-    1) Compare package candidates from the selected creative target with headline + description.
-    2) If no reliable match, read script var adData -> appId only when tied to the same image/text.
-    3) If still not found, return N/A.
-
-    Visible Install/Get links are NOT used for image ads.
-    """
-    best_score = 0.0
-    candidates = set()
-
-    # Only same target. Do not scan all page package names for matching; that caused cross-ad contamination.
-    if image_target is not None:
-        candidates.update(extract_packages_from_target(image_target))
-
-    if is_valid_text_ad(headline, description) and candidates:
-        matched_pkg, best_score = get_best_matching_package(headline, description, candidates)
-        if matched_pkg:
-            return matched_pkg, best_score, "same_target_headline_description_match"
-
-    # adData fallback is strict: appId must share context with the selected image URL/simgad id or selected text.
-    app_id = None
-    if page is not None:
-        app_id = extract_appid_from_addata_page(
-            page,
-            image_target=image_target,
-            image_url=image_url,
-            headline=headline,
-            description=description,
-        )
-    elif image_target is not None:
-        app_id = extract_appid_from_addata_target(
-            image_target,
-            image_url=image_url,
-            headline=headline,
-            description=description,
-            source_priority=450,
-            require_related=True,
-        )
-
-    if app_id:
-        return app_id, best_score, "related_addata_appId_fallback"
-
-    return "N/A", best_score, "not_found"
-
-
 def scrape_single_url(url_row):
     row_num, url = url_row
 
@@ -2020,6 +1671,9 @@ def scrape_single_url(url_row):
                 app_link_time = get_exact_time()
 
                 headline, description = wait_and_extract_headline_description(page, max_wait_seconds=15)
+                
+                # Extract image URL for video ads too
+                image_url = extract_primary_image_url(page)
 
                 if app_link == "N/A":
                     status = "VIDEO_FOUND_APP_LINK_NOT_FOUND"
@@ -2042,6 +1696,7 @@ def scrape_single_url(url_row):
 
                 safe_update_combined_row(row_num, data)
                 safe_update_headline_desc(row_num, headline, description)
+                safe_update_image_url(row_num, image_url)
 
                 safe_add_log(
                     row_number=row_num,
@@ -2053,84 +1708,31 @@ def scrape_single_url(url_row):
                     message=message
                 )
 
-                print(f"✅ Row {row_num}: saved VIDEO ad advertiser + package + video ID + text")
+                print(f"✅ Row {row_num}: saved VIDEO ad advertiser + package + video ID + text + image")
                 return
 
             # =========================
-            # NON-VIDEO PATH: IMAGE ADS FIRST, THEN TEXT ADS
+            # NON-VIDEO PATH: TEXT + IMAGE ADS
             # =========================
-            print(f"📄 Row {row_num}: no video found, checking image/text ad")
-            process_time = get_exact_time()
+            print(f"📄 Row {row_num}: no video found, checking text/image ad")
 
-            # IMAGE AD PATH
-            # Extract image URL + headline + description from the SAME creative/frame.
-            # Do NOT use visible Install/Get links for image ads.
-            image_data, image_target = wait_and_extract_image_ad_details(page, max_wait_seconds=15)
-            image_url = clean_text(image_data.get("image_url"))
-
-            if image_url != "N/A":
-                headline = clean_text(image_data.get("headline"))
-                description = clean_text(image_data.get("description"))
-                has_text = is_valid_text_ad(headline, description)
-
-                print(f"🖼 Row {row_num}: image ad found -> {image_url}")
-                print(f"🔎 Row {row_num}: image headline -> {headline}")
-                print(f"🔎 Row {row_num}: image description -> {description}")
-                print(f"📦 Row {row_num}: resolving IMAGE package by headline/description, then adData.appId only")
-
-                package_name, match_score, package_source = resolve_image_ad_package(headline, description, image_target, page=page, image_url=image_url)
-
-                if package_name != "N/A":
-                    app_link = f"https://play.google.com/store/apps/details?id={package_name}"
-                    status = "SUCCESS"
-                    message = (
-                        f"Image ad saved. Package source={package_source}. "
-                        f"Headline/description match score={match_score}. Visible install link was not used."
-                    )
-                    print(f"✅ Row {row_num}: image package -> {package_name} | source={package_source} | score={match_score}")
-                else:
-                    app_link = "N/A"
-                    status = "IMAGE_PACKAGE_NOT_FOUND"
-                    message = (
-                        f"Image ad saved, but package not found. Best headline/description score={match_score}. "
-                        "adData.appId fallback also not found. Visible install link was not used."
-                    )
-                    print(f"⚠️ Row {row_num}: image package not found, writing N/A | best score={match_score}")
-
-                data = [
-                    advertiser,
-                    package_name,
-                    url,
-                    app_link,
-                    process_time,
-                    image_url,      # Column F: image URL for image ads
-                    process_time
-                ]
-
-                safe_update_combined_row(row_num, data)
-                safe_update_headline_desc(row_num, headline if has_text else "N/A", description if has_text else "N/A")
-
-                safe_add_log(
-                    row_number=row_num,
-                    status=status,
-                    log_type="IMAGE_AD",
-                    url=url,
-                    video_id=image_url,
-                    app_link=app_link,
-                    message=message
-                )
-
-                print(f"✅ Row {row_num}: saved IMAGE ad advertiser + package + image URL + headline + description")
-                return
-
-            # TEXT AD PATH
-            # Keep your old text-ad logic because it is already working for text ads.
             text_data = wait_and_extract_text_ad_details(page, max_wait_seconds=15)
             headline = clean_text(text_data.get("headline"))
             description = clean_text(text_data.get("description"))
+            process_time = get_exact_time()
             has_text = is_valid_text_ad(headline, description)
 
-            if not has_text:
+            # Extract image URL
+            image_url = extract_primary_image_url(page)
+
+            # First try visible install/app link from the active creative.
+            visible_app_link = wait_and_extract_install_link(page, max_wait_seconds=8)
+            visible_package = extract_package_name(visible_app_link)
+
+            is_image_like = has_visible_image_creative(page)
+            ad_type = "text" if has_text else "image" if (is_image_like or visible_package != "N/A") else "N/A"
+
+            if not has_text and visible_package == "N/A" and not is_image_like:
                 data = [
                     advertiser,
                     "N/A",
@@ -2143,6 +1745,7 @@ def scrape_single_url(url_row):
 
                 safe_update_combined_row(row_num, data)
                 safe_update_headline_desc(row_num, "N/A", "N/A")
+                safe_update_image_url(row_num, "N/A")
 
                 safe_add_log(
                     row_number=row_num,
@@ -2151,42 +1754,46 @@ def scrape_single_url(url_row):
                     url=url,
                     video_id="N/A",
                     app_link="N/A",
-                    message="No video ID and no valid image/text creative found"
+                    message="No video ID and no valid text/image creative found"
                 )
 
-                print(f"⏭ Row {row_num}: no video and no valid image/text ad found")
+                print(f"⏭ Row {row_num}: no video and no valid text/image ad found")
                 return
 
-            print(f"🔎 Row {row_num}: text headline -> {headline}")
-            print(f"📦 Row {row_num}: resolving TEXT package from visible install link first")
+            if has_text:
+                print(f"🔎 Row {row_num}: text/image headline -> {headline}")
+            else:
+                print(f"🖼 Row {row_num}: likely image ad, headline/description not found")
 
-            # Visible install link is still allowed for TEXT ads only.
-            visible_app_link = wait_and_extract_install_link(page, max_wait_seconds=8)
-            visible_package = extract_package_name(visible_app_link)
+            print(f"📦 Row {row_num}: resolving package from visible install link first")
 
             if visible_package != "N/A":
                 package_name = visible_package
                 app_link = visible_app_link
                 match_score = 1.0
                 status = "SUCCESS"
-                message = "Text ad package extracted from visible install link"
-                print(f"✅ Row {row_num}: text package from visible install link -> {package_name}")
+                message = f"Non-video {ad_type} ad package extracted from visible install link"
+                print(f"✅ Row {row_num}: package from visible install link -> {package_name}")
             else:
-                print(f"📦 Row {row_num}: visible install link not found, strict matching with headline + description")
-                all_found_packages = extract_package_from_page(page)
-                package_name, match_score = get_best_matching_package(headline, description, all_found_packages)
+                package_name = None
+                match_score = 0.0
+
+                if has_text:
+                    print(f"📦 Row {row_num}: visible install link not found, strict matching with headline + description")
+                    all_found_packages = extract_package_from_page(page)
+                    package_name, match_score = get_best_matching_package(headline, description, all_found_packages)
 
                 if package_name:
                     app_link = f"https://play.google.com/store/apps/details?id={package_name}"
                     status = "SUCCESS"
-                    message = f"Text ad package strictly matched with score {match_score}"
-                    print(f"✅ Row {row_num}: strict matched text package -> {package_name} | score={match_score}")
+                    message = f"Non-video {ad_type} ad package strictly matched with score {match_score}"
+                    print(f"✅ Row {row_num}: strict matched package -> {package_name} | score={match_score}")
                 else:
                     package_name = "N/A"
                     app_link = "N/A"
-                    status = "TEXT_PACKAGE_NOT_FOUND"
-                    message = f"Text ad found, but package score below 0.76. Best score={match_score}"
-                    print(f"⚠️ Row {row_num}: text package score below 0.76, writing N/A | best score={match_score}")
+                    status = "NON_VIDEO_PACKAGE_NOT_FOUND"
+                    message = f"Non-video {ad_type} ad found, but package score below 0.76. Best score={match_score}"
+                    print(f"⚠️ Row {row_num}: package score below 0.76, writing N/A | best score={match_score}")
 
             data = [
                 advertiser,
@@ -2194,24 +1801,25 @@ def scrape_single_url(url_row):
                 url,
                 app_link,
                 process_time,
-                "text",      # Column F: text marker for text ads
+                ad_type,      # Column F: text/image for non-video ads
                 process_time
             ]
 
             safe_update_combined_row(row_num, data)
-            safe_update_headline_desc(row_num, headline, description)
+            safe_update_headline_desc(row_num, headline if has_text else "N/A", description if has_text else "N/A")
+            safe_update_image_url(row_num, image_url)
 
             safe_add_log(
                 row_number=row_num,
                 status=status,
-                log_type="TEXT_AD",
+                log_type="NON_VIDEO_AD",
                 url=url,
-                video_id="text",
+                video_id=ad_type,
                 app_link=app_link,
                 message=message
             )
 
-            print(f"✅ Row {row_num}: saved TEXT ad advertiser + package + headline + description")
+            print(f"✅ Row {row_num}: saved NON-VIDEO {ad_type} ad advertiser + package + headline + description + image")
 
         except Exception as e:
             error_time = get_exact_time()
@@ -2230,6 +1838,7 @@ def scrape_single_url(url_row):
 
                 safe_update_combined_row(row_num, data)
                 safe_update_headline_desc(row_num, "N/A", "N/A")
+                safe_update_image_url(row_num, "N/A")
             except Exception:
                 pass
 
