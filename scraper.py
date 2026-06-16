@@ -2395,7 +2395,8 @@ def resolve_package_from_scoped_packages(headline, description, scoped_packages)
 
 def wait_and_extract_active_image_ad_data(page, max_wait_seconds=IMAGE_AD_MAX_WAIT_SECONDS, min_wait_seconds=IMAGE_AD_MIN_WAIT_SECONDS):
     """
-    Waits until active image ad has image + title/description.
+    Waits until active image ad has an image URL.
+    Headline/description are optional because some ads are image-only.
     Debug showed the full image ad appears around step 0010, so this function does not
     return before min_wait_seconds unless timeout is reached.
     """
@@ -2415,7 +2416,9 @@ def wait_and_extract_active_image_ad_data(page, max_wait_seconds=IMAGE_AD_MAX_WA
             has_text = is_valid_text_ad(candidate.get("headline"), candidate.get("description"))
 
             # Wait at least 10 sec for Google creative hydration, then accept active image data.
-            if elapsed >= min_wait_seconds and has_image and has_text:
+            # IMPORTANT: image-only ads have NO headline/description in DOM.
+            # If image_url exists, return the candidate even when has_text is False.
+            if elapsed >= min_wait_seconds and has_image:
                 package_name, package_score = resolve_package_from_scoped_packages(
                     candidate.get("headline", "N/A"),
                     candidate.get("description", "N/A"),
