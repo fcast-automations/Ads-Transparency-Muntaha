@@ -1922,6 +1922,588 @@ def wait_and_extract_app_link_from_classes_only(page, max_wait_seconds=8):
         page.wait_for_timeout(1000)
     return 'N/A'
 
+
+# =========================
+# ROBUST IMAGE-AD PACKAGE + APP LINK RESOLVER
+# =========================
+# This block fixes image ads where image URL is found but Package/App Link stays N/A.
+# Priority:
+# 1) Match package with SAME creative headline + description.
+# 2) If text match fails or text is N/A, read the SAME image creative anchor/script/adData/appId.
+# 3) Final fallback: inspected classes ns-zxqs8-e-16 / ns-zxqs8-e-13.
+
+def decode_all(text):
+    """Decode URL, HTML, JS and Unicode escaped values used inside ad iframes/scripts."""
+    if text is None:
+        return ""
+
+    import html
+
+    text = str(text)
+
+    def repl_unicode(match):
+        try:
+            return chr(int(match.group(1), 16))
+        except Exception:
+            return match.group(0)
+
+    for _ in range(4):
+        previous = text
+        text = html.unescape(text)
+        text = text.replace('\\/', '/')
+        text = re.sub(r'\\u([0-9a-fA-F]{4})', repl_unicode, text)
+        text = re.sub(r'\\x3[Dd]', '=', text)
+        text = re.sub(r'\\x26', '&', text)
+        text = re.sub(r'\\x3[Ff]', '?', text)
+        text = re.sub(r'\\x2[Ff]', '/', text)
+        text = unquote(text)
+        if text == previous:
+            break
+
+    return text
+
+
+def clean_googleadservices_link(href):
+    """Return final destination from Google ad redirect links when adurl/url is present."""
+    if not href:
+        return "N/A"
+
+    href = decode_all(str(href).strip())
+
+    # If a full HTML/JS block was passed, first extract a clean store link from it.
+    store_link = extract_store_link_from_text(href)
+    if store_link != "N/A":
+        return store_link
+
+    if href.startswith("//"):
+        href = "https:" + href
+
+    try:
+        parsed = urlparse(href)
+        query = parse_qs(parsed.query)
+
+        possible_keys = [
+            "adurl", "url", "q", "u", "ds_dest_url", "destination",
+            "dest", "redirect", "redir", "target", "target_url",
+            "final_url", "finalUrl", "click_url", "clickUrl", "landingUrl",
+            "landing_url", "rdid"
+        ]
+
+        for key in possible_keys:
+            value = query.get(key, [None])[0]
+            if value:
+                value = decode_all(value)
+                nested_store = extract_store_link_from_text(value)
+                return nested_store if nested_store != "N/A" else value
+
+    except Exception:
+        pass
+
+    return href
+
+
+def is_good_app_link(href):
+    if not href:
+        return False
+
+    href = str(href).lower()
+
+    return (
+        "play.google.com/store/apps/details" in href
+        or "market://details" in href
+        or "apps.apple.com" in href
+        or "itunes.apple.com" in href
+        or "googleadservices.com" in href
+        or "googleads.g.doubleclick.net" in href
+        or "adclick.g.doubleclick.net" in href
+        or "doubleclick.net" in href
+        or "googlesyndication.com" in href
+        or "google.com/aclk" in href
+    )
+
+
+def extract_store_link_from_text(raw_text):
+    """Extract the actual Play/App Store URL from href, JS, HTML, or adData text."""
+    if not raw_text:
+        return "N/A"
+
+    text = decode_all(raw_text)
+
+    # Direct Play Store URL.
+    play_match = re.search(
+        r"https?://play\.google\.com/store/apps/details[^\s'\"<>\\)\\]}]+",
+        text,
+        flags=re.I
+    )
+    if play_match:
+        url = play_match.group(0).rstrip('.,;\'\"\\)\\]}')
+        pkg = extract_first_package_ordered(url)
+        if pkg != "N/A":
+            return build_store_link_from_package(pkg)
+        return url
+
+    # Protocol-relative Play Store URL.
+    play_match = re.search(
+        r"//play\.google\.com/store/apps/details[^\s'\"<>\\)\\]}]+",
+        text,
+        flags=re.I
+    )
+    if play_match:
+        url = "https:" + play_match.group(0).rstrip('.,;\'\"\\)\\]}')
+        pkg = extract_first_package_ordered(url)
+        if pkg != "N/A":
+            return build_store_link_from_package(pkg)
+        return url
+
+    # market://details?id=com.example.app
+    market_match = re.search(
+        r"market://details[^\s'\"<>\\)\\]}]+[?&]id=([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*){2,})",
+        text,
+        flags=re.I
+    )
+    if market_match:
+        pkg = market_match.group(1).rstrip('.,;\'\"\\)\\]}')
+        if _is_valid_pkg(pkg):
+            return build_store_link_from_package(pkg)
+
+    # Apple App Store URL.
+    apple_match = re.search(
+        r"https?://(?:apps|itunes)\.apple\.com/[^\s'\"<>\\)\\]}]+/id\d+[^\s'\"<>\\)\\]}]*",
+        text,
+        flags=re.I
+    )
+    if apple_match:
+        return apple_match.group(0).rstrip('.,;\'\"\\)\\]}')
+
+    return "N/A"
+
+
+def extract_package_name(app_link):
+    """Extract package/app id from Play Store, App Store, redirect link, or raw HTML/JS."""
+    if not app_link or app_link == "N/A":
+        return "N/A"
+
+    text = decode_all(app_link)
+
+    # Clean Google redirect first, then re-check.
+    cleaned = clean_googleadservices_link(text)
+    if cleaned and cleaned != "N/A" and cleaned != text:
+        pkg = extract_package_name(cleaned)
+        if pkg != "N/A":
+            return pkg
+
+    ordered = extract_packages_ordered_from_text(text)
+    if ordered:
+        return ordered[0]
+
+    try:
+        if "apps.apple.com" in text.lower() or "itunes.apple.com" in text.lower():
+            match = re.search(r"/id(\d+)", text)
+            if match:
+                return f"id{match.group(1)}"
+    except Exception:
+        pass
+
+    return "N/A"
+
+
+def normalize_app_link(href):
+    """Normalize href/html/js to a clean Play/App Store URL when possible."""
+    if not href:
+        return "N/A"
+
+    raw = decode_all(href)
+
+    store_link = extract_store_link_from_text(raw)
+    if store_link != "N/A":
+        return store_link
+
+    cleaned = clean_googleadservices_link(raw)
+    store_link = extract_store_link_from_text(cleaned)
+    if store_link != "N/A":
+        return store_link
+
+    if cleaned.startswith("//"):
+        cleaned = "https:" + cleaned
+
+    if is_good_app_link(cleaned) and not cleaned.lstrip().startswith("<"):
+        pkg = extract_package_name(cleaned)
+        if pkg != "N/A" and not pkg.startswith("id"):
+            return build_store_link_from_package(pkg)
+        return cleaned
+
+    pkg = extract_first_package_ordered(raw)
+    if pkg != "N/A" and not pkg.startswith("id"):
+        return build_store_link_from_package(pkg)
+
+    return "N/A"
+
+
+
+def _is_valid_pkg(pkg):
+    """Override: keep real advertiser packages, skip Google/internal SDK package strings."""
+    if not pkg:
+        return False
+
+    pkg = str(pkg).strip().rstrip('.,;\'"\\)\\]}')
+    parts = pkg.split('.')
+
+    if len(parts) < 3 or len(pkg) < 8:
+        return False
+    if _SKIP_EXT.search(pkg):
+        return False
+    if _SKIP_PFX.match(pkg):
+        return False
+
+    lower = pkg.lower()
+    internal_prefixes = (
+        'com.google.ads.',
+        'com.google.doubleclick.',
+        'com.google.gmsg.',
+        'com.google.common.',
+        'com.google.thirdparty.',
+        'com.google.adsense.',
+        'com.google.analytics.',
+    )
+    if lower.startswith(internal_prefixes):
+        return False
+
+    for part in parts:
+        if not part or not re.match(r'^[A-Za-z][A-Za-z0-9_]*$', part):
+            return False
+
+    return True
+
+
+def extract_packages_ordered_from_text(raw_text):
+    """Return valid Android package names in the same order they appear in HTML/JS."""
+    if not raw_text:
+        return []
+
+    text = decode_all(raw_text)
+    found = []
+
+    patterns = [
+        # JSON/script keys: appId, appid, app_id, packageName, androidPackageName, etc.
+        r"""[\"']?(?:appId|appid|app_id|packageName|package_name|androidPackageName|android_package_name|appPackageName|app_package_name|packageId|package_id|bundleId|bundle_id)[\"']?\s*[:=]\s*[\"']([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*){2,})[\"']""",
+        # Play Store URL.
+        r"""play\.google\.com/store/apps/details[^\s'\"<>]*[?&]id=([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*){2,})""",
+        # market URL.
+        r"""market://[^\s'\"<>]*[?&]id=([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*){2,})""",
+        # Redirect/destination URL values.
+        r"""(?:destination_url|final_url|click_url|destUrl|clickUrl|landingUrl|landing_url|adurl|url|target_url)[\"'\s:=]*[\"']?[^\s'\"<>]*[?&]id=([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*){2,})""",
+        # Query params.
+        r"""[?&](?:id|package|pkg|app_id|appid)=([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*){2,})""",
+    ]
+
+    for pat in patterns:
+        for m in re.finditer(pat, text, re.IGNORECASE):
+            pkg = m.group(1).rstrip('.,;\'\"\\)\\]}')
+            if _is_valid_pkg(pkg) and pkg not in found:
+                found.append(pkg)
+
+    return found
+
+
+def extract_first_package_ordered(raw_text):
+    ordered = extract_packages_ordered_from_text(raw_text)
+    return ordered[0] if ordered else "N/A"
+
+
+def extract_packages_from_text(raw_text):
+    """Override: keep old function name, but support lower-case appid/adData too."""
+    return set(extract_packages_ordered_from_text(raw_text))
+
+
+def extract_same_image_creative_package_sources_from_target(target, image_url="N/A"):
+    """
+    Collect only SAME image creative raw sources: image anchor, parent wrappers,
+    appstore container, scripts, adData/appId and performance URLs from that iframe.
+    """
+    js = r"""
+    (targetImageUrl, inspectClasses) => {
+        const clean = (v) => String(v || '').trim();
+        const norm = (url) => {
+            url = clean(url);
+            if (!url) return '';
+            if (url.startsWith('//')) url = 'https:' + url;
+            try { return new URL(url, window.location.href).href; }
+            catch (e) { return url; }
+        };
+        const target = norm(targetImageUrl);
+        const targetFile = target ? target.split('/').pop().split('?')[0] : '';
+
+        const isVisible = (el) => {
+            if (!el) return false;
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return rect.width > 0 && rect.height > 0 &&
+                   style.visibility !== 'hidden' &&
+                   style.display !== 'none' &&
+                   style.opacity !== '0';
+        };
+
+        const area = (el) => {
+            try {
+                const r = el.getBoundingClientRect();
+                return (r.width || 0) * (r.height || 0);
+            } catch (e) { return 0; }
+        };
+
+        const attrs = (el) => {
+            const out = [];
+            if (!el) return out;
+            try {
+                for (const a of Array.from(el.attributes || [])) {
+                    if (a && a.value) out.push(`${a.name}=${a.value}`);
+                }
+            } catch(e) {}
+            try { if (el.href) out.push(el.href); } catch(e) {}
+            try { if (el.src) out.push(el.src); } catch(e) {}
+            try { if (el.currentSrc) out.push(el.currentSrc); } catch(e) {}
+            return out;
+        };
+
+        const out = [];
+        let score = 0;
+
+        const push = (v) => {
+            v = clean(v);
+            if (v) out.push(v);
+        };
+
+        const collectElement = (el, depthLimit=7) => {
+            if (!el) return;
+            attrs(el).forEach(push);
+            try { push(el.outerHTML); } catch(e) {}
+
+            const anchor = el.closest && el.closest('a[href], a[data-href]');
+            if (anchor) {
+                attrs(anchor).forEach(push);
+                try { push(anchor.outerHTML); } catch(e) {}
+            }
+
+            const adContainer = el.closest && el.closest('.discover, [class*="discover"], [id*="google_image_div"], [id*="ad"], [class*="creative"], [class*="ad-"]');
+            if (adContainer) {
+                attrs(adContainer).forEach(push);
+                try { push(adContainer.outerHTML); } catch(e) {}
+                for (const a of Array.from(adContainer.querySelectorAll('a[href], a[data-href]'))) {
+                    attrs(a).forEach(push);
+                    try { push(a.outerHTML); } catch(e) {}
+                }
+            }
+
+            let p = el.parentElement;
+            let d = 0;
+            while (p && d < depthLimit) {
+                attrs(p).forEach(push);
+                try { push(p.outerHTML); } catch(e) {}
+                for (const a of Array.from(p.querySelectorAll ? p.querySelectorAll('a[href], a[data-href]') : [])) {
+                    attrs(a).forEach(push);
+                    try { push(a.outerHTML); } catch(e) {}
+                }
+                p = p.parentElement;
+                d += 1;
+            }
+        };
+
+        const imageNodes = Array.from(document.querySelectorAll('img[src], img[data-src]'));
+        const matches = [];
+
+        for (const img of imageNodes) {
+            const src = norm(img.getAttribute('src') || img.currentSrc || img.src || img.getAttribute('data-src') || '');
+            if (!src) continue;
+            const lower = src.toLowerCase();
+            const cls = String(img.className || '').toLowerCase();
+            const id = String(img.id || '').toLowerCase();
+            const exactMatch = target && (src === target || src.includes(target) || target.includes(src));
+            const fileMatch = targetFile && src.includes(targetFile);
+            const inspectedImage = id === 'ad-image' || cls.includes('discover__image');
+            const largeVisible = isVisible(img) && area(img) >= 8000;
+            if (exactMatch || fileMatch || inspectedImage || largeVisible) {
+                let s = area(img);
+                if (exactMatch) s += 1000000;
+                if (fileMatch) s += 800000;
+                if (inspectedImage) s += 700000;
+                if (largeVisible) s += 100000;
+                matches.push([s, img, src]);
+            }
+        }
+
+        matches.sort((a, b) => b[0] - a[0]);
+        for (const [s, img, src] of matches.slice(0, 3)) {
+            score += s;
+            push(src);
+            collectElement(img);
+        }
+
+        // Clickable image ads often have no headline/description; the package is in the image anchor.
+        for (const a of Array.from(document.querySelectorAll('a[href], a[data-href]'))) {
+            const hasImg = !!a.querySelector('img');
+            const href = clean(a.getAttribute('href') || a.getAttribute('data-href') || a.href || '');
+            if (hasImg || href.includes('adurl') || href.includes('play.google') || href.includes('doubleclick') || href.includes('googleadservices')) {
+                attrs(a).forEach(push);
+                try { push(a.outerHTML); } catch(e) {}
+                score += hasImg ? 120000 : 30000;
+            }
+        }
+
+        // User-supplied classes from inspect panel.
+        for (const cls of inspectClasses) {
+            for (const el of Array.from(document.getElementsByClassName(cls))) {
+                collectElement(el);
+                score += 90000;
+            }
+            for (const el of Array.from(document.querySelectorAll(`[class*="${cls}"]`))) {
+                collectElement(el);
+                score += 60000;
+            }
+        }
+
+        // Exact structure from the screenshot.
+        for (const sel of ['#ad-title', '#ad-description', '#appstore-container', '.discover__content', '.discover__action', '.discover']) {
+            for (const el of Array.from(document.querySelectorAll(sel))) {
+                collectElement(el);
+                score += 40000;
+            }
+        }
+
+        // If this target really looks like the creative iframe, inspect scripts/adData too.
+        if (score > 0) {
+            try { push(document.documentElement.outerHTML); } catch(e) {}
+            for (const s of Array.from(document.scripts || [])) {
+                push(s.textContent || s.innerText || '');
+                attrs(s).forEach(push);
+            }
+            try {
+                const perf = performance.getEntriesByType('resource').map(r => r.name).filter(Boolean).join('\n');
+                push(perf);
+            } catch(e) {}
+        }
+
+        return {score, text: out.join('\n')};
+    }
+    """
+
+    try:
+        result = target.evaluate(js, image_url if image_url else "N/A", APP_LINK_INSPECT_CLASSES)
+        if result and float(result.get("score", 0) or 0) > 0:
+            return result
+    except Exception:
+        pass
+
+    return {"score": 0, "text": ""}
+
+
+def get_same_image_creative_package_sources(page, image_url="N/A"):
+    sources = []
+    targets = [page] + [f for f in page.frames if f != page.main_frame]
+
+    for target in targets:
+        try:
+            result = extract_same_image_creative_package_sources_from_target(target, image_url)
+            if result and result.get("text"):
+                sources.append({
+                    "score": float(result.get("score", 0) or 0),
+                    "text": result.get("text", "")
+                })
+        except Exception:
+            continue
+
+    sources.sort(key=lambda x: x["score"], reverse=True)
+    return sources
+
+
+def resolve_package_and_link_for_image_ad(page, headline, description, image_url, has_text=False):
+    """
+    Final resolver for Column B Package and Column D App Link.
+    Does not depend only on the one screenshot layout.
+    """
+    headline = clean_text(headline)
+    description = clean_text(description)
+    match_score = 0.0
+
+    # 1) FIRST: compare package with headline + description, as requested.
+    if has_text:
+        all_found_packages = extract_package_from_page(page)
+        package_name, match_score = get_best_matching_package(headline, description, all_found_packages)
+        if package_name:
+            return {
+                "package_name": package_name,
+                "app_link": build_store_link_from_package(package_name),
+                "status": "SUCCESS",
+                "message": f"Package matched with headline + description. Score={match_score}",
+                "match_score": match_score,
+                "source": "headline_description_match"
+            }
+
+    # 2) SECOND: use the SAME image creative iframe/anchor/script/adData/appId.
+    sources = get_same_image_creative_package_sources(page, image_url)
+
+    for src in sources[:5]:
+        raw = src.get("text", "")
+
+        direct_link = normalize_app_link(raw)
+        if direct_link != "N/A":
+            pkg = extract_package_name(direct_link)
+            if pkg != "N/A":
+                return {
+                    "package_name": pkg,
+                    "app_link": build_store_link_from_package(pkg) if not pkg.startswith("id") else direct_link,
+                    "status": "SUCCESS",
+                    "message": "Package/App Link extracted from same image creative anchor/script/adData",
+                    "match_score": match_score,
+                    "source": "same_image_creative_link"
+                }
+
+        ordered_packages = extract_packages_ordered_from_text(raw)
+        if ordered_packages:
+            # If text exists, try to match only same-creative packages against that text.
+            if has_text:
+                pkg, score = get_best_matching_package(headline, description, ordered_packages, min_score=0.60)
+                if pkg:
+                    return {
+                        "package_name": pkg,
+                        "app_link": build_store_link_from_package(pkg),
+                        "status": "SUCCESS",
+                        "message": f"Same-creative package matched with headline + description. Score={score}",
+                        "match_score": score,
+                        "source": "same_creative_text_match"
+                    }
+
+            # Pure image ad usually has no text. If the same iframe gives a package, use it.
+            pkg = ordered_packages[0]
+            return {
+                "package_name": pkg,
+                "app_link": build_store_link_from_package(pkg),
+                "status": "SUCCESS",
+                "message": "Package extracted from same image creative appId/adData/final URL",
+                "match_score": match_score,
+                "source": "same_image_creative_package"
+            }
+
+    # 3) THIRD: fallback to only supplied classes ns-zxqs8-e-16 / ns-zxqs8-e-13.
+    class_app_link = wait_and_extract_app_link_from_classes_only(page, max_wait_seconds=8)
+    class_package = extract_package_name(class_app_link)
+    if class_package != "N/A":
+        return {
+            "package_name": class_package,
+            "app_link": build_store_link_from_package(class_package) if not class_package.startswith("id") else class_app_link,
+            "status": "SUCCESS",
+            "message": "Package extracted from inspected classes ns-zxqs8-e-16 / ns-zxqs8-e-13",
+            "match_score": match_score,
+            "source": "inspected_classes"
+        }
+
+    return {
+        "package_name": "N/A",
+        "app_link": "N/A",
+        "status": "NON_VIDEO_PACKAGE_NOT_FOUND",
+        "message": f"Image ad found but package/app link not found. Best text-match score={match_score}",
+        "match_score": match_score,
+        "source": "not_found"
+    }
+
 def scrape_single_url(url_row):
     row_num, url = url_row
 
@@ -2063,42 +2645,28 @@ def scrape_single_url(url_row):
 
             # PACKAGE RULE FROM USER:
             # 1) First compare package names with the SAME creative headline + description.
-            # 2) If no match, then check inspected classes ns-zxqs8-e-16 / ns-zxqs8-e-13.
-            print(f"📦 Row {row_num}: resolving package by headline + description first")
+            # 2) If no match / no text, check SAME image anchor/script/adData/appId.
+            # 3) Final fallback: ns-zxqs8-e-16 / ns-zxqs8-e-13.
+            print(f"📦 Row {row_num}: resolving package/link for same image creative")
 
-            package_name = None
-            app_link = "N/A"
-            match_score = 0.0
-            status = "NON_VIDEO_PACKAGE_NOT_FOUND"
-            message = "Package not found"
+            resolved = resolve_package_and_link_for_image_ad(
+                page=page,
+                headline=headline,
+                description=description,
+                image_url=image_url,
+                has_text=has_text
+            )
 
-            if has_text:
-                all_found_packages = extract_package_from_page(page)
-                package_name, match_score = get_best_matching_package(headline, description, all_found_packages)
+            package_name = resolved.get("package_name", "N/A")
+            app_link = resolved.get("app_link", "N/A")
+            status = resolved.get("status", "NON_VIDEO_PACKAGE_NOT_FOUND")
+            message = f"Non-video {ad_type} ad: {resolved.get('message', '')}"
+            match_score = resolved.get("match_score", 0.0)
 
-                if package_name:
-                    app_link = build_store_link_from_package(package_name)
-                    status = "SUCCESS"
-                    message = f"Non-video {ad_type} ad package matched with headline + description. Score={match_score}"
-                    print(f"✅ Row {row_num}: package matched by headline/description -> {package_name} | score={match_score}")
-
-            if not package_name:
-                print(f"📦 Row {row_num}: no headline/description package match, checking ns-zxqs8-e-16 / ns-zxqs8-e-13")
-                class_app_link = wait_and_extract_app_link_from_classes_only(page, max_wait_seconds=8)
-                class_package = extract_package_name(class_app_link)
-
-                if class_package != "N/A":
-                    package_name = class_package
-                    app_link = class_app_link if class_app_link != "N/A" else build_store_link_from_package(class_package)
-                    status = "SUCCESS"
-                    message = f"Non-video {ad_type} ad package extracted from inspected classes after text match failed"
-                    print(f"✅ Row {row_num}: package from inspected classes -> {package_name}")
-                else:
-                    package_name = "N/A"
-                    app_link = "N/A"
-                    status = "NON_VIDEO_PACKAGE_NOT_FOUND"
-                    message = f"Non-video {ad_type} ad found, but package did not match headline/description and classes failed. Best score={match_score}"
-                    print(f"⚠️ Row {row_num}: package not found, writing N/A | best score={match_score}")
+            if package_name != "N/A":
+                print(f"✅ Row {row_num}: package/link resolved -> {package_name} | {app_link} | source={resolved.get('source')}")
+            else:
+                print(f"⚠️ Row {row_num}: package/link not found, writing N/A | best score={match_score}")
 
             if not has_text and package_name == "N/A" and not is_image_like:
                 data = [
