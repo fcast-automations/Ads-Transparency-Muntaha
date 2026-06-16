@@ -1791,6 +1791,9 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15, preferred_target
             const lower = original.toLowerCase();
             if (!lower) return true;
             if (isInstallAnchorText(lower)) return true;
+            // Important: never save text that contains Install as headline/description.
+            // Install can be an anchor/button, but not ad text for your sheet.
+            if (/\binstall\b/i.test(lower)) return true;
 
             const exactBad = new Set([
                 "play", "close", "menu", "search", "sign in", "log in",
@@ -1815,6 +1818,149 @@ def wait_and_extract_text_ad_details(page, max_wait_seconds=15, preferred_target
         const installAnchors = [];
         const textCandidates = [];
         const nodes = root === document.body ? Array.from(document.querySelectorAll('body *')) : Array.from(root.querySelectorAll('*'));
+
+        // COMBINED SCRAPER REFERENCE FALLBACK:
+        // Use the known Google ad text classes/selectors from the combined scraper first,
+        // but still keep it locked to the selected current creative root/image/CR id.
+        const isInsideCurrentScope = (box) => {
+            if (root !== document.body) return true;
+            if (!imageBox) return true;
+            const img = imageBox;
+            const imgBox = { top: img.top, bottom: img.bottom, left: img.left, right: img.right, width: img.width, height: img.height };
+            const aligned = horizontalOverlapRatio(box, imgBox) >= 0.10;
+            const verticalNear = box.top >= img.top - 100 && box.top <= img.bottom + 760;
+            return aligned && verticalNear;
+        };
+
+        const collectReferenceTexts = (selector, label) => {
+            const scope = root === document.body ? document : root;
+            const collected = [];
+            try {
+                for (const el of Array.from(scope.querySelectorAll(selector))) {
+                    if (!isVisible(el)) continue;
+                    const rawText = cleanText(el.innerText || el.textContent || '');
+                    if (rawText.length < 3 || rawText.length > 260) continue;
+                    if (rawText.includes('{{') || rawText.includes('}}')) continue;
+                    if (isBadText(rawText)) continue;
+                    const box = rectObj(el);
+                    if (box.width < 10 || box.height < 6) continue;
+                    if (!isInsideCurrentScope(box)) continue;
+
+                    const directText = directTextOnly(el);
+                    const cls = String(el.className || '').toLowerCase();
+                    const aria = String(el.getAttribute('aria-label') || '').toLowerCase();
+                    const role = String(el.getAttribute('role') || '').toLowerCase();
+                    const isSpecific =
+                        cls.includes('headline') || cls.includes('description') || cls.includes('long-description') ||
+                        cls.includes('-e-15') || cls.includes('-e-67') ||
+                        aria.includes('headline') || aria.includes('description') ||
+                        role === 'heading' || el.matches('div[role="link"] span');
+
+                    // Avoid wrappers that contain all ad text together.
+                    if (el.children.length > 0 && !isSpecific && directText.length < 3) continue;
+
+                    const style = window.getComputedStyle(el);
+                    const fontSize = parseFloat(style.fontSize || '0') || 0;
+                    const weightRaw = String(style.fontWeight || '400');
+                    const fontWeight = weightRaw === 'bold' ? 700 : (parseInt(weightRaw, 10) || 400);
+                    collected.push({ text: rawText, label, ...box, fontSize, fontWeight });
+                }
+            } catch (e) {}
+            return collected;
+        };
+
+        const getCombinedReferencePair = () => {
+            const headlineSelector = [
+                'div[role="link"] span',
+                '[class*="-e-15"]',
+                '[class*="headline"]',
+                '[aria-label*="Headline"]',
+                '[aria-label*="headline"]',
+                '[role="heading"]'
+            ].join(',');
+
+            const descriptionSelector = [
+                '[class*="-e-67"]',
+                '[class*="long-description"]',
+                '[class*="description"]',
+                '[aria-label*="Description"]',
+                '[aria-label*="description"]',
+                'div.HFTpmd-WsjYwc-hgDUwe',
+                'div.cS4Vcb-vnv8ic'
+            ].join(',');
+
+            const headRefs = collectReferenceTexts(headlineSelector, 'headline_ref');
+            const descRefs = collectReferenceTexts(descriptionSelector, 'description_ref');
+            const allRefs = [...headRefs, ...descRefs];
+
+            const seen = new Set();
+            const refs = [];
+            for (const c of allRefs) {
+                const key = `${c.text.toLowerCase()}|${Math.round(c.top)}|${Math.round(c.left)}`;
+                if (seen.has(key)) continue;
+                seen.add(key);
+                refs.push(c);
+            }
+
+            if (!refs.length) return null;
+
+            refs.sort((a, b) => {
+                if (Math.abs(a.top - b.top) > 6) return a.top - b.top;
+                if (a.label !== b.label) return a.label === 'headline_ref' ? -1 : 1;
+                return a.left - b.left;
+            });
+
+            let head = null;
+            if (headRefs.length) {
+                const sortedHeads = headRefs.slice().sort((a, b) => {
+                    // Prefer the topmost visible headline reference, then bolder/larger text.
+                    if (Math.abs(a.top - b.top) > 8) return a.top - b.top;
+                    const aScore = a.fontSize * 5 + (a.fontWeight >= 600 ? 80 : 0);
+                    const bScore = b.fontSize * 5 + (b.fontWeight >= 600 ? 80 : 0);
+                    return bScore - aScore;
+                });
+                head = sortedHeads[0] || null;
+            }
+            if (!head) head = refs[0];
+
+            let desc = null;
+            const descBelow = descRefs
+                .filter(c => c.text !== head.text)
+                .filter(c => c.top >= head.bottom - 16)
+                .filter(c => c.top <= head.bottom + 420)
+                .sort((a, b) => {
+                    if (Math.abs(a.top - b.top) > 8) return a.top - b.top;
+                    return b.text.length - a.text.length;
+                });
+            if (descBelow.length) desc = descBelow[0];
+
+            if (!desc) {
+                const anyBelow = refs
+                    .filter(c => c.text !== head.text)
+                    .filter(c => c.top >= head.bottom - 16)
+                    .filter(c => c.top <= head.bottom + 420)
+                    .sort((a, b) => a.top - b.top);
+                desc = anyBelow.length ? anyBelow[0] : null;
+            }
+
+            // Only trust this reference method when it found at least one strong reference text.
+            if (head && (desc || headRefs.length || descRefs.length)) {
+                return { headline: head.text, description: desc ? desc.text : 'N/A' };
+            }
+            return null;
+        };
+
+        const combinedReference = getCombinedReferencePair();
+        if (combinedReference && (combinedReference.headline !== 'N/A' || combinedReference.description !== 'N/A')) {
+            return {
+                headline: combinedReference.headline || 'N/A',
+                description: combinedReference.description || 'N/A',
+                mode: 'combined_reference_selector_locked',
+                rootReason: rootData.reason,
+                rootScore: rootData.score,
+                creativeId
+            };
+        }
 
         for (const el of nodes) {
             if (!isVisible(el)) continue;
