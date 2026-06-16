@@ -2395,7 +2395,8 @@ def resolve_package_from_scoped_packages(headline, description, scoped_packages)
 
 def wait_and_extract_active_image_ad_data(page, max_wait_seconds=IMAGE_AD_MAX_WAIT_SECONDS, min_wait_seconds=IMAGE_AD_MIN_WAIT_SECONDS):
     """
-    Waits until active image ad has image + title/description.
+    Waits until active image ad has its main image URL.
+    Text is optional now: for image-only ads, save the image URL and keep headline/description as N/A.
     Debug showed the full image ad appears around step 0010, so this function does not
     return before min_wait_seconds unless timeout is reached.
     """
@@ -2412,10 +2413,10 @@ def wait_and_extract_active_image_ad_data(page, max_wait_seconds=IMAGE_AD_MAX_WA
 
         if candidate:
             has_image = candidate.get("image_url", "N/A") != "N/A"
-            has_text = is_valid_text_ad(candidate.get("headline"), candidate.get("description"))
 
-            # Wait at least 10 sec for Google creative hydration, then accept active image data.
-            if elapsed >= min_wait_seconds and has_image and has_text:
+            # Wait at least 10 sec for Google creative hydration.
+            # Important: text is optional. If this is an image-only ad, save image URL and keep text as N/A.
+            if elapsed >= min_wait_seconds and has_image:
                 package_name, package_score = resolve_package_from_scoped_packages(
                     candidate.get("headline", "N/A"),
                     candidate.get("description", "N/A"),
@@ -2705,7 +2706,7 @@ def scrape_single_url(url_row):
             has_text = is_valid_text_ad(headline, description)
             ad_type = "image" if image_url != "N/A" else "N/A"
 
-            if ad_type == "N/A" or not has_text:
+            if ad_type == "N/A":
                 data = [
                     advertiser,
                     "N/A",
@@ -2722,24 +2723,31 @@ def scrape_single_url(url_row):
 
                 safe_add_log(
                     row_number=row_num,
-                    status="IMAGE_AD_INCOMPLETE",
+                    status="IMAGE_URL_NOT_FOUND",
                     log_type="IMAGE_AD",
                     url=url,
                     video_id="N/A",
                     app_link="N/A",
-                    message="Active image target found but image/headline/description was incomplete"
+                    message="Active image target found but image URL was not found"
                 )
 
-                print(f"⏭ Row {row_num}: active image ad incomplete, wrote N/A")
+                print(f"⏭ Row {row_num}: active image target found but image URL missing, wrote N/A")
                 return
+
+            if not has_text:
+                print(f"🖼 Row {row_num}: image-only ad found, saving image URL with headline/description as N/A")
 
             if package_name != "N/A":
                 status = "SUCCESS"
                 message = f"Image ad package extracted from active target/parent safeframe scope. Score={match_score}"
                 print(f"✅ Row {row_num}: scoped package -> {package_name}")
             else:
-                status = "IMAGE_PACKAGE_NOT_FOUND"
-                message = "Image ad found, but package was not found in active target/parent safeframe scope"
+                if has_text:
+                    status = "IMAGE_PACKAGE_NOT_FOUND"
+                    message = "Image ad found, but package was not found in active target/parent safeframe scope"
+                else:
+                    status = "IMAGE_ONLY_URL_SAVED"
+                    message = "Image-only ad found; image URL saved while headline/description/package stayed N/A"
                 print(f"⚠️ Row {row_num}: image data found but package not found in active scope")
 
             data = [
