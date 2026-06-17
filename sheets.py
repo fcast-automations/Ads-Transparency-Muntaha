@@ -66,40 +66,20 @@ def get_spreadsheet():
 
 
 # --------------------------
-# Logs
+# Logs disabled
 # --------------------------
-def get_or_create_logs_sheet():
-    spreadsheet = get_spreadsheet()
-    try:
-        logs_sheet = spreadsheet.worksheet("Logs")
-    except gspread.exceptions.WorksheetNotFound:
-        logs_sheet = spreadsheet.add_worksheet(title="Logs", rows=1000, cols=8)
-        logs_sheet.update("A1:H1", [[
-            "Time", "Row", "Status", "Type", "URL", "Video ID", "App Link", "Message"
-        ]])
-    return logs_sheet
-
+WRITE_LOGS = False
 
 def flush_logs():
-    """Batch append logs to reduce quota usage."""
+    """Logs disabled - do nothing"""
     global LOG_CACHE
-    if not LOG_CACHE:
-        return
-    try:
-        logs_sheet = get_or_create_logs_sheet()
-        logs_sheet.append_rows(LOG_CACHE)
-        LOG_CACHE = []
-    except gspread.exceptions.APIError as e:
-        print(f"⚠ Failed to flush logs due to APIError: {e}")
+    LOG_CACHE = []
+    return
 
 
 def add_log(row_number="", status="", log_type="", url="", video_id="", app_link="", message=""):
-    global LOG_CACHE
-    timestamp = datetime.now().strftime("%I:%M:%S %p")
-    LOG_CACHE.append([timestamp, row_number, status, log_type, url, video_id, app_link, message])
-    if len(LOG_CACHE) >= LOG_BATCH_SIZE:
-        flush_logs()
-
+    """Logs disabled - do nothing"""
+    return
 
 # --------------------------
 # Agent helpers
