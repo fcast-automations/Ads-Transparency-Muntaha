@@ -19,8 +19,6 @@ CLAIM_STATUS_COL = 12     # L
 HEADLINE_COL = 13         # M
 DESCRIPTION_COL = 14      # N
 IMAGE_URL_COL = 15        # O
-STOP_FLAG_COL = 16        # P - optional; moved here so it does not conflict with Headline/Image URL
-
 CLAIM_TTL_MINUTES = 5  # adjust to 370 for production
 
 LOG_BATCH_SIZE = 5  # batch logs to reduce API calls
@@ -96,7 +94,7 @@ def ensure_agent_headers():
         HEADLINE_COL: "Headline",
         DESCRIPTION_COL: "Description",
         IMAGE_URL_COL: "Image URL",
-        STOP_FLAG_COL: "Stop Flag",  # optional manual STOP column
+        
     }
 
     updates = []
@@ -160,7 +158,7 @@ def get_agent_rows_snapshot():
         claim_status = row[CLAIM_STATUS_COL - 1].strip() if len(row) >= CLAIM_STATUS_COL else ""
 
         # STOP flag moved to P, because M/N/O are now Headline, Description, Image URL.
-        stop_flag = row[STOP_FLAG_COL - 1].strip() if len(row) >= STOP_FLAG_COL else ""
+        stop_flag = ""
 
         if not url:
             continue
@@ -215,9 +213,7 @@ def get_next_agent_task(direction, agent_name, run_id):
         row_num = candidate["row_num"]
         url = candidate["url"]
 
-        if candidate["stop_flag"].upper() == "STOP":
-            print(f"🛑 {agent_name}: Stop flag detected. Stopping agent.")
-            return "COLLISION_STOP"
+      
 
         if candidate["claim_agent"] and candidate["claim_agent"] != agent_name and not candidate["claim_expired"]:
             continue
